@@ -1,0 +1,26 @@
+[project]
+name = "usrn-soil-matcher"
+version = "0.1.0"
+description = "A simple library to spatially join USRNs to the National Soil Dataset"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "apache-sedona[db]==1.8.1"
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.2",
+]
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["usrn_soil_matcher*"]
+
+[project.scripts]
+usrn-matcher = "usrn_soil_matcher.matcher:UsrnSoilMatcher.cli"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
