@@ -79,6 +79,7 @@ def run_intersect_join(
     rhs_config: DatasetConfig,
     bbox: list[float] | None = None,
     explain: bool = False,
+    include_rhs_geometry: bool = False,
 ):
     """Run a spatial intersection join of USRNs against any right-hand side dataset.
 
@@ -98,6 +99,10 @@ def run_intersect_join(
         a full dataset join is executed with no spatial pre-filter.
     explain:
         If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
+    include_rhs_geometry:
+        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` in the
+        SELECT list. Used by the DTF export step, which encodes the matched RHS
+        feature geometry (not the USRN line) into type 67 coordinate records.
     """
     rhs_view: str = rhs_config.name
 
@@ -140,6 +145,9 @@ def run_intersect_join(
         log.info("No bbox supplied — running full dataset join.")
 
     col_fragment: str = _col_fragment(rhs_config)
+    rhs_geom_fragment: str = (
+        ", ST_AsWKB(s.geometry) AS rhs_geometry" if include_rhs_geometry else ""
+    )
 
     query: str = f"""
         SELECT
@@ -147,6 +155,7 @@ def run_intersect_join(
             u.street_type,
             {intersection_expr} AS geometry
             {col_fragment}
+            {rhs_geom_fragment}
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_Intersects(u.geometry, s.geometry)
@@ -207,6 +216,7 @@ def run_nearest_join(
     distance_m: float = 50.0,
     bbox: list[float] | None = None,
     explain: bool = False,
+    include_rhs_geometry: bool = False,
 ):
     """Find the nearest USRN for each point in the RHS dataset.
 
@@ -230,6 +240,10 @@ def run_nearest_join(
         points are matched. When ``None`` all points are matched.
     explain:
         If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
+    include_rhs_geometry:
+        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` in the
+        SELECT list. Used by the DTF export step, which stores the matched RHS
+        point geometry as WKT in the paired type 67a record.
 
     Returns
     -------
@@ -287,6 +301,9 @@ def run_nearest_join(
         if bbox_wkt
         else "ST_AsWKB(u.geometry)"
     )
+    rhs_geom_fragment: str = (
+        ", ST_AsWKB(s.geometry) AS rhs_geometry" if include_rhs_geometry else ""
+    )
 
     query: str = f"""
         SELECT
@@ -295,6 +312,7 @@ def run_nearest_join(
             {geometry_expr} AS geometry
             {col_fragment},
             ST_Distance(u.geometry, s.geometry) AS distance_m
+            {rhs_geom_fragment}
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_DWithin(u.geometry, s.geometry, {distance_m})

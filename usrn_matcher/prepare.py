@@ -15,7 +15,7 @@ from .logger import get_logger
 log: logging.Logger = get_logger()
 
 
-def _write_geoparquet(
+def write_geoparquet(
     gdf: gpd.GeoDataFrame, path: pathlib.Path, row_group_size: int
 ) -> None:
     """Write a GeoDataFrame as GeoParquet 1.1 with bbox covering columns.
@@ -147,7 +147,7 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
 
     gdf = gpd.GeoDataFrame(gdf.sort_values("geometry").reset_index(drop=True))
 
-    _write_geoparquet(gdf, config.parquet_path, config.row_group_size)
+    write_geoparquet(gdf, config.parquet_path, config.row_group_size)
 
     log.info(
         "  Written %s (GeoParquet 1.1 / WKB + covering, row_group_size=%d)",
@@ -235,7 +235,7 @@ def prepare_from_csv(
             )
 
     gdf = gpd.GeoDataFrame(gdf.sort_values("geometry").reset_index(drop=True))
-    _write_geoparquet(gdf, resolved_parquet, row_group_size)
+    write_geoparquet(gdf, resolved_parquet, row_group_size)
     log.info(
         "  Written %s (GeoParquet 1.1 / WKB + covering, row_group_size=%d)",
         resolved_parquet,

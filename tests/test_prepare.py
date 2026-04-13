@@ -1,4 +1,4 @@
-"""Tests for the pre-spatial phase: _write_geoparquet and prepare_dataset."""
+"""Tests for the pre-spatial phase: write_geoparquet and prepare_dataset."""
 
 import json
 
@@ -8,7 +8,7 @@ import pytest
 from shapely.geometry import box
 
 from usrn_matcher.config import DatasetConfig
-from usrn_matcher.prepare import _write_geoparquet, prepare_dataset
+from usrn_matcher.prepare import write_geoparquet, prepare_dataset
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -29,12 +29,12 @@ def tiny_gdf():
 def written_parquet(tiny_gdf, tmp_path_factory):
     """GeoParquet written from the synthetic GDF."""
     out = tmp_path_factory.mktemp("parquet") / "test.parquet"
-    _write_geoparquet(tiny_gdf, out, row_group_size=5)
+    write_geoparquet(tiny_gdf, out, row_group_size=5)
     return out
 
 
 # ---------------------------------------------------------------------------
-# _write_geoparquet metadata tests
+# write_geoparquet metadata tests
 # ---------------------------------------------------------------------------
 
 

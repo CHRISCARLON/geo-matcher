@@ -1,8 +1,23 @@
 # usrn-matcher
 
-Spatially join Unique Street Reference Numbers (USRNs) to any polygon or point dataset using SedonaDB.
+Spatially join Unique Street Reference Numbers (USRNs) to any geospatial dataset using SedonaDB.
 
-Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) with optimised [GeoParquet 1.1](https://geoparquet.org/) files (he hopes).
+Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) with optimised [GeoParquet 1.1](https://geoparquet.org/) files.
+
+## What it does
+
+`usrn-matcher` answers the question: *which USRN is this feature on or near?*
+
+Given a third-party spatial dataset (naptan data, national soil data — anything with geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN and the original dataset's attributes.
+
+There are two output routes, each keeping a different geometry:
+
+| Route | Command | Geometry kept | Best for |
+|---|---|---|---|
+| **Standard** | `usrn-matcher match` | USRN street geometry | Street-centric analysis — each row describes a street segment |
+| **DTF export** | `usrn-matcher export` | Matched RHS feature geometry | Dataset-centric exchange — each row describes a matched feature from the third-party dataset, in a format close to DTF8.1 |
+
+The DTF export is a community extension to the NSG DTF8.1 format for third-party spatially matched datasets — see [`DTF_MAPPING.md`](DTF_MAPPING.md) for the full compliance mapping.
 
 ## Installation (will add it to pypi soon)
 
@@ -101,6 +116,53 @@ Key options:
 
 Output files are named `usrn_{rhs-name}_attribution.{ext}`.
 
+### 4. DTF export — matched feature geometry in DTF8.1-inspired format
+
+Runs the spatial join and writes four output files, each carrying the **matched RHS feature geometry** (not the USRN geometry):
+
+```bash
+# Intersect join (polygon/line datasets)
+usrn-matcher export \
+  --rhs-name soil \
+  --city LEEDS \
+  --dtf-org-name "My Council" \
+  --dtf-org-ref 1234
+
+# Nearest join (point datasets)
+usrn-matcher export \
+  --rhs-name stops \
+  --mode nearest \
+  --distance 25 \
+  --city LEEDS \
+  --dtf-org-name "My Council" \
+  --dtf-org-ref 1234
+```
+
+Key options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--rhs-name` | required | Name of the prepared RHS dataset |
+| `--mode` | `intersect` | `intersect` or `nearest` |
+| `--distance` | `50` | Search radius in metres for `--mode nearest` |
+| `--bbox XMIN YMIN XMAX YMAX` | full join | Bounding box in EPSG:27700 |
+| `--city` | full join | Named city preset |
+| `--dtf-org-name` | `usrn-matcher` | Organisation name in the DTF type 10 header |
+| `--dtf-org-ref` | `0` | SWA organisation reference code |
+| `--cache-dir` | `output_data` | Prepared GeoParquet directory |
+| `--matched-dir` | `matched_data` | Output directory |
+
+Output files written to `matched_data/`:
+
+| File | Format | Description |
+|---|---|---|
+| `matched_{name}_ad.csv` | DTF 8.1a CSV | Interleaved type 63a/67a records. Exchange format for NSG-aware tools. |
+| `matched_{name}_ad.parquet` | GeoParquet 1.1 | Spatially optimised. One row per matched feature. |
+| `matched_{name}_ad_flat.csv` | Flat CSV | Same columns as parquet, WKT geometry. Opens in QGIS, Excel, GeoPandas. |
+| `matched_{name}_ad.gpkg` | GeoPackage | Same columns as parquet, native geometry. Opens in QGIS, ArcGIS, OGR tools. |
+
+See [`DTF_MAPPING.md`](DTF_MAPPING.md) for the full DTF8.1 compliance mapping and field layout.
+
 ---
 
 ## Programmatic usage
@@ -137,6 +199,46 @@ matcher = UsrnMatcher(
 table = matcher.match_intersect()  # full national join
 ```
 
+### DTF export
+
+```python
+from usrn_matcher import UsrnMatcher, DatasetConfig, DTFConfig
+from usrn_matcher.dtf import to_dtf_csv, to_dtf_geoparquet, to_dtf_flat_csv, to_dtf_gpkg
+import pathlib
+
+cfg = DatasetConfig(
+    name="stops",
+    source_path="input_data/naptan_stops.gpkg",
+    columns=["ATCOCode", "CommonName", "StopType"],
+    row_group_size=10_000,
+)
+
+dtf_cfg = DTFConfig(
+    swa_org_name="My Council",
+    swa_org_ref=1234,
+    rhs_name="stops",
+)
+
+matcher = UsrnMatcher(
+    usrn_parquet="output_data/usrns_27700.parquet",
+    rhs_config=cfg,
+)
+
+# Run nearest join — must pass include_rhs_geometry=True for DTF export
+table = matcher.match_nearest(
+    bbox=[412000, 426000, 444000, 445000],
+    distance_m=25,
+    include_rhs_geometry=True,
+)
+
+out = pathlib.Path("matched_data")
+stem = "matched_stops_ad"
+
+to_dtf_csv(table, dtf_cfg, out / f"{stem}.csv")            # DTF 8.1a CSV
+to_dtf_geoparquet(table, dtf_cfg, out / f"{stem}.parquet") # GeoParquet 1.1
+to_dtf_flat_csv(table, dtf_cfg, out / f"{stem}_flat.csv")  # flat CSV (QGIS-ready)
+to_dtf_gpkg(table, dtf_cfg, out / f"{stem}.gpkg")          # GeoPackage
+```
 
 ---
 
@@ -214,13 +316,17 @@ The nearest join wraps the USRN geometry as `ST_AsWKB(u.geometry)` rather than s
 
 ## Output
 
-**Intersect join** — one row per USRN–polygon intersection, geometry clipped to the polygon (and bbox if supplied):
+### Standard match output (`usrn-matcher match`)
+
+Keeps the **USRN street geometry**. Each row describes a street segment and what was found on or near it.
+
+**Intersect join** — one row per USRN–feature intersection, geometry clipped to the RHS feature (and bbox if supplied):
 
 | Column | Description |
 |---|---|
 | `usrn` | Unique Street Reference Number |
 | `street_type` | Road classification |
-| `geometry` | Clipped USRN linestring (WKT in CSV, WKB in GeoParquet) |
+| `geometry` | `ST_Intersection` of the USRN and RHS feature — the segment of the street that falls inside the RHS polygon (WKT in CSV, WKB in GeoParquet) |
 | *(RHS columns)* | All selected columns from the right-hand side dataset |
 
 **Nearest join** — one row per USRN–point pair within `distance_m`, ordered by `usrn, distance_m`:
@@ -229,6 +335,32 @@ The nearest join wraps the USRN geometry as `ST_AsWKB(u.geometry)` rather than s
 |---|---|
 | `usrn` | Unique Street Reference Number |
 | `street_type` | Road classification |
-| `geometry` | USRN linestring (WKT in CSV, WKB in GeoParquet) |
+| `geometry` | USRN linestring clipped to the bbox boundary if `--bbox`/`--city` supplied, otherwise full USRN (no RHS clipping — points have no area to intersect against) |
 | *(RHS columns)* | All selected columns from the right-hand side dataset |
 | `distance_m` | Distance in metres between the point and the USRN |
+
+### DTF export output (`usrn-matcher export`)
+
+Keeps the **matched RHS feature geometry**. Each row describes a matched feature from the third-party dataset and which USRN it was matched to. Four files are written per export run — see the export section above for the full file list.
+
+---
+
+### Output cardinality
+
+Both routes run the same spatial join and produce the **same number of rows**. The relationship is many-to-many — a USRN can cross many RHS features, and an RHS feature can touch many USRNs — so the output will always have more rows than either source dataset alone.
+
+The difference is which entity is repeated across rows:
+
+| | Normal intersect (`match`) | Normal nearest (`match --mode nearest`) | DTF (`export`) |
+|---|---|---|---|
+| Geometry kept | `ST_Intersection(usrn, rhs)` — segment of the USRN inside the RHS polygon, also clipped to bbox if supplied | USRN clipped to bbox if supplied, otherwise full USRN — no RHS clipping (points have no area) | Full unclipped RHS feature geometry |
+| Repeated entity | USRNs — same USRN appears once per RHS feature it crosses | RHS features — same feature appears once per USRN it touches |
+| To get unique streets | `GROUP BY usrn` | `GROUP BY usrn` |
+| To get unique RHS features | Deduplicate on RHS attribute columns | `GROUP BY` RHS attribute columns |
+| Question answered | What portion of this street falls within each RHS feature? | Which streets does this feature touch? |
+
+**Example — soil data for Leeds (39,582 rows):**
+- A soil polygon covering a large area may touch 50+ USRNs → appears 50+ times in the DTF output
+- A long A-road crossing 10 soil polygons → appears 10 times in both outputs, each with a different soil type
+- To count how many soil types each USRN crosses: `GROUP BY usrn, COUNT(DISTINCT MAP_SYMBOL)`
+- To count how many USRNs each soil polygon touches: `GROUP BY MAP_SYMBOL, COUNT(DISTINCT usrn)`

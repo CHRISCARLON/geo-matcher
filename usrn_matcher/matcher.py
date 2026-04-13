@@ -107,6 +107,7 @@ class UsrnMatcher:
         self,
         bbox: list[float] | None = None,
         explain: bool = False,
+        include_rhs_geometry: bool = False,
     ) -> pa.Table:
         """Spatially join USRNs to the configured dataset.
 
@@ -119,6 +120,9 @@ class UsrnMatcher:
         explain:
             If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
             The join runs twice when this flag is set.
+        include_rhs_geometry:
+            If ``True``, appends a ``rhs_geometry`` column (WKB bytes of the
+            matched RHS feature geometry). Required for DTF export.
 
         Returns
         -------
@@ -134,6 +138,7 @@ class UsrnMatcher:
             rhs_config=self._rhs_config,
             bbox=bbox,
             explain=explain,
+            include_rhs_geometry=include_rhs_geometry,
         ).to_arrow_table()
         log.info("Result row count: %d", len(table))
         return table
@@ -143,6 +148,7 @@ class UsrnMatcher:
         distance_m: float = 50.0,
         bbox: list[float] | None = None,
         explain: bool = False,
+        include_rhs_geometry: bool = False,
     ) -> pa.Table:
         """Find the nearest USRN for each point in the configured dataset.
 
@@ -156,6 +162,9 @@ class UsrnMatcher:
             which points are matched.
         explain:
             If ``True``, runs EXPLAIN ANALYZE and logs the query plan.
+        include_rhs_geometry:
+            If ``True``, appends a ``rhs_geometry`` column (WKB bytes of the
+            matched RHS point geometry). Required for DTF export.
 
         Returns
         -------
@@ -171,6 +180,7 @@ class UsrnMatcher:
             distance_m=distance_m,
             bbox=bbox,
             explain=explain,
+            include_rhs_geometry=include_rhs_geometry,
         )
 
         return result.to_arrow_table()
@@ -472,6 +482,86 @@ class UsrnMatcher:
             help="Directory for output files (default: matched_data).",
         )
 
+        # ------------------------------------------------------------------ #
+        # export                                                               #
+        # ------------------------------------------------------------------ #
+        p_export = sub.add_parser(
+            "export",
+            help="Export join results as a DTF8.1-inspired CSV + GeoParquet.",
+        )
+        p_export.add_argument(
+            "--rhs-name",
+            required=True,
+            metavar="NAME",
+            help="Name of the prepared RHS dataset.",
+        )
+        p_export.add_argument(
+            "--rhs-columns",
+            nargs="*",
+            default=[],
+            metavar="COL",
+            help="Columns to select from the RHS dataset. Omit to select all.",
+        )
+
+        export_area = p_export.add_mutually_exclusive_group()
+        export_area.add_argument(
+            "--bbox",
+            nargs=4,
+            type=float,
+            metavar=("XMIN", "YMIN", "XMAX", "YMAX"),
+            help="Bounding box in EPSG:27700.",
+        )
+        export_area.add_argument(
+            "--city",
+            choices=city_names,
+            metavar="CITY",
+            help=f"Named city bbox. One of: {', '.join(city_names)}",
+        )
+
+        p_export.add_argument(
+            "--mode",
+            choices=["intersect", "nearest"],
+            default="intersect",
+            help="Join mode: 'intersect' (default) or 'nearest'.",
+        )
+        p_export.add_argument(
+            "--distance",
+            type=float,
+            default=50.0,
+            metavar="METRES",
+            help="Search radius in metres for --mode nearest (default: 50).",
+        )
+        p_export.add_argument(
+            "--dtf-org-name",
+            default="usrn-matcher",
+            metavar="NAME",
+            help="Organisation name written to the DTF type 10 header (default: usrn-matcher).",
+        )
+        p_export.add_argument(
+            "--dtf-org-ref",
+            type=int,
+            default=0,
+            metavar="CODE",
+            help="SWA organisation reference code for the DTF header (default: 0).",
+        )
+        p_export.add_argument(
+            "--cache-dir",
+            default="output_data",
+            metavar="DIR",
+            help="Directory containing prepared GeoParquet files (default: output_data).",
+        )
+        p_export.add_argument(
+            "--matched-dir",
+            default="matched_data",
+            metavar="DIR",
+            help="Directory for output files (default: matched_data).",
+        )
+        p_export.add_argument(
+            "--explain",
+            action="store_true",
+            help="Run EXPLAIN ANALYZE before the join.",
+        )
+
         args = parser.parse_args()
 
         # ------------------------------------------------------------------ #
@@ -550,6 +640,58 @@ class UsrnMatcher:
                     matched_dir / f"{stem}_sample.csv",
                     sample=args.sample_rows,
                 )
+
+        elif args.command == "export":
+            from .dtf import (
+                DTFConfig,
+                to_dtf_csv,
+                to_dtf_flat_csv,
+                to_dtf_geoparquet,
+                to_dtf_gpkg,
+            )
+
+            cache_dir = pathlib.Path(args.cache_dir)
+            rhs_config = DatasetConfig(
+                name=args.rhs_name,
+                source_path=cache_dir / f"{args.rhs_name}_27700.parquet",
+                parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
+                columns=args.rhs_columns,
+            )
+            bbox = (
+                args.bbox
+                if args.bbox is not None
+                else (getattr(_bboxes, args.city) if args.city else None)
+            )
+            matcher = cls(
+                usrn_parquet=cache_dir / "usrns_27700.parquet",
+                rhs_config=rhs_config,
+            )
+
+            if args.mode == "nearest":
+                table = matcher.match_nearest(
+                    distance_m=args.distance,
+                    bbox=bbox,
+                    explain=args.explain,
+                    include_rhs_geometry=True,
+                )
+            else:
+                table = matcher.match_intersect(
+                    bbox=bbox,
+                    explain=args.explain,
+                    include_rhs_geometry=True,
+                )
+
+            dtf_config = DTFConfig(
+                swa_org_name=args.dtf_org_name,
+                swa_org_ref=args.dtf_org_ref,
+                rhs_name=args.rhs_name,
+            )
+            matched_dir = pathlib.Path(args.matched_dir)
+            stem = f"matched_{args.rhs_name}_ad"
+            to_dtf_csv(table, dtf_config, matched_dir / f"{stem}.csv")
+            to_dtf_geoparquet(table, dtf_config, matched_dir / f"{stem}.parquet")
+            to_dtf_flat_csv(table, dtf_config, matched_dir / f"{stem}_flat.csv")
+            to_dtf_gpkg(table, dtf_config, matched_dir / f"{stem}.gpkg")
 
 
 def _cmd_init() -> None:
