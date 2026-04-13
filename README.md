@@ -2,7 +2,7 @@
 
 Spatially join Unique Street Reference Numbers (USRNs) to any geospatial dataset using SedonaDB.
 
-Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) with optimised [GeoParquet 1.1](https://geoparquet.org/) files.
+Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) for spatial joins and [DuckDB](https://duckdb.org/) for GeoParquet preparation, with optimised [GeoParquet 1.1](https://geoparquet.org/) output.
 
 ## What it does
 
@@ -246,11 +246,13 @@ to_dtf_gpkg(table, dtf_cfg, out / f"{stem}.gpkg")          # GeoPackage
 
 ### Pre-spatial phase
 
-Each source file is converted to an optimised GeoParquet 1.1 file in `output_data/`. 
+Each source file is converted to an optimised GeoParquet 1.1 file in `output_data/`.
 
 Run it once, then query as many times as you like.
 
-**Spatial sort** — geometries are sorted by WKB representation before writing. This approximates a spatial ordering so geographically nearby features land in the same row groups.
+**DuckDB pipeline** — the entire prepare phase runs inside DuckDB, without going through GeoPandas or loading geometry into Python memory. For GeoPackage/Shapefile/etc. sources, `ST_Read()` reads the file natively. For CSV sources, `read_csv()` ingests the file and `ST_Point()` builds point geometries from the X/Y columns. DuckDB then sorts, computes the bbox struct, and writes the Parquet file in a single `COPY ... TO ... (FORMAT PARQUET)` statement. A lightweight PyArrow post-processing step patches the GeoParquet 1.1 metadata (covering key, CRS PROJJSON) into the file footer.
+
+**Spatial sort** — geometries are sorted by a Z-order (Hilbert) key computed from each feature's centroid within the British National Grid extent (EPSG:27700) using DuckDB's `ST_Hilbert(geom, BOX_2D)`. Sorting by this key clusters spatially adjacent features into consecutive row groups, maximising SedonaDB's ability to skip row groups during spatial joins.
 
 **Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups across 1.76M rows); polygon datasets default to `10,000`. More row groups means more opportunities for SedonaDB to skip irrelevant data.
 
@@ -311,6 +313,28 @@ In practice, Speculative chooses `prepare_none` (`execution_mode=0`) for point d
 **ST_AsWKB wrapping (nearest join)**
 
 The nearest join wraps the USRN geometry as `ST_AsWKB(u.geometry)` rather than selecting it as a raw column. Selecting a raw `WkbView` geometry column causes a segfault in Sedona's `to_arrow_table()` — the computed expression forces a safe buffer allocation. See `sedona-spatial-join/src/refine/geos.rs` for the underlying materialisation path.
+
+### DTF export phase
+
+The DTF GeoParquet output (`to_dtf_geoparquet`) uses the same DuckDB pipeline as the prepare phase. After building the DTF column layout, the shapely geometries are serialised to WKB and registered as a PyArrow table directly in DuckDB memory (no temp file). DuckDB then computes the inline `bbox` struct, Hilbert-sorts the rows, and writes the GeoParquet file via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1 with the covering key and CRS PROJJSON.
+
+The Hilbert sort in the DTF path also runs in DuckDB — the registered PyArrow table is queried with `ST_Hilbert(ST_GeomFromWKB(rhs_geometry), BOX_2D)` to get sort keys, which are then used to reorder the GeoDataFrame before writing. No file I/O is required for the sort step.
+
+**DuckDB ↔ PyArrow zero-copy registration**
+
+Both the sort and write steps use `con.register("name", arrow_table)` to hand an in-memory PyArrow table to DuckDB without copying or serialising it. DuckDB reads the Arrow columnar buffers in place (via Arrow's zero-copy interface) and the registered name becomes a virtual table in any subsequent SQL:
+
+```python
+con = duckdb.connect()
+con.execute("LOAD spatial;")
+con.register("_dtf_src", arrow_table)   # pa.Table — no copy, no file
+
+con.sql("SELECT ST_Hilbert(ST_GeomFromWKB(rhs_geometry), ...) FROM _dtf_src")
+```
+
+The geometry column is stored as `pa.binary()` (raw WKB bytes). DuckDB sees it as a `BLOB`, so `ST_GeomFromWKB()` deserialises it into DuckDB's internal `GEOMETRY` type on the fly. This means spatial functions (`ST_Hilbert`, `ST_XMin`, etc.) work directly on data that lives in Python memory, with no round-trip to disk.
+
+This is DuckDB's "replacement scan" feature — registered Python objects (Arrow tables, Pandas DataFrames, NumPy arrays) are substituted into the query plan as virtual tables. It works because DuckDB and PyArrow share the Arrow columnar memory layout.
 
 ---
 

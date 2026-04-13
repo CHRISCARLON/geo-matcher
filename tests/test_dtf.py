@@ -1,8 +1,11 @@
 """Tests for usrn_matcher.dtf — DTF8.1-inspired export module."""
 
+import json
 from datetime import date
 
+import geopandas as gpd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import shapely.wkb
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
@@ -399,3 +402,168 @@ class TestMissingRhsGeometry:
     def test_to_dtf_gpkg_raises(self, cfg, tmp_path):
         with pytest.raises(ValueError, match="rhs_geometry"):
             to_dtf_gpkg(self._table_without_rhs_geometry(), cfg, tmp_path / "out.gpkg")
+
+
+# ---------------------------------------------------------------------------
+# Integration: to_dtf_geoparquet output quality
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def multi_row_table():
+    """Three-row table with mixed geometry types for output tests."""
+    pt_wkb = shapely.wkb.dumps(Point(412000.0, 426000.0))
+    ls_wkb = shapely.wkb.dumps(LineString([(412000.0, 426000.0), (413000.0, 427000.0)]))
+    poly_wkb = shapely.wkb.dumps(Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000), (0, 0)]))
+    return pa.table(
+        {
+            "usrn": pa.array([1, 2, 1], type=pa.int64()),
+            "street_type": pa.array(["A Road", "B Road", "A Road"], type=pa.string()),
+            "geometry": pa.array([b"x", b"x", b"x"], type=pa.binary()),
+            "rhs_geometry": pa.array([pt_wkb, ls_wkb, poly_wkb], type=pa.binary()),
+            "name": pa.array(["alpha", "beta", "gamma"], type=pa.string()),
+        }
+    )
+
+
+class TestToDtfGeoparquet:
+    def test_writes_file(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        result = to_dtf_geoparquet(multi_row_table, cfg, out)
+        assert result == out
+        assert out.stat().st_size > 0
+
+    def test_geoparquet_version_11(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+        assert geo["version"] == "1.1.0"
+
+    def test_covering_metadata(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+        covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
+        assert covering == {
+            "xmin": ["bbox", "xmin"],
+            "ymin": ["bbox", "ymin"],
+            "xmax": ["bbox", "xmax"],
+            "ymax": ["bbox", "ymax"],
+        }
+
+    def test_crs_in_metadata(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+        crs_meta = geo["columns"]["geometry"].get("crs")
+        assert crs_meta is not None
+        assert "27700" in str(crs_meta)
+
+    def test_compression_zstd(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        rg = pq.ParquetFile(out).metadata.row_group(0)
+        for i in range(rg.num_columns):
+            col = rg.column(i)
+            assert col.compression == "ZSTD", (
+                f"{col.path_in_schema}: expected ZSTD, got {col.compression}"
+            )
+
+    def test_dtf_columns_present(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        names = pq.read_schema(str(out)).names
+        for col in ("USRN", "RECORD_IDENTIFIER", "ATTRIBUTION_SEQ_NUM", "GEOMETRY_TYPE", "geometry"):
+            assert col in names, f"Expected column {col!r} in GeoParquet output"
+
+    def test_row_count(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        assert pq.read_metadata(str(out)).num_rows == len(multi_row_table)
+
+    def test_rhs_cols_not_in_skip_set_are_preserved(self, cfg, multi_row_table, tmp_path):
+        """RHS attribute columns (here: 'name') survive into the GeoParquet."""
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        assert "name" in pq.read_schema(str(out)).names
+
+
+# ---------------------------------------------------------------------------
+# Integration: to_dtf_flat_csv output quality
+# ---------------------------------------------------------------------------
+
+
+class TestToDtfFlatCsv:
+    def test_writes_file(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out_flat.csv"
+        result = to_dtf_flat_csv(multi_row_table, cfg, out)
+        assert result == out
+        assert out.stat().st_size > 0
+
+    def test_row_count(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out_flat.csv"
+        to_dtf_flat_csv(multi_row_table, cfg, out)
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        # One header + one row per input row
+        assert len(lines) == len(multi_row_table) + 1
+
+    def test_dtf_columns_in_header(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out_flat.csv"
+        to_dtf_flat_csv(multi_row_table, cfg, out)
+        header = out.read_text(encoding="utf-8").splitlines()[0].split(",")
+        for col in ("USRN", "RECORD_IDENTIFIER", "GEOMETRY_TYPE", "geometry"):
+            assert col in header, f"Expected {col!r} in flat CSV header"
+
+    def test_geometry_col_is_wkt(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out_flat.csv"
+        to_dtf_flat_csv(multi_row_table, cfg, out)
+        import csv as _csv
+        with open(out, newline="", encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+        # Each geometry cell should be a WKT string, not raw bytes
+        for row in rows:
+            wkt = row["geometry"]
+            assert any(wkt.startswith(prefix) for prefix in ("POINT", "LINESTRING", "POLYGON", "MULTI")), (
+                f"Expected WKT geometry, got: {wkt!r}"
+            )
+
+    def test_rhs_attribute_preserved(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out_flat.csv"
+        to_dtf_flat_csv(multi_row_table, cfg, out)
+        content = out.read_text(encoding="utf-8")
+        assert "alpha" in content
+
+
+# ---------------------------------------------------------------------------
+# Integration: to_dtf_gpkg output quality
+# ---------------------------------------------------------------------------
+
+
+class TestToDtfGpkg:
+    def test_writes_file(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.gpkg"
+        result = to_dtf_gpkg(multi_row_table, cfg, out)
+        assert result == out
+        assert out.stat().st_size > 0
+
+    def test_readable_as_geodataframe(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.gpkg"
+        to_dtf_gpkg(multi_row_table, cfg, out)
+        gdf = gpd.read_file(str(out))
+        assert len(gdf) == len(multi_row_table)
+        assert gdf.crs is not None
+        assert gdf.crs.to_epsg() == 27700
+
+    def test_dtf_columns_present(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.gpkg"
+        to_dtf_gpkg(multi_row_table, cfg, out)
+        gdf = gpd.read_file(str(out))
+        for col in ("USRN", "RECORD_IDENTIFIER", "GEOMETRY_TYPE"):
+            assert col in gdf.columns, f"Expected column {col!r} in GeoPackage"
+
+    def test_custom_layer_name(self, cfg, multi_row_table, tmp_path):
+        out = tmp_path / "out.gpkg"
+        to_dtf_gpkg(multi_row_table, cfg, out, layer="my_layer")
+        # gpd.list_layers returns a DataFrame with a 'name' column (geopandas ≥ 0.14 / pyogrio)
+        layer_names = gpd.list_layers(str(out))["name"].tolist()
+        assert "my_layer" in layer_names

@@ -1,6 +1,7 @@
 """DTF8.1-inspired export for USRN match results.
 
 A community extension to the NSG DTF8.1 format for third-party spatially matched datasets.
+
 Produces four output files per run — a DTF CSV, GeoParquet, flat CSV, and GeoPackage — all
 carrying the matched RHS feature geometry (not the USRN street geometry).
 
@@ -58,7 +59,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+import duckdb
 import geopandas as gpd
+import numpy as np
 import pyarrow as pa
 import shapely
 from shapely.geometry import (
@@ -70,7 +73,7 @@ from shapely.geometry import (
 )
 
 from .logger import get_logger
-from .prepare import write_geoparquet
+from .prepare import _BNG_BOX, _patch_covering_metadata
 
 log: logging.Logger = get_logger()
 
@@ -568,7 +571,9 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
     layout mirrors the type 63a CSV record — fixed DTF fields first, then RHS
     attribute columns, then the native geometry column (from rhs_geometry).
 
-    The GeoDataFrame is spatially sorted (same approximation as prepare_dataset).
+    The GeoDataFrame is sorted by Hilbert curve index (``ST_Hilbert`` via DuckDB
+    in-memory) for spatial locality in the output GeoParquet.  DuckDB registers
+    the source PyArrow table directly — no file I/O required.
     """
     import pandas as pd
 
@@ -614,7 +619,82 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
         geometry=list(geoms),
         crs="EPSG:27700",
     )
-    return gpd.GeoDataFrame(gdf.sort_values("geometry").reset_index(drop=True))
+
+    # Hilbert sort using DuckDB in-memory — register the original PyArrow table so
+    # we can run ST_Hilbert on the rhs_geometry WKB column without touching disk.
+    # COALESCE guards against any null rhs_geometry rows.
+    con = duckdb.connect()
+    con.execute("LOAD spatial;")
+    con.register("_dtf_src", table)
+    hilbert_keys = np.asarray(
+        con.sql(f"""
+            SELECT COALESCE(
+                ST_Hilbert(ST_GeomFromWKB(rhs_geometry), {_BNG_BOX}),
+                0
+            ) AS h
+            FROM _dtf_src
+        """).fetchnumpy()["h"],
+        dtype=np.uint32,
+    )
+
+    idx = np.argsort(hilbert_keys)
+    return gpd.GeoDataFrame(gdf.iloc[idx].reset_index(drop=True))
+
+
+def _write_dtf_geoparquet(
+    gdf: gpd.GeoDataFrame,
+    path: pathlib.Path,
+    row_group_size: int,
+) -> None:
+    """Write a Hilbert-sorted DTF GeoDataFrame as GeoParquet 1.1 via DuckDB.
+
+    Converts the shapely geometry column to WKB, registers the resulting PyArrow
+    table with DuckDB in-memory, and uses ``COPY TO PARQUET`` with an inline bbox
+    struct column.  Follows the same pipeline as :func:`~usrn_matcher.prepare.prepare_dataset`:
+    DuckDB writes the file, then :func:`~usrn_matcher.prepare._patch_covering_metadata`
+    upgrades to GeoParquet 1.1 with the covering key and CRS PROJJSON.
+
+    No temp file is written — avoids the GeoPandas two-pass round-trip.
+    """
+    import pandas as pd
+
+    # Convert shapely geometries → WKB bytes for DuckDB
+    wkb = pa.array(shapely.to_wkb(gdf.geometry.values), type=pa.binary())
+
+    # Build PyArrow table: non-geometry columns first, WKB geometry last
+    base = pa.Table.from_pandas(
+        pd.DataFrame(gdf.drop(columns=["geometry"])), preserve_index=False
+    )
+    arrow_table = base.append_column(pa.field("geometry", pa.binary()), wkb)
+
+    con = duckdb.connect()
+    con.execute("LOAD spatial;")
+    con.register("_dtf_write_src", arrow_table)
+
+    # Inline bbox struct so DuckDB writes it alongside the geometry column.
+    # A subquery materialises ST_GeomFromWKB once so the four ST_X*/ST_Y*
+    # calls and the ST_Hilbert sort all reference the same geometry object.
+    con.execute(f"""
+        COPY (
+            SELECT
+                *,
+                {{
+                    'xmin': ST_XMin(geometry),
+                    'ymin': ST_YMin(geometry),
+                    'xmax': ST_XMax(geometry),
+                    'ymax': ST_YMax(geometry)
+                }} AS bbox
+            FROM (
+                SELECT
+                    * EXCLUDE geometry,
+                    ST_GeomFromWKB(geometry) AS geometry
+                FROM _dtf_write_src
+            )
+        ) TO '{path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {row_group_size})
+    """)
+
+    _patch_covering_metadata(path, row_group_size, crs="EPSG:27700")
 
 
 def to_dtf_geoparquet(
@@ -629,8 +709,8 @@ def to_dtf_geoparquet(
     fixed DTF fields, then RHS attribute columns, then a native geometry column
     (the matched RHS geometry — equivalent to the WKT in the paired type 67a).
 
-    Spatial optimisations: spatial sort, GeoParquet 1.1 bbox covering columns,
-    ZSTD compression.
+    Uses the same DuckDB pipeline as the prepare phase: Hilbert sort, inline bbox
+    struct, GeoParquet 1.1 covering key, ZSTD compression — no GeoPandas temp file.
 
     Parameters
     ----------
@@ -653,7 +733,7 @@ def to_dtf_geoparquet(
         )
 
     gdf = _build_dtf_gdf(table, config)
-    write_geoparquet(gdf, resolved, row_group_size)
+    _write_dtf_geoparquet(gdf, resolved, row_group_size)
     log.info("Written DTF GeoParquet: %s", resolved)
     return resolved
 

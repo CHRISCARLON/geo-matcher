@@ -7,8 +7,7 @@ specification — what is compliant, what differs, and why.
 
 DTF8.1 was designed for highway authority ASD (Additional Street Data) exchange. 
 
-It has no built-in concept of spatially matching a third-party dataset to USRNs and attaching the results
-alongside the USRN record.
+It has no built-in concept of spatially matching a third-party dataset to USRNs and attaching the results alongside the USRN record.
 
 This file represents a **community extension to DTF8.1 for third-party spatially matched
 datasets**. 

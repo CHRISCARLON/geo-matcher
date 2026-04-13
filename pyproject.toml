@@ -9,7 +9,8 @@ description = "A library to spatially join USRNs to any spatial dataset"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "apache-sedona[db]==1.8.1"
+    "apache-sedona[db]==1.8.1",
+    "duckdb>=1.5.2",
 ]
 
 [dependency-groups]
