@@ -167,6 +167,14 @@ Run it once, then query as many times as you like.
 
 SedonaDB reads this and calls `access_plan.skip(i)` for any row group whose bbox doesn't overlap the query region — before reading a single geometry byte. For a Leeds query, 858/979 USRN row groups are skipped (88% pruning, ~162 MB → 20 MB scanned).
 
+Two parquet optimisations are in play here:
+
+**Predicate pushdown** — the bbox covering columns enable row group skipping. SedonaDB checks the `xmin/ymin/xmax/ymax` min/max statistics in the file footer for each row group and calls `access_plan.skip(i)` for any group whose bbox doesn't overlap the query. No WKB bytes are read for skipped row groups — this is the 88% pruning (858/979 row groups) measured for a Leeds query. See the [Polars predicate pushdown post](https://pola.rs/posts/predicate-pushdown-query-optimizer/) for a good general breakdown of the technique.
+
+**Projection pushdown** — because parquet is columnar, selecting only `usrn`, `street_type`, `geometry` and the chosen RHS columns means the reader fetches only those column chunks from disk. Every column we don't select is never touched. This is free — it follows directly from the columnar layout.
+
+The [Apache Arrow blog post on querying parquet with millisecond latency](https://arrow.apache.org/blog/2022/12/26/querying-parquet-with-millisecond-latency/) is a good deep-dive into how parquet enables both of these at the file-format level.
+
 It's like a poor man's spatial index essentially.
 
 **ZSTD compression** — all columns compressed with ZSTD; low-cardinality string columns use `RLE_DICTIONARY` encoding automatically.

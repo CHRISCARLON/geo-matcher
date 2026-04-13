@@ -276,15 +276,23 @@ def run_nearest_join(
         log.info("No bbox supplied — matching all points.")
 
     col_fragment: str = _col_fragment(rhs_config)
+    bbox_wkt: str | None = _bbox_wkt(bbox)
 
-    # TODO: Look into why not wrapping the Geometry in
-    # ST_AsWKB causes a seg fault
-    # Why do we need to make Sedona do this?
+    # Clip the USRN geometry to the bbox so long streets don't extend outside
+    # the area of interest — mirrors the ST_Intersection clipping in run_intersect_join.
+    # ST_Intersection also avoids the raw WkbView segfault in to_arrow_table(), so
+    # ST_AsWKB is only needed for the unclipped (no-bbox) case.
+    geometry_expr: str = (
+        f"ST_Intersection(u.geometry, {bbox_wkt})"
+        if bbox_wkt
+        else "ST_AsWKB(u.geometry)"
+    )
+
     query: str = f"""
         SELECT
             u.usrn,
             u.street_type,
-            ST_AsWKB(u.geometry) AS geometry
+            {geometry_expr} AS geometry
             {col_fragment},
             ST_Distance(u.geometry, s.geometry) AS distance_m
         FROM usrns AS u
