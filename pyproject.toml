@@ -1,7 +1,11 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "usrn-soil-matcher"
-version = "0.1.0"
-description = "A simple library to spatially join USRNs to the National Soil Dataset"
+name = "usrn-matcher"
+version = "0.2.0"
+description = "A library to spatially join USRNs to any spatial dataset"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,11 +20,11 @@ dev = [
 [tool.uv]
 package = true
 
-[tool.setuptools.packages.find]
-include = ["usrn_soil_matcher*"]
+[tool.hatch.build.targets.wheel]
+packages = ["usrn_matcher"]
 
 [project.scripts]
-usrn-matcher = "usrn_soil_matcher.matcher:UsrnSoilMatcher.cli"
+usrn-matcher = "usrn_matcher.matcher:UsrnMatcher.cli"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -635,8 +635,8 @@ wheels = [
 ]
 
 [[package]]
-name = "usrn-soil-matcher"
-version = "0.1.0"
+name = "usrn-matcher"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "apache-sedona", extra = ["db"] },

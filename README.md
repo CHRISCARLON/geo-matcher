@@ -1,14 +1,10 @@
-# USRN Soil Matcher
+# usrn-matcher
 
-Spatially joins Unique Street Reference Numbers (USRNs) to National Soil polygons.
+Spatially join Unique Street Reference Numbers (USRNs) to any polygon or point dataset using SedonaDB.
 
-Built on SedonaDB (Rust-based spatial query engine).
+Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) with optimised [GeoParquet 1.1](https://geoparquet.org/) files (he hopes).
 
-Just focuses on the National Soil polygons for now but will become more generic.
-
-## Installation
-
-Will put on PyPi soon.
+## Installation (will add it to pypi soon)
 
 ```bash
 git clone <repo>
@@ -16,64 +12,147 @@ cd usrn-matcher
 uv sync
 ```
 
-Place your input files in `input_data/` before running:
+## Quick start
 
-```
-input_data/
-  osopenusrn.gpkg
-  NationalSoilMap.gpkg
-```
-
-## Usage
+### 1. Initialise project directories
 
 ```bash
-usrn-matcher --bbox XMIN YMIN XMAX YMAX [--output csv|parquet|sample] [--explain]
-
-or 
-
-usrn-matcher --city LEEDS [--output csv|parquet|sample] [--explain]
+usrn-matcher init
 ```
 
-A bounding box is required — full-dataset joins are not permitted.
+Creates `input_data/`, `output_data/`, and `matched_data/` if they don't exist:
 
-**Examples**
+```
+input_data/     ← place your source GeoPackages here
+output_data/    ← prepared GeoParquet files are stored here
+matched_data/   ← join results are written here
+```
+
+### 2. Pre-spatial phase — prepare GeoParquet files
+
+Convert your source files into optimised GeoParquet 1.1 with bbox covering columns and spatial sorting. 
+
+This only needs to be done once per dataset.
+
 ```bash
-# London
-usrn-matcher --bbox 503000 155000 562000 200000
-
-# Leeds with query plan
-usrn-matcher --city LEEDS --explain
+usrn-matcher prepare \
+  --usrn-gpkg input_data/osopenusrn.gpkg \
+  --rhs-gpkg input_data/NationalSoilMap.gpkg \
+  --rhs-name soil \
+  --rhs-geometry-col SHAPE
 ```
 
-**As a library**
-```python
-from usrn_soil_matcher import UsrnSoilMatcher
+Key options:
 
-matcher = UsrnSoilMatcher.from_gpkgs(
-    usrn_gpkg="input_data/osopenusrn.gpkg",
-    soil_gpkg="input_data/NationalSoilMap.gpkg",
-)
-gdf = matcher.match(bbox=[412000, 426000, 444000, 445000])
-matcher.to_csv(gdf, "output.csv")
+| Option | Default | Description |
+|---|---|---|
+| `--usrn-gpkg` | `input_data/osopenusrn.gpkg` | OS Open USRN GeoPackage |
+| `--rhs-gpkg` | required | Right-hand side source file |
+| `--rhs-name` | required | Short identifier (valid SQL identifier, e.g. `soil`, `flood_risk`) |
+| `--rhs-geometry-col` | `geometry` | Geometry column name in source file |
+| `--rhs-row-group-size` | `10000` | Row group size for RHS GeoParquet |
+| `--usrn-row-group-size` | `20000` | Row group size for USRN GeoParquet |
+| `--cache-dir` | `output_data` | Directory for cached GeoParquet files |
+| `--force` | off | Re-prepare even if GeoParquet already exists |
+
+### 3. Spatial phase — run the join
+
+```bash
+# Full national intersect join (polygon/line datasets)
+usrn-matcher match --rhs-name soil
+
+# Nearest-USRN join (point datasets) — assigns each point to its closest USRN within 25m
+usrn-matcher match --rhs-name stops --mode nearest --distance 25 --city LEEDS
+
+# Restricted to a bounding box (EPSG:27700)
+usrn-matcher match --rhs-name soil --bbox 412000 426000 444000 445000
+
+# Named city
+usrn-matcher match --rhs-name soil --city LEEDS
+
+# Select specific columns from the RHS
+usrn-matcher match --rhs-name soil --city LEEDS --rhs-columns MUSID MAP_SYMBOL DRAINAGE
+
+# Output as GeoParquet instead of CSV
+usrn-matcher match --rhs-name soil --city LEEDS --output parquet
+
+# Sample the first 10,000 rows
+usrn-matcher match --rhs-name soil --output sample --sample-rows 10000
+
+# Inspect the query plan
+usrn-matcher match --rhs-name stops --mode nearest --city LEEDS --explain
 ```
 
-Coordinates are in EPSG:27700 (British National Grid).
+Key options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--rhs-name` | required | Name of the prepared RHS dataset |
+| `--rhs-columns` | all | Columns to select (auto-discovers from schema if omitted) |
+| `--mode` | `intersect` | `intersect` for polygon/line datasets; `nearest` for point datasets |
+| `--distance` | `50` | Search radius in metres for `--mode nearest` |
+| `--bbox XMIN YMIN XMAX YMAX` | full join | Bounding box in EPSG:27700 |
+| `--city` | full join | Named city preset (LEEDS, LONDON, MANCHESTER, …) |
+| `--output` | `csv` | `csv`, `parquet`, or `sample` |
+| `--sample-rows` | `100000` | Row limit for `--output sample` |
+| `--explain` | off | Run EXPLAIN ANALYZE before the join and log the query plan |
+| `--cache-dir` | `output_data` | Directory containing prepared GeoParquet files |
+| `--matched-dir` | `matched_data` | Directory for output files |
+
+Output files are named `usrn_{rhs-name}_attribution.{ext}`.
 
 ---
 
-## Things I've learnt so far
+## Programmatic usage
 
-These are just some notes to record how best to structure geoparquet files to make use of how SedonaDB works internally.
+```python
+from usrn_matcher import UsrnMatcher, DatasetConfig
+from usrn_matcher.prepare import prepare_usrns, prepare_dataset
 
-Might still be some errors in my understanding!
+# Describe the right-hand side dataset
+cfg = DatasetConfig(
+    name="soil",
+    source_path="input_data/NationalSoilMap.gpkg",
+    geometry_column="SHAPE",               # rename non-standard geometry column
+    columns=["MAP_SYMBOL", "DRAINAGE"],    # [] = auto-select all columns
+    row_group_size=10_000,
+)
 
-### 1. GeoParquet 1.1 with bbox covering columns
+# Pre-spatial phase (skipped if GeoParquet already exists)
+matcher = UsrnMatcher.from_sources(
+    usrn_gpkg="input_data/osopenusrn.gpkg",
+    rhs_config=cfg,
+    cache_dir="output_data",
+)
 
-Each parquet file contains a `bbox` struct column (`xmin`, `ymin`, `xmax`, `ymax`) with one row per geometry, computed from `gdf.geometry.bounds`. 
+# Spatial phase
+table = matcher.match_intersect(bbox=[412000, 426000, 444000, 445000])
+matcher.to_csv(table, "matched_data/usrn_soil_attribution.csv")
 
-Parquet files automatically write min/max statistics on these float columns into the file footer at the row group level.
+# Or skip preparation if GeoParquet files are already prepared
+matcher = UsrnMatcher(
+    usrn_parquet="output_data/usrns_27700.parquet",
+    rhs_config=cfg,
+)
+table = matcher.match_intersect()  # full national join
+```
 
-The `geo` metadata is patched to GeoParquet 1.1 with a `covering` key:
+
+---
+
+## How it works
+
+### Pre-spatial phase
+
+Each source file is converted to an optimised GeoParquet 1.1 file in `output_data/`. 
+
+Run it once, then query as many times as you like.
+
+**Spatial sort** — geometries are sorted by WKB representation before writing. This approximates a spatial ordering so geographically nearby features land in the same row groups.
+
+**Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups across 1.76M rows); polygon datasets default to `10,000`. More row groups means more opportunities for SedonaDB to skip irrelevant data.
+
+**GeoParquet 1.1 bbox covering columns** — a `bbox` struct column (`xmin`, `ymin`, `xmax`, `ymax`) is added to every row. Parquet writes min/max statistics on these floats into the file footer at the row group level. The geo metadata is patched with a `covering` key:
 
 ```json
 "covering": {
@@ -86,83 +165,62 @@ The `geo` metadata is patched to GeoParquet 1.1 with a `covering` key:
 }
 ```
 
-This tells SedonaDB which columns contain per-row bbox data. 
+SedonaDB reads this and calls `access_plan.skip(i)` for any row group whose bbox doesn't overlap the query region — before reading a single geometry byte. For a Leeds query, 858/979 USRN row groups are skipped (88% pruning, ~162 MB → 20 MB scanned).
 
-Without this key, Sedona ignores the bbox columns entirely. 
+It's like a poor man's spatial index essentially.
 
-The implementation is in `sedona-geoparquet/src/file_opener.rs` — `parse_column_coverings()` maps these paths to parquet column indices, `row_group_covering_geo_stats()` reads the min/max stats, and `filter_access_plan_using_geoparquet_covering()` calls `access_plan.skip(i)` for row groups outside the query bbox.
+**ZSTD compression** — all columns compressed with ZSTD; low-cardinality string columns use `RLE_DICTIONARY` encoding automatically.
 
-**Result:** For a Leeds bbox query, 858/979 USRN row groups are skipped before any geometry bytes are read (88% pruning). Bytes scanned drops from 162 MB to around 20 MB.
+### Spatial phase
 
-### 2. Fine-grained row groups
+**Two-phase spatial join (R-tree + refinement)**
 
-USRNs are written with `row_group_size=20,000` (89 row groups across 1.76M rows) and soil with `row_group_size=10,000` (5 row groups across 42K rows). 
+SedonaDB executes each join in two phases:
 
-More row groups = more opportunities to prune. `pq.write_table(..., row_group_size=N)` is used directly rather than `geoarrow.rust.io.GeoParquetWriter`, which has no `row_group_size` parameter and collapses data to 1–2 row groups via internal byte buffering.
+1. **Index phase** — an R-tree built with Hilbert curve ordering finds candidate geometry pairs from their bounding rectangles, without touching WKB bytes.
+2. **Refinement phase** — the exact spatial predicate (`ST_Intersects` or `ST_DWithin`) is evaluated only on candidates.
 
-TODO: Explore how I could use the rust arrow io crate and add row group sizes - speak to someone about this/raise PR?
+**Build/probe side assignment**
 
-### 3. Spatial sort
+Sedona automatically assigns the smaller table to the build side (R-tree index) and the larger to the probe side, based on cardinality estimates (`should_swap_join_order` in `physical_planner.rs`). For stops (434K) vs USRNs (1.76M): stops = build, USRNs = probe.
 
-Before writing, geometries are sorted by `gdf.sort_values("geometry")`. 
+**Speculative execution mode**
 
-GeoPandas sorts by the geometry's WKB representation which approximates a spatial ordering — geographically nearby features end up in the same row groups. 
+Sedona's default `execution_mode` is `Speculative(N)`. It samples the first N probe-side geometries at runtime and picks the best refinement strategy:
 
-This maximises bbox pruning effectiveness: a Leeds query skips row groups containing only southern England roads without inspecting a single geometry.
+- `prepare_build` — lazily creates GEOS `PreparedGeometry` objects for build-side geometries on first use, caching them for reuse across all probe comparisons. Worth it for complex polygons.
+- `prepare_probe` — prepares probe-side geometries instead. Better when the probe side has complex geometry.
+- `prepare_none` — no prepared geometries. Optimal for simple geometry types like points.
 
-### 4. ZSTD compression
+In practice, Speculative chooses `prepare_none` (`execution_mode=0`) for point datasets (e.g. stops) since point geometries are trivial to evaluate directly. We do not override this setting.
 
-All columns are written with `compression="zstd"`. String columns (soil type, drainage class etc.) use `RLE_DICTIONARY` encoding automatically. Both reduce bytes read from disk during scans.
+**Geometry clipping (intersect join)**
 
-### 5. Prepared build-side geometries (R-tree + prepared geometry index)
+`ST_Intersection(u.geometry, s.geometry)` is used rather than returning full USRN geometries. A USRN crossing three polygons produces three rows, each with only the segment inside that polygon. When a bbox is supplied the result is also clipped to its boundary.
 
-```python
-sd.sql("SET sedona.spatial_join.execution_mode TO 'prepare_build'").execute()
-```
+**ST_AsWKB wrapping (nearest join)**
 
-SedonaDB builds an **R-tree with Hilbert curve sorting** on the soil side (the build side — smaller table, 42K polygons) before the join starts. 
-
-Each soil polygon is also parsed into a prepared geometry (GEOS `PreparedGeometry` or TG internal index) which pre-computes internal spatial indices.
-
-The join then has two phases for each USRN:
-
-1. **Index phase** — for every USRN, Sedona computes its bounding rectangle and fires a single R-tree search (`default_spatial_index.rs:316`):
-   ```rust
-   let mut candidates = self.inner.rtree.search(min.x, min.y, max.x, max.y);
-   ```
-   This returns integer IDs of every soil polygon whose bounding box overlaps the USRN's bbox. For example, a USRN in Leeds at `[413000, 432000, 413200, 432050]` might get back `[8, 47, 203]` — three soil polygons whose bboxes touch that area. Everything else in the R-tree is discarded without touching any WKB bytes.
-
-2. **Refinement phase** — `ST_Intersects` is evaluated only on those 3 candidates using the pre-built prepared geometries. The candidate IDs are looked up via `data_id_to_batch_pos` → `(batch_idx, row_idx)` to retrieve the WKB, then the exact predicate is evaluated. Without `prepare_build`, the WKB would be re-parsed from scratch on every evaluation.
-
-`execution_mode=1` in the EXPLAIN output confirms `PrepareBuild` is active. Source: `sedona-common/src/option.rs:279`.
-
-### 6. Geometry clipping (ST_Intersection)
-
-The join uses `ST_Intersection(u.geometry, s.geometry)` rather than returning the full USRN geometry. 
-
-A USRN crossing three soil polygons produces three rows, each carrying only the segment that actually falls within that soil type. 
-
-When a bbox is supplied, the result is also clipped to the bbox boundary so long USRNs don't bleed outside the area of interest:
-
-```sql
-ST_Intersection(ST_Intersection(u.geometry, s.geometry), bbox_polygon)
-```
-
-The clipping happens in `ProjectionExec` (post-join) on the 25K matched rows — not pre-join on 1.76M rows!!
+The nearest join wraps the USRN geometry as `ST_AsWKB(u.geometry)` rather than selecting it as a raw column. Selecting a raw `WkbView` geometry column causes a segfault in Sedona's `to_arrow_table()` — the computed expression forces a safe buffer allocation. See `sedona-spatial-join/src/refine/geos.rs` for the underlying materialisation path.
 
 ---
 
 ## Output
 
-Each row in the output represents a **segment** of a USRN within a single soil polygon, with the clipped geometry and all soil attributes (drainage class, soilscape, fertility, geology etc.).
+**Intersect join** — one row per USRN–polygon intersection, geometry clipped to the polygon (and bbox if supplied):
 
 | Column | Description |
 |---|---|
 | `usrn` | Unique Street Reference Number |
 | `street_type` | Road classification |
-| `geometry` | Clipped linestring (WKT) |
-| `DRAINAGE` | Soil drainage class |
-| `SOILSCAPE` | Soilscape description |
-| `GEOLOGY` | Underlying geology |
-| `FERTILITY` | Agricultural fertility |
-| … | Other soil attributes |
+| `geometry` | Clipped USRN linestring (WKT in CSV, WKB in GeoParquet) |
+| *(RHS columns)* | All selected columns from the right-hand side dataset |
+
+**Nearest join** — one row per USRN–point pair within `distance_m`, ordered by `usrn, distance_m`:
+
+| Column | Description |
+|---|---|
+| `usrn` | Unique Street Reference Number |
+| `street_type` | Road classification |
+| `geometry` | USRN linestring (WKT in CSV, WKB in GeoParquet) |
+| *(RHS columns)* | All selected columns from the right-hand side dataset |
+| `distance_m` | Distance in metres between the point and the USRN |
