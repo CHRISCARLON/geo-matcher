@@ -1,4 +1,4 @@
-# usrn-matcher
+# USRN Matcher
 
 Spatially join Unique Street Reference Numbers (USRNs) to any geospatial dataset using SedonaDB.
 
