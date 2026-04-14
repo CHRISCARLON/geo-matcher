@@ -79,3 +79,5 @@ docs/_build/
 .pytest_cache
 .ruff_cache
 main.py
+sandbox.py
+/rough_notes

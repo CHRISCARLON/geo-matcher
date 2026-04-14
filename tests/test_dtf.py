@@ -1,5 +1,6 @@
 """Tests for usrn_matcher.dtf — DTF8.1-inspired export module."""
 
+import csv as _csv
 import json
 from datetime import date
 
@@ -8,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import shapely.wkb
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 from usrn_matcher.dtf import (
     DTFConfig,
@@ -29,6 +30,7 @@ from usrn_matcher.dtf import (
     to_dtf_gpkg,
 )
 
+pytestmark = pytest.mark.unit
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -136,8 +138,6 @@ class TestGeomTypeCode:
         assert _geom_type_code(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])) == "P"
 
     def test_multipolygon(self):
-        from shapely.geometry import MultiPolygon
-
         mp = MultiPolygon(
             [
                 Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
@@ -300,7 +300,7 @@ class TestToDtfCsv:
         assert lines[2].startswith('"63a",')
         assert lines[-1].startswith("99,")
         # Points now emit a type 67a record (not inline in 63a)
-        assert any(l.startswith('"67a",') for l in lines)
+        assert any(line.startswith('"67a",') for line in lines)
 
     def test_file_structure_polygon(self, cfg, tmp_path):
         poly_wkb = shapely.wkb.dumps(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
@@ -313,7 +313,7 @@ class TestToDtfCsv:
         assert lines[1].startswith("69,")
         assert lines[2].startswith('"63a",')
         # One type 67a record per feature carrying the full WKT
-        type_67a_lines = [l for l in lines if l.startswith('"67a",')]
+        type_67a_lines = [line for line in lines if line.startswith('"67a",')]
         assert len(type_67a_lines) == 1
         assert "POLYGON" in type_67a_lines[0]
         assert lines[-1].startswith("99,")
@@ -368,10 +368,10 @@ class TestToDtfCsv:
         to_dtf_csv(table, cfg, out)
 
         lines = out.read_text(encoding="utf-8").strip().splitlines()
-        type_63a = [l for l in lines if l.startswith('"63a",')]
+        type_63a = [line for line in lines if line.startswith('"63a",')]
         assert len(type_63a) == 2
         # ATTRIBUTION_SEQ_NUM is field index 4 (0-based after split)
-        seq_nums = [int(l.split(",")[4]) for l in type_63a]
+        seq_nums = [int(line.split(",")[4]) for line in type_63a]
         assert seq_nums == [1, 2]
 
 
@@ -530,8 +530,6 @@ class TestToDtfFlatCsv:
     def test_geometry_col_is_wkt(self, cfg, multi_row_table, tmp_path):
         out = tmp_path / "out_flat.csv"
         to_dtf_flat_csv(multi_row_table, cfg, out)
-        import csv as _csv
-
         with open(out, newline="", encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
         # Each geometry cell should be a WKT string, not raw bytes

@@ -9,6 +9,8 @@ import pytest
 from usrn_matcher.config import DatasetConfig
 from usrn_matcher.join import _bbox_filter, _bbox_wkt, _col_fragment
 
+pytestmark = pytest.mark.unit
+
 # ---------------------------------------------------------------------------
 # _bbox_filter
 # ---------------------------------------------------------------------------

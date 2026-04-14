@@ -4,8 +4,11 @@ import pathlib
 import time
 from typing import Any
 
+import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyogrio
+from pyproj import CRS as ProjCRS
 
 from .config import DatasetConfig
 from .logger import get_logger
@@ -53,8 +56,6 @@ def _patch_covering_metadata(
     }
 
     if crs is not None:
-        from pyproj import CRS as ProjCRS
-
         geo_meta["columns"][geom_col]["crs"] = ProjCRS.from_user_input(
             crs
         ).to_json_dict()
@@ -99,7 +100,9 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
 
     Uses DuckDB's ``ST_Hilbert()`` function to compute a Z-order (Hilbert) index
     from each geometry's centroid within the EPSG:27700 (British National Grid)
-    extent.  Sorting by this index clusters spatially adjacent features into
+    extent.
+
+    Sorting by this index clusters spatially adjacent features into
     consecutive row groups, maximising SedonaDB's ability to skip irrelevant row
     groups when a bbox filter is applied.
 
@@ -129,8 +132,6 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
     log.info("Preparing %s from %s", config.name, config.source_path)
 
     # CRS validation — lightweight check before starting the DuckDB pipeline
-    import pyogrio
-
     info = pyogrio.read_info(str(config.source_path))
     assert info["crs"] == config.crs, (
         f"Expected CRS {config.crs}, got {info['crs']} for {config.source_path}"
@@ -142,8 +143,6 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
         f"{feature_count:,}" if feature_count >= 0 else "unknown",
         info.get("geometry_type", "unknown"),
     )
-
-    import duckdb
 
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
@@ -242,6 +241,7 @@ def prepare_from_csv(
 
     log.info("Preparing CSV → GeoParquet: %s", resolved_csv)
 
+    # Implement the other Geometry types here
     match geometry_type:
         case "point":
             log.info("  Geometry: point from (%r, %r) | CRS: %s", x_col, y_col, crs)
@@ -250,8 +250,6 @@ def prepare_from_csv(
                 f"geometry_type={geometry_type!r} is not yet supported. "
                 "Currently only 'point' is implemented."
             )
-
-    import duckdb
 
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")

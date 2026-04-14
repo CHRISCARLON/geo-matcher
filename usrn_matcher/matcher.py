@@ -1,16 +1,30 @@
+import argparse
 import logging
 import pathlib
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, TypeAlias
 
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
+import sedona.db
 import shapely
 
+from . import bboxes as _bboxes
 from .config import DatasetConfig
+from .dtf import (
+    DTFConfig,
+    _build_dtf_gdf,
+    to_dtf_csv,
+    to_dtf_flat_csv,
+    to_dtf_geoparquet,
+    to_dtf_gpkg,
+)
 from .join import run_intersect_join, run_nearest_join
 from .logger import get_logger
 from .prepare import prepare_dataset, prepare_from_csv, prepare_usrns
+
+BBox: TypeAlias = Sequence[float]
 
 if TYPE_CHECKING:
     from sedonadb.context import SedonaContext
@@ -19,6 +33,7 @@ log: logging.Logger = get_logger()
 
 
 # TODO: Use match statements for the dispatch at the bottom
+# TODO: Add in the possibility to do "Linestring/Multilinestring" matching
 class UsrnMatcher:
     """Spatially join USRNs to any polygon or point dataset using SedonaDB.
 
@@ -97,15 +112,13 @@ class UsrnMatcher:
 
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
-            import sedona.db
-
             self._sd = sedona.db.connect()
         assert self._sd is not None
         return self._sd
 
     def match_intersect(
         self,
-        bbox: list[float] | None = None,
+        bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
     ) -> pa.Table:
@@ -146,7 +159,7 @@ class UsrnMatcher:
     def match_nearest(
         self,
         distance_m: float = 50.0,
-        bbox: list[float] | None = None,
+        bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
     ) -> pa.Table:
@@ -252,18 +265,14 @@ class UsrnMatcher:
         init
             Create the standard project directories.
         prepare
-            Pre-process a spatial source file into optimised GeoParquet.
+            Pre-process a spatial source file into an optimised GeoParquet.
         prepare-csv
-            Pre-process a CSV with coordinate columns into optimised GeoParquet.
+            Pre-process a CSV with coordinate columns into optimised and GeoParquet.
         match
             Spatially join USRNs against a prepared dataset (spatial phase).
             Use ``--mode intersect`` (default) for polygon/line datasets, or
             ``--mode nearest`` for point datasets to find the closest USRN.
         """
-        import argparse
-
-        from . import bboxes as _bboxes
-
         city_names: list[str] = [k for k in vars(_bboxes) if not k.startswith("_")]
 
         parser = argparse.ArgumentParser(
@@ -607,7 +616,7 @@ class UsrnMatcher:
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
                 columns=args.rhs_columns,
             )
-            bbox: list[float] | None = (
+            bbox: BBox | None = (
                 args.bbox
                 if args.bbox is not None
                 else (getattr(_bboxes, args.city) if args.city else None)
@@ -642,15 +651,6 @@ class UsrnMatcher:
                 )
 
         elif args.command == "export":
-            from .dtf import (
-                DTFConfig,
-                _build_dtf_gdf,
-                to_dtf_csv,
-                to_dtf_flat_csv,
-                to_dtf_geoparquet,
-                to_dtf_gpkg,
-            )
-
             cache_dir = pathlib.Path(args.cache_dir)
             rhs_config = DatasetConfig(
                 name=args.rhs_name,
@@ -709,9 +709,9 @@ def _cmd_init() -> None:
         pathlib.Path("output_data"),
         pathlib.Path("matched_data"),
     ]
-    print("Initialising usrn-matcher project directories:")
+    print("Initialising usrn-matcher project directories:")  # noqa: T201
     for d in dirs:
         created: bool = not d.exists()
         d.mkdir(exist_ok=True)
         status: str = "created" if created else "already exists"
-        print(f"  {d}/  ({status})")
+        print(f"  {d}/  ({status})")  # noqa: T201

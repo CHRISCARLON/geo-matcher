@@ -6,6 +6,8 @@ import pytest
 
 from usrn_matcher.config import DatasetConfig
 
+pytestmark = pytest.mark.unit
+
 
 def test_parquet_path_defaults_to_name():
     cfg = DatasetConfig(name="flood_risk", source_path="input_data/flood.gpkg")

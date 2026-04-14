@@ -11,6 +11,8 @@ from shapely.geometry import box
 from usrn_matcher.config import DatasetConfig
 from usrn_matcher.prepare import prepare_dataset, prepare_from_csv
 
+pytestmark = pytest.mark.unit
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

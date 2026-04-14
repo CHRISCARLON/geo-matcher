@@ -1,16 +1,20 @@
 import logging
 import pathlib
+from collections.abc import Sequence
+from typing import TypeAlias
 
 import pyarrow.parquet as pq
-from sedonadb.context import SedonaContext
+from sedonadb.context import DataFrame, SedonaContext
 
 from .config import DatasetConfig
 from .logger import get_logger
 
+BBox: TypeAlias = Sequence[float]
+
 log: logging.Logger = get_logger()
 
 
-def _bbox_filter(bbox: list[float] | None) -> str:
+def _bbox_filter(bbox: BBox | None) -> str:
     """Return a WHERE clause restricting both sides to the given EPSG:27700 bbox.
 
     Filtering both ``u`` (USRNs) and ``s`` (RHS) lets Sedona prune row groups
@@ -35,7 +39,7 @@ def _bbox_filter(bbox: list[float] | None) -> str:
     )
 
 
-def _bbox_wkt(bbox: list[float] | None) -> str | None:
+def _bbox_wkt(bbox: BBox | None) -> str | None:
     """Return the bbox as a WKT geometry string for clipping, or None.
 
     _bbox_filter is for pruning — it goes in the WHERE clause and touches both scans.
@@ -77,10 +81,10 @@ def run_intersect_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
-    bbox: list[float] | None = None,
+    bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
-):
+) -> DataFrame:
     """Run a spatial intersection join of USRNs against any right-hand side dataset.
 
     Parameters
@@ -172,9 +176,7 @@ def run_intersect_join(
     return sd.sql(query)
 
 
-def _bbox_nearest_filters(
-    bbox: list[float] | None, distance_m: float
-) -> tuple[str, str]:
+def _bbox_nearest_filters(bbox: BBox | None, distance_m: float) -> tuple[str, str]:
     """Return a combined WHERE clause that prunes both sides of a nearest join.
 
     USRNs (``u``) are filtered to the exact bbox (same as the intersect join).
@@ -214,10 +216,10 @@ def run_nearest_join(
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
     distance_m: float = 50.0,
-    bbox: list[float] | None = None,
+    bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
-):
+) -> DataFrame:
     """Find the nearest USRN for each point in the RHS dataset.
 
     Uses a range join (``ST_DWithin``) to find all USRNs within ``distance_m``
