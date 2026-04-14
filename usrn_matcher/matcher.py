@@ -565,7 +565,7 @@ class UsrnMatcher:
         args = parser.parse_args()
 
         # ------------------------------------------------------------------ #
-        # Dispatch                                                             #
+        # Dispatch                                                           #
         # ------------------------------------------------------------------ #
         if args.command == "init":
             _cmd_init()
@@ -644,6 +644,7 @@ class UsrnMatcher:
         elif args.command == "export":
             from .dtf import (
                 DTFConfig,
+                _build_dtf_gdf,
                 to_dtf_csv,
                 to_dtf_flat_csv,
                 to_dtf_geoparquet,
@@ -688,10 +689,17 @@ class UsrnMatcher:
             )
             matched_dir = pathlib.Path(args.matched_dir)
             stem = f"matched_{args.rhs_name}_ad"
+            # Build the sorted GDF once — shared by the three geometry-bearing writers
+            # so the Hilbert sort only runs once instead of once per output format.
+            gdf = _build_dtf_gdf(table, dtf_config)
             to_dtf_csv(table, dtf_config, matched_dir / f"{stem}.csv")
-            to_dtf_geoparquet(table, dtf_config, matched_dir / f"{stem}.parquet")
-            to_dtf_flat_csv(table, dtf_config, matched_dir / f"{stem}_flat.csv")
-            to_dtf_gpkg(table, dtf_config, matched_dir / f"{stem}.gpkg")
+            to_dtf_geoparquet(
+                table, dtf_config, matched_dir / f"{stem}.parquet", _gdf=gdf
+            )
+            to_dtf_flat_csv(
+                table, dtf_config, matched_dir / f"{stem}_flat.csv", _gdf=gdf
+            )
+            to_dtf_gpkg(table, dtf_config, matched_dir / f"{stem}.gpkg", _gdf=gdf)
 
 
 def _cmd_init() -> None:

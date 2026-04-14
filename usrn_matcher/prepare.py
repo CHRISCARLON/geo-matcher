@@ -146,7 +146,7 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
     import duckdb
 
     con = duckdb.connect()
-    con.execute("LOAD spatial;")
+    con.execute("INSTALL spatial; LOAD spatial;")
 
     # Discover the geometry column name from the source file.
     # DuckDB's st_read exposes the column using the file's internal name
@@ -254,7 +254,7 @@ def prepare_from_csv(
     import duckdb
 
     con = duckdb.connect()
-    con.execute("LOAD spatial;")
+    con.execute("INSTALL spatial; LOAD spatial;")
 
     # Count rows first so we can report it before the (potentially slow) sort+write.
     _count_row = con.sql(

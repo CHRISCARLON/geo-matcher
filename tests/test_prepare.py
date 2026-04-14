@@ -200,7 +200,12 @@ def tiny_csv(tmp_path):
         writer.writeheader()
         for i in range(10):
             writer.writerow(
-                {"id": i, "label": f"item_{i}", "Easting": 412000 + i * 1000, "Northing": 426000 + i * 1000}
+                {
+                    "id": i,
+                    "label": f"item_{i}",
+                    "Easting": 412000 + i * 1000,
+                    "Northing": 426000 + i * 1000,
+                }
             )
     return p
 

@@ -53,10 +53,11 @@ extensions.
 
 **Status: compliant**
 
-The 24 MD_* coverage percentage fields (indices 14–37) are all set to `0`. These fields measure
-what percentage of each standard NSG designation type is present in GeoPlace for the supplying authority. 
+The 24 MD_* coverage percentage fields (indices 14–37) are all set to `0`.
 
-They are a quality metric for the standard ASD supply and have no meaningful value here — this file carries a third-party spatially matched dataset, not special designations. `0` satisfies the mandatory field requirement without claiming false coverage; `100` would incorrectly imply complete NSG designation coverage.
+They are a quality metric for the standard ASD supply and have no meaningful value here — this file carries a third-party spatially matched dataset, not special designations. 
+
+`0` satisfies the mandatory field requirement without claiming false coverage; `100` would incorrectly imply complete NSG designation coverage.
 
 | Index | Field | Type | Value |
 |---|---|---|---|
@@ -87,10 +88,11 @@ They are a quality metric for the standard ASD supply and have no meaningful val
 - `WHOLE_ROAD = 0` always. Every match is treated as a part-road designation.
   Whole-road handling is not implemented. This is intentional — matched features
   from an RHS dataset always describe a specific location on or near a street,
-  never the whole street.
+  never the whole street (assumption for now).
 - Because `WHOLE_ROAD = 0`, the spec requires `ASD_COORDINATE` to be set.
   We always set `ASD_COORDINATE = 1`, meaning geometry is always carried in a
-  paired type 67a record. Inline start/end coordinate fields are never written.
+  paired type 67a record. Inline start/end coordinate fields are never written
+  in the type 63a records.
 - A type 67a record is **always** emitted for every matched row, carrying the
   full WKT geometry of the matched RHS feature. This applies to all geometry
   types including Point. (The standard DTF8.1 spec, footnote 52, says Points
@@ -243,7 +245,7 @@ Each type 63a is **immediately followed** by exactly one type 67a. They are link
 ```
 
 `(ASD_USRN, ASD_SEQ_NUM)` is the reliable join key if the file is ever split into separate
-63a and 67a tables.
+63a and 67a tables (although you'd create Unique IDs for them in reality).
 
 ---
 

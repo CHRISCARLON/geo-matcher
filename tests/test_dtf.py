@@ -17,7 +17,7 @@ from usrn_matcher.dtf import (
     _enc_int,
     _enc_num,
     _enc_text,
-    _extract_coords,
+    _geom_type_code,
     _type_10,
     _type_63a,
     _type_67a,
@@ -117,31 +117,34 @@ class TestEncAny:
 # ---------------------------------------------------------------------------
 
 
-class TestExtractCoords:
+class TestGeomTypeCode:
     def test_point(self):
-        geom = Point(412000.0, 426000.0)
-        code, coords = _extract_coords(geom)
-        assert code == "PT"
-        assert coords == [(412000.0, 426000.0)]
+        assert _geom_type_code(Point(412000.0, 426000.0)) == "PT"
 
     def test_linestring(self):
-        geom = LineString([(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)])
-        code, coords = _extract_coords(geom)
-        assert code == "L"
-        assert len(coords) == 3
-        assert coords[0] == (0.0, 0.0)
+        assert _geom_type_code(LineString([(0.0, 0.0), (1.0, 1.0)])) == "L"
 
-    def test_multilinestring_flattens(self):
-        geom = MultiLineString([[(0.0, 0.0), (1.0, 1.0)], [(2.0, 2.0), (3.0, 3.0)]])
-        code, coords = _extract_coords(geom)
-        assert code == "ML"
-        assert len(coords) == 4
+    def test_multilinestring(self):
+        assert (
+            _geom_type_code(
+                MultiLineString([[(0.0, 0.0), (1.0, 1.0)], [(2.0, 2.0), (3.0, 3.0)]])
+            )
+            == "ML"
+        )
 
-    def test_polygon_exterior_only(self):
-        geom = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
-        code, coords = _extract_coords(geom)
-        assert code == "P"
-        assert len(coords) == 5  # closed ring
+    def test_polygon(self):
+        assert _geom_type_code(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])) == "P"
+
+    def test_multipolygon(self):
+        from shapely.geometry import MultiPolygon
+
+        mp = MultiPolygon(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ]
+        )
+        assert _geom_type_code(mp) == "MP"
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +417,9 @@ def multi_row_table():
     """Three-row table with mixed geometry types for output tests."""
     pt_wkb = shapely.wkb.dumps(Point(412000.0, 426000.0))
     ls_wkb = shapely.wkb.dumps(LineString([(412000.0, 426000.0), (413000.0, 427000.0)]))
-    poly_wkb = shapely.wkb.dumps(Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000), (0, 0)]))
+    poly_wkb = shapely.wkb.dumps(
+        Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000), (0, 0)])
+    )
     return pa.table(
         {
             "usrn": pa.array([1, 2, 1], type=pa.int64()),
@@ -473,7 +478,13 @@ class TestToDtfGeoparquet:
         out = tmp_path / "out.parquet"
         to_dtf_geoparquet(multi_row_table, cfg, out)
         names = pq.read_schema(str(out)).names
-        for col in ("USRN", "RECORD_IDENTIFIER", "ATTRIBUTION_SEQ_NUM", "GEOMETRY_TYPE", "geometry"):
+        for col in (
+            "USRN",
+            "RECORD_IDENTIFIER",
+            "ATTRIBUTION_SEQ_NUM",
+            "GEOMETRY_TYPE",
+            "geometry",
+        ):
             assert col in names, f"Expected column {col!r} in GeoParquet output"
 
     def test_row_count(self, cfg, multi_row_table, tmp_path):
@@ -481,7 +492,9 @@ class TestToDtfGeoparquet:
         to_dtf_geoparquet(multi_row_table, cfg, out)
         assert pq.read_metadata(str(out)).num_rows == len(multi_row_table)
 
-    def test_rhs_cols_not_in_skip_set_are_preserved(self, cfg, multi_row_table, tmp_path):
+    def test_rhs_cols_not_in_skip_set_are_preserved(
+        self, cfg, multi_row_table, tmp_path
+    ):
         """RHS attribute columns (here: 'name') survive into the GeoParquet."""
         out = tmp_path / "out.parquet"
         to_dtf_geoparquet(multi_row_table, cfg, out)
@@ -518,14 +531,16 @@ class TestToDtfFlatCsv:
         out = tmp_path / "out_flat.csv"
         to_dtf_flat_csv(multi_row_table, cfg, out)
         import csv as _csv
+
         with open(out, newline="", encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
         # Each geometry cell should be a WKT string, not raw bytes
         for row in rows:
             wkt = row["geometry"]
-            assert any(wkt.startswith(prefix) for prefix in ("POINT", "LINESTRING", "POLYGON", "MULTI")), (
-                f"Expected WKT geometry, got: {wkt!r}"
-            )
+            assert any(
+                wkt.startswith(prefix)
+                for prefix in ("POINT", "LINESTRING", "POLYGON", "MULTI")
+            ), f"Expected WKT geometry, got: {wkt!r}"
 
     def test_rhs_attribute_preserved(self, cfg, multi_row_table, tmp_path):
         out = tmp_path / "out_flat.csv"

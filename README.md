@@ -6,9 +6,9 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 ## What it does
 
-`usrn-matcher` answers the question: *which USRN is this feature on or near?*
+`usrn-matcher` answers the question: *which USRN does this spatial feature spatially interact with?*
 
-Given a third-party spatial dataset (naptan data, national soil data — anything with geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN and the original dataset's attributes.
+Given a third-party spatial dataset (naptan data, national soil data, anything with a geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN and the original dataset's attributes.
 
 There are two output routes, each keeping a different geometry:
 
@@ -19,7 +19,7 @@ There are two output routes, each keeping a different geometry:
 
 The DTF export is a community extension to the NSG DTF8.1 format for third-party spatially matched datasets — see [`DTF_MAPPING.md`](DTF_MAPPING.md) for the full compliance mapping.
 
-## Installation (will add it to pypi soon)
+## Installation (I'll add it to pypi soon)
 
 ```bash
 git clone <repo>
@@ -76,8 +76,8 @@ Key options:
 # Full national intersect join (polygon/line datasets)
 usrn-matcher match --rhs-name soil
 
-# Nearest-USRN join (point datasets) — assigns each point to its closest USRN within 25m
-usrn-matcher match --rhs-name stops --mode nearest --distance 25 --city LEEDS
+# Nearest-USRN join (point datasets) — assigns each point to its closest USRN within 10m
+usrn-matcher match --rhs-name stops --mode nearest --distance 10 --city LEEDS
 
 # Restricted to a bounding box (EPSG:27700)
 usrn-matcher match --rhs-name soil --bbox 412000 426000 444000 445000
@@ -125,7 +125,7 @@ Runs the spatial join and writes four output files, each carrying the **matched 
 usrn-matcher export \
   --rhs-name soil \
   --city LEEDS \
-  --dtf-org-name "My Council" \
+  --dtf-org-name "My Org" \
   --dtf-org-ref 1234
 
 # Nearest join (point datasets)
@@ -134,7 +134,7 @@ usrn-matcher export \
   --mode nearest \
   --distance 25 \
   --city LEEDS \
-  --dtf-org-name "My Council" \
+  --dtf-org-name "My Org" \
   --dtf-org-ref 1234
 ```
 
@@ -156,7 +156,7 @@ Output files written to `matched_data/`:
 
 | File | Format | Description |
 |---|---|---|
-| `matched_{name}_ad.csv` | DTF 8.1a CSV | Interleaved type 63a/67a records. Exchange format for NSG-aware tools. |
+| `matched_{name}_ad.csv` | DTF 8.1a CSV | Paired type 63a/67a records. Exchange format for NSG-aware tools. |
 | `matched_{name}_ad.parquet` | GeoParquet 1.1 | Spatially optimised. One row per matched feature. |
 | `matched_{name}_ad_flat.csv` | Flat CSV | Same columns as parquet, WKT geometry. Opens in QGIS, Excel, GeoPandas. |
 | `matched_{name}_ad.gpkg` | GeoPackage | Same columns as parquet, native geometry. Opens in QGIS, ArcGIS, OGR tools. |
@@ -250,7 +250,7 @@ Each source file is converted to an optimised GeoParquet 1.1 file in `output_dat
 
 Run it once, then query as many times as you like.
 
-**DuckDB pipeline** — the entire prepare phase runs inside DuckDB, without going through GeoPandas or loading geometry into Python memory. For GeoPackage/Shapefile/etc. sources, `ST_Read()` reads the file natively. For CSV sources, `read_csv()` ingests the file and `ST_Point()` builds point geometries from the X/Y columns. DuckDB then sorts, computes the bbox struct, and writes the Parquet file in a single `COPY ... TO ... (FORMAT PARQUET)` statement. A lightweight PyArrow post-processing step patches the GeoParquet 1.1 metadata (covering key, CRS PROJJSON) into the file footer.
+**DuckDB pipeline** — The prepare phase runs inside DuckDB. For GeoPackage/Shapefile/etc. sources, `ST_Read()` reads the file natively. For CSV sources, `read_csv()` ingests the file and `ST_Point()` builds point geometries from the X/Y columns. DuckDB then sorts, computes the bbox struct, and writes the Parquet file in a single `COPY ... TO ... (FORMAT PARQUET)` statement. A lightweight PyArrow post-processing step patches the GeoParquet 1.1 metadata (covering key, CRS PROJJSON) into the file footer.
 
 **Spatial sort** — geometries are sorted by a Z-order (Hilbert) key computed from each feature's centroid within the British National Grid extent (EPSG:27700) using DuckDB's `ST_Hilbert(geom, BOX_2D)`. Sorting by this key clusters spatially adjacent features into consecutive row groups, maximising SedonaDB's ability to skip row groups during spatial joins.
 
@@ -304,19 +304,17 @@ Sedona's default `execution_mode` is `Speculative(N)`. It samples the first N pr
 - `prepare_probe` — prepares probe-side geometries instead. Better when the probe side has complex geometry.
 - `prepare_none` — no prepared geometries. Optimal for simple geometry types like points.
 
-In practice, Speculative chooses `prepare_none` (`execution_mode=0`) for point datasets (e.g. stops) since point geometries are trivial to evaluate directly. We do not override this setting.
+In practice, Speculative sometimes chooses `prepare_none` (`execution_mode=0`) for some point datasets (e.g. Naptan Nodes).
 
 **Geometry clipping (intersect join)**
 
 `ST_Intersection(u.geometry, s.geometry)` is used rather than returning full USRN geometries. A USRN crossing three polygons produces three rows, each with only the segment inside that polygon. When a bbox is supplied the result is also clipped to its boundary.
 
-**ST_AsWKB wrapping (nearest join)**
-
-The nearest join wraps the USRN geometry as `ST_AsWKB(u.geometry)` rather than selecting it as a raw column. Selecting a raw `WkbView` geometry column causes a segfault in Sedona's `to_arrow_table()` — the computed expression forces a safe buffer allocation. See `sedona-spatial-join/src/refine/geos.rs` for the underlying materialisation path.
-
 ### DTF export phase
 
-The DTF GeoParquet output (`to_dtf_geoparquet`) uses the same DuckDB pipeline as the prepare phase. After building the DTF column layout, the shapely geometries are serialised to WKB and registered as a PyArrow table directly in DuckDB memory (no temp file). DuckDB then computes the inline `bbox` struct, Hilbert-sorts the rows, and writes the GeoParquet file via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1 with the covering key and CRS PROJJSON.
+The DTF GeoParquet output (`to_dtf_geoparquet`) uses the same DuckDB pipeline as the prepare phase. After building the DTF column layout, the shapely geometries are serialised to WKB and registered as a PyArrow table directly in DuckDB memory (no temp file). 
+
+DuckDB then computes the inline `bbox` struct, Hilbert-sorts the rows, and writes the GeoParquet file via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1 with the covering key and CRS PROJJSON.
 
 The Hilbert sort in the DTF path also runs in DuckDB — the registered PyArrow table is queried with `ST_Hilbert(ST_GeomFromWKB(rhs_geometry), BOX_2D)` to get sort keys, which are then used to reorder the GeoDataFrame before writing. No file I/O is required for the sort step.
 

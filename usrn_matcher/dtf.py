@@ -62,6 +62,7 @@ from typing import Any
 import duckdb
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import shapely
 from shapely.geometry import (
@@ -170,15 +171,7 @@ def _enc_any(v: Any, field: pa.Field) -> str:
 # ---------------------------------------------------------------------------
 
 # Geometry type codes (extension to DTF8.1)
-_GEOM_TYPE_CODES: dict[str, str] = {
-    "Point": "PT",
-    "LineString": "L",
-    "MultiLineString": "ML",
-    "Polygon": "P",
-    "MultiPolygon": "MP",
-}
-
-# ASD_GEOMETRY_TYPE codes for type 67a records — our extension covers all OGC simple features.
+# ASD_GEOMETRY_TYPE codes for type 67a records — the extension covers all OGC simple features.
 # Standard type 67 only defines "L" (line) and "P" (polygon); type 67a adds "PT", "ML", "MP".
 _ASD_GEOM_TYPE: dict[str, str] = {
     "PT": "PT",
@@ -189,43 +182,28 @@ _ASD_GEOM_TYPE: dict[str, str] = {
 }
 
 
-def _extract_coords(
-    geom: shapely.Geometry,
-) -> tuple[str, list[tuple[float, ...]]]:
-    """Return ``(geometry_type_code, coords_list)``.
+def _geom_type_code(geom: shapely.Geometry) -> str:
+    """Return the DTF geometry type code for a shapely geometry.
 
-    Geometry type codes: ``"PT"``, ``"L"``, ``"ML"``, ``"P"``, ``"MP"``.
-
-    Only the type code is used by callers — the coords list is unused since
-    geometry is now stored as a full WKT string in a single type 67a record
-    via ``shapely.to_wkt(geom)``.
+    Codes: ``"PT"`` (Point), ``"L"`` (LineString), ``"ML"`` (MultiLineString),
+    ``"P"`` (Polygon), ``"MP"`` (MultiPolygon).
     """
-    if isinstance(geom, Point):
-        return "PT", [(geom.x, geom.y)]
-
-    if isinstance(geom, LineString):
-        return "L", list(geom.coords)
-
-    if isinstance(geom, MultiLineString):
-        coords: list[tuple[float, ...]] = []
-        for part in geom.geoms:
-            coords.extend(part.coords)
-        return "ML", coords
-
-    if isinstance(geom, Polygon):
-        return "P", list(geom.exterior.coords)
-
-    if isinstance(geom, MultiPolygon):
-        coords = []
-        for part in geom.geoms:
-            coords.extend(part.exterior.coords)
-        return "MP", coords
-
-    # Fallback: unknown geometry type — skip coordinates
-    log.warning(
-        "Unsupported geometry type %r — skipping coordinates", type(geom).__name__
-    )
-    return "L", []
+    match geom:
+        case Point():
+            return "PT"
+        case LineString():
+            return "L"
+        case MultiLineString():
+            return "ML"
+        case Polygon():
+            return "P"
+        case MultiPolygon():
+            return "MP"
+        case _:
+            log.warning(
+                "Unsupported geometry type %r — defaulting to 'L'", type(geom).__name__
+            )
+            return "L"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +274,7 @@ def _type_63a(
     config: DTFConfig,
     today: date,
 ) -> str:
-    """Build a type 63a USRN Attribution Record line (our DTF extension).
+    """Build a type 63a USRN Attribution Record line (DTF extension).
 
     This record holds attribution attributes only — geometry is always stored
     in the following type 67a coordinate record(s). ASD_COORDINATE is therefore
@@ -410,7 +388,10 @@ _SKIP_COLUMNS = frozenset({"usrn", "street_type", "geometry", "rhs_geometry"})
 
 
 def _rhs_fields(schema: pa.Schema) -> list[tuple[int, pa.Field]]:
-    """Return (column_index, field) pairs for RHS attribute columns."""
+    """Return (column_index, field) pairs for RHS attribute columns.
+
+    This is for faster lookups during the loop in creating the Dtf file.
+    """
     return [
         (i, schema.field(i))
         for i in range(len(schema))
@@ -475,12 +456,14 @@ def to_dtf_csv(
     now: datetime = datetime.now()
     timestamp: str = now.strftime("%H%M%S")
 
-    # Pre-compute which columns are RHS attributes and their Arrow fields
+    # Convert columns to Python lists up front — one bulk conversion instead of
+    # per-row .as_py() calls inside the loop.
     rhs_col_specs: list[tuple[int, pa.Field]] = _rhs_fields(table.schema)
-
-    # Extract raw column arrays for fast row iteration
-    usrn_col = table.column("usrn")
-    rhs_geom_col = table.column("rhs_geometry")
+    usrn_list: list[int] = table.column("usrn").to_pylist()
+    rhs_geom_list: list[bytes | None] = table.column("rhs_geometry").to_pylist()
+    rhs_col_lists: list[list] = [
+        table.column(col_idx).to_pylist() for col_idx, _ in rhs_col_specs
+    ]
 
     pro_order: int = 1  # sequential counter across all body records
     record_count: int = 0  # excludes header (10) and trailer (99)
@@ -495,11 +478,9 @@ def to_dtf_csv(
     lines.append(_type_69(config, today))
     record_count += 1  # type 69 counts as a body record
 
-    # Basically we just iterate over
-    # Creating the type 63s and 69s in order
     for row_idx in range(len(table)):
-        usrn: int = usrn_col[row_idx].as_py()
-        rhs_wkb = rhs_geom_col[row_idx].as_py()
+        usrn: int = usrn_list[row_idx]
+        rhs_wkb: bytes | None = rhs_geom_list[row_idx]
 
         if rhs_wkb is None:
             log.warning("Row %d has null rhs_geometry — skipping", row_idx)
@@ -507,7 +488,7 @@ def to_dtf_csv(
 
         # Decode RHS geometry
         geom: shapely.Geometry = shapely.from_wkb(rhs_wkb)
-        geom_type_code, _ = _extract_coords(geom)
+        geom_type_code: str = _geom_type_code(geom)
         asd_geom_type: str = _ASD_GEOM_TYPE.get(geom_type_code, "L")
         geometry_wkt: str = shapely.to_wkt(geom)
 
@@ -517,8 +498,8 @@ def to_dtf_csv(
 
         # Encode RHS attribute values
         rhs_attr_fields: list[str] = [
-            _enc_any(table.column(col_idx)[row_idx].as_py(), field)
-            for col_idx, field in rhs_col_specs
+            _enc_any(rhs_col_lists[i][row_idx], field)
+            for i, (_, field) in enumerate(rhs_col_specs)
         ]
 
         # Emit type 63a — attributes only; geometry follows in one type 67a record
@@ -575,16 +556,13 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
     in-memory) for spatial locality in the output GeoParquet.  DuckDB registers
     the source PyArrow table directly — no file I/O required.
     """
-    import pandas as pd
 
     today: date = date.today()
     n_rows: int = len(table)
 
     rhs_geom_col = table.column("rhs_geometry")
     geoms = shapely.from_wkb(rhs_geom_col.combine_chunks().to_pylist())
-    geom_type_codes: list[str] = [
-        _GEOM_TYPE_CODES.get(type(g).__name__, "L") for g in geoms
-    ]
+    geom_type_codes: list[str] = [_geom_type_code(g) for g in geoms]
 
     usrn_col = table.column("usrn").to_pylist()
     usrn_seq: dict[int, int] = {}
@@ -624,7 +602,7 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
     # we can run ST_Hilbert on the rhs_geometry WKB column without touching disk.
     # COALESCE guards against any null rhs_geometry rows.
     con = duckdb.connect()
-    con.execute("LOAD spatial;")
+    con.execute("INSTALL spatial; LOAD spatial;")
     con.register("_dtf_src", table)
     hilbert_keys = np.asarray(
         con.sql(f"""
@@ -638,6 +616,15 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
     )
 
     idx = np.argsort(hilbert_keys)
+    rows_moved = int((idx != np.arange(len(idx))).sum())
+    log.debug(
+        "Hilbert sort: %d rows, keys min=%d max=%d, %d/%d rows reordered",
+        len(idx),
+        int(hilbert_keys.min()),
+        int(hilbert_keys.max()),
+        rows_moved,
+        len(idx),
+    )
     return gpd.GeoDataFrame(gdf.iloc[idx].reset_index(drop=True))
 
 
@@ -656,7 +643,6 @@ def _write_dtf_geoparquet(
 
     No temp file is written — avoids the GeoPandas two-pass round-trip.
     """
-    import pandas as pd
 
     # Convert shapely geometries → WKB bytes for DuckDB
     wkb = pa.array(shapely.to_wkb(gdf.geometry.values), type=pa.binary())
@@ -668,7 +654,7 @@ def _write_dtf_geoparquet(
     arrow_table = base.append_column(pa.field("geometry", pa.binary()), wkb)
 
     con = duckdb.connect()
-    con.execute("LOAD spatial;")
+    con.execute("INSTALL spatial; LOAD spatial;")
     con.register("_dtf_write_src", arrow_table)
 
     # Inline bbox struct so DuckDB writes it alongside the geometry column.
@@ -702,6 +688,8 @@ def to_dtf_geoparquet(
     config: DTFConfig,
     path: str | pathlib.Path,
     row_group_size: int = 10_000,
+    *,
+    _gdf: gpd.GeoDataFrame | None = None,
 ) -> pathlib.Path:
     """Write match results as a spatially optimised GeoParquet.
 
@@ -732,7 +720,7 @@ def to_dtf_geoparquet(
             "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
         )
 
-    gdf = _build_dtf_gdf(table, config)
+    gdf = _gdf if _gdf is not None else _build_dtf_gdf(table, config)
     _write_dtf_geoparquet(gdf, resolved, row_group_size)
     log.info("Written DTF GeoParquet: %s", resolved)
     return resolved
@@ -742,6 +730,8 @@ def to_dtf_flat_csv(
     table: pa.Table,
     config: DTFConfig,
     path: str | pathlib.Path,
+    *,
+    _gdf: gpd.GeoDataFrame | None = None,
 ) -> pathlib.Path:
     """Write match results as a spatially sorted flat CSV.
 
@@ -770,9 +760,7 @@ def to_dtf_flat_csv(
             "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
         )
 
-    import pandas as pd
-
-    gdf = _build_dtf_gdf(table, config)
+    gdf = _gdf if _gdf is not None else _build_dtf_gdf(table, config)
 
     # Cast to plain DataFrame before replacing the geometry column with WKT strings.
     # Writing WKT into a GeoDataFrame's geometry column triggers a GeoPandas warning.
@@ -789,6 +777,8 @@ def to_dtf_gpkg(
     config: DTFConfig,
     path: str | pathlib.Path,
     layer: str | None = None,
+    *,
+    _gdf: gpd.GeoDataFrame | None = None,
 ) -> pathlib.Path:
     """Write match results as a GeoPackage layer.
 
@@ -816,7 +806,7 @@ def to_dtf_gpkg(
             "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
         )
 
-    gdf = _build_dtf_gdf(table, config)
+    gdf = _gdf if _gdf is not None else _build_dtf_gdf(table, config)
     layer_name: str = layer or resolved.stem
     gdf.to_file(resolved, layer=layer_name, driver="GPKG")
 
