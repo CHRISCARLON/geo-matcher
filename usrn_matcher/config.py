@@ -1,6 +1,11 @@
 import pathlib
 import re
 
+DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
+DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")
+DEFAULT_MATCHED_DIR: pathlib.Path = pathlib.Path("matched_data")
+DEFAULT_USRN_GPKG: pathlib.Path = DEFAULT_INPUT_DIR / "osopenusrn.gpkg"
+
 
 class DatasetConfig:
     """Describes a spatial dataset for use as the right-hand side of a USRN join.
@@ -63,7 +68,7 @@ class DatasetConfig:
         self.parquet_path = (
             pathlib.Path(parquet_path)
             if parquet_path is not None
-            else pathlib.Path(f"output_data/{name}_27700.parquet")
+            else DEFAULT_OUTPUT_DIR / f"{name}_27700.parquet"
         )
         self.columns = columns if columns is not None else []
         self.geometry_column = geometry_column

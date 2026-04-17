@@ -11,7 +11,13 @@ import sedona.db
 import shapely
 
 from . import bboxes as _bboxes
-from .config import DatasetConfig
+from .config import (
+    DEFAULT_INPUT_DIR,
+    DEFAULT_MATCHED_DIR,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_USRN_GPKG,
+    DatasetConfig,
+)
 from .dtf import (
     DTFConfig,
     _build_dtf_gdf,
@@ -47,23 +53,13 @@ class UsrnMatcher:
             columns=["road_class", "speed_limit"],
         )
 
-        # Pre-spatial phase — run once, results cached as GeoParquet
-        matcher = UsrnMatcher.from_sources(
-            usrn_gpkg="input_data/osopenusrn.gpkg",
-            rhs_config=cfg,
-        )
-
-        # Spatial phase — full national join or restricted to a bbox
-        table = matcher.match_intersect()
-        table = matcher.match_intersect(bbox=[412000, 426000, 444000, 445000])
-        matcher.to_csv(table, "matched_data/usrn_highways_attribution.csv")
-
-    If the GeoParquet files are already prepared::
-
         matcher = UsrnMatcher(
             usrn_parquet="output_data/usrns_27700.parquet",
             rhs_config=cfg,
         )
+        table = matcher.match_intersect()
+        table = matcher.match_intersect(bbox=[412000, 426000, 444000, 445000])
+        matcher.to_csv(table, "matched_data/usrn_highways_attribution.csv")
     """
 
     _usrn_parquet: pathlib.Path
@@ -78,37 +74,6 @@ class UsrnMatcher:
         self._usrn_parquet = pathlib.Path(usrn_parquet)
         self._rhs_config = rhs_config
         self._sd = None
-
-    @classmethod
-    def from_sources(
-        cls,
-        usrn_gpkg: str | pathlib.Path,
-        rhs_config: DatasetConfig,
-        cache_dir: str | pathlib.Path = "output_data",
-        force_prepare: bool = False,
-    ) -> "UsrnMatcher":
-        """Build from source files, preparing GeoParquet caches as needed.
-
-        Parameters
-        ----------
-        usrn_gpkg:
-            Path to the OS Open USRN GeoPackage.
-        rhs_config:
-            Configuration for the right-hand side dataset.
-            ``rhs_config.parquet_path`` controls where its GeoParquet is cached.
-        cache_dir:
-            Directory where the USRN GeoParquet is cached.
-        force_prepare:
-            Re-prepare GeoParquet files even if they already exist.
-        """
-        resolved_cache_dir: pathlib.Path = pathlib.Path(cache_dir)
-        resolved_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        usrn_parquet: pathlib.Path = resolved_cache_dir / "usrns_27700.parquet"
-        prepare_usrns(usrn_gpkg, usrn_parquet, force=force_prepare)
-        prepare_dataset(rhs_config, force=force_prepare)
-
-        return cls(usrn_parquet, rhs_config)
 
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
@@ -299,15 +264,15 @@ class UsrnMatcher:
         )
         p_prepare.add_argument(
             "--usrn-gpkg",
-            default="input_data/osopenusrn.gpkg",
+            default=DEFAULT_USRN_GPKG,
             metavar="PATH",
-            help="Path to the OS Open USRN GeoPackage (default: input_data/osopenusrn.gpkg).",
+            help=f"Path to the OS Open USRN GeoPackage (default: {DEFAULT_USRN_GPKG}).",
         )
         p_prepare.add_argument(
             "--rhs-gpkg",
-            required=True,
+            default=None,
             metavar="PATH",
-            help="Path to the right-hand side source file (GeoPackage or any geopandas-readable format).",
+            help=f"Path to the RHS source file (default: {DEFAULT_INPUT_DIR}/{{rhs-name}}.gpkg).",
         )
         p_prepare.add_argument(
             "--rhs-name",
@@ -337,9 +302,9 @@ class UsrnMatcher:
         )
         p_prepare.add_argument(
             "--cache-dir",
-            default="output_data",
+            default=DEFAULT_OUTPUT_DIR,
             metavar="DIR",
-            help="Directory for cached GeoParquet files (default: output_data).",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
         )
         p_prepare.add_argument(
             "--force",
@@ -356,9 +321,9 @@ class UsrnMatcher:
         )
         p_prepare_csv.add_argument(
             "--csv",
-            required=True,
+            default=None,
             metavar="PATH",
-            help="Path to the source CSV file.",
+            help=f"Path to the source CSV file (default: {DEFAULT_INPUT_DIR}/{{name}}.csv).",
         )
         p_prepare_csv.add_argument(
             "--name",
@@ -393,9 +358,9 @@ class UsrnMatcher:
         )
         p_prepare_csv.add_argument(
             "--cache-dir",
-            default="output_data",
+            default=DEFAULT_OUTPUT_DIR,
             metavar="DIR",
-            help="Directory for cached GeoParquet files (default: output_data).",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
         )
         p_prepare_csv.add_argument(
             "--geometry-type",
@@ -480,15 +445,15 @@ class UsrnMatcher:
         )
         p_match.add_argument(
             "--cache-dir",
-            default="output_data",
+            default=DEFAULT_OUTPUT_DIR,
             metavar="DIR",
-            help="Directory containing prepared GeoParquet files (default: output_data).",
+            help=f"Directory containing prepared GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
         )
         p_match.add_argument(
             "--matched-dir",
-            default="matched_data",
+            default=DEFAULT_MATCHED_DIR,
             metavar="DIR",
-            help="Directory for output files (default: matched_data).",
+            help=f"Directory for output files (default: {DEFAULT_MATCHED_DIR}).",
         )
 
         # ------------------------------------------------------------------ #
@@ -555,15 +520,15 @@ class UsrnMatcher:
         )
         p_export.add_argument(
             "--cache-dir",
-            default="output_data",
+            default=DEFAULT_OUTPUT_DIR,
             metavar="DIR",
-            help="Directory containing prepared GeoParquet files (default: output_data).",
+            help=f"Directory containing prepared GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
         )
         p_export.add_argument(
             "--matched-dir",
-            default="matched_data",
+            default=DEFAULT_MATCHED_DIR,
             metavar="DIR",
-            help="Directory for output files (default: matched_data).",
+            help=f"Directory for output files (default: {DEFAULT_MATCHED_DIR}).",
         )
         p_export.add_argument(
             "--explain",
@@ -581,9 +546,15 @@ class UsrnMatcher:
 
         elif args.command == "prepare":
             cache_dir: pathlib.Path = pathlib.Path(args.cache_dir)
+            rhs_gpkg: pathlib.Path = (
+                pathlib.Path(args.rhs_gpkg)
+                if args.rhs_gpkg is not None
+                else DEFAULT_INPUT_DIR / f"{args.rhs_name}.gpkg"
+            )
+            _validate_input_file(rhs_gpkg)
             rhs_config: DatasetConfig = DatasetConfig(
                 name=args.rhs_name,
-                source_path=args.rhs_gpkg,
+                source_path=rhs_gpkg,
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
                 geometry_column=args.rhs_geometry_col,
                 row_group_size=args.rhs_row_group_size,
@@ -596,8 +567,14 @@ class UsrnMatcher:
             prepare_dataset(rhs_config, force=args.force)
 
         elif args.command == "prepare-csv":
+            csv_path: pathlib.Path = (
+                pathlib.Path(args.csv)
+                if args.csv is not None
+                else DEFAULT_INPUT_DIR / f"{args.name}.csv"
+            )
+            _validate_input_file(csv_path)
             prepare_from_csv(
-                csv_path=args.csv,
+                csv_path=csv_path,
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
                 geometry_type=args.geometry_type,
@@ -702,12 +679,37 @@ class UsrnMatcher:
             to_dtf_gpkg(table, dtf_config, matched_dir / f"{stem}.gpkg", _gdf=gdf)
 
 
+def _validate_input_file(path: pathlib.Path) -> None:
+    """Check the input dir exists, all filenames are lowercase, and the target file is present."""
+    if not DEFAULT_INPUT_DIR.exists():
+        raise ValueError(
+            f"Input directory '{DEFAULT_INPUT_DIR}' does not exist. Run 'usrn-matcher init' first."
+        )
+
+    bad: list[str] = [
+        f.name
+        for f in DEFAULT_INPUT_DIR.iterdir()
+        if f.is_file() and f.name != f.name.lower()
+    ]
+    if bad:
+        raise ValueError(
+            f"All files in '{DEFAULT_INPUT_DIR}' must have lowercase names. "
+            f"Rename: {', '.join(bad)}"
+        )
+
+    if not path.exists():
+        raise ValueError(
+            f"Input file '{path}' not found. "
+            f"Place it in '{DEFAULT_INPUT_DIR}/' with a lowercase filename."
+        )
+
+
 def _cmd_init() -> None:
     """Create standard project directories if they don't exist."""
     dirs: list[pathlib.Path] = [
-        pathlib.Path("input_data"),
-        pathlib.Path("output_data"),
-        pathlib.Path("matched_data"),
+        DEFAULT_INPUT_DIR,
+        DEFAULT_OUTPUT_DIR,
+        DEFAULT_MATCHED_DIR,
     ]
     print("Initialising usrn-matcher project directories:")  # noqa: T201
     for d in dirs:

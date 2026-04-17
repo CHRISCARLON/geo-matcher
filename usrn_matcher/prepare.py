@@ -256,7 +256,7 @@ def prepare_from_csv(
 
     # Count rows first so we can report it before the (potentially slow) sort+write.
     _count_row = con.sql(
-        f"SELECT COUNT(*) FROM read_csv('{resolved_csv}', auto_detect=true)"
+        f"SELECT COUNT(*) FROM read_csv('{resolved_csv}', auto_detect=true, nullstr=['NULL', ''])"
     ).fetchone()
     row_count: int = _count_row[0] if _count_row else 0
     log.info(
@@ -281,7 +281,7 @@ def prepare_from_csv(
                 SELECT
                     * EXCLUDE ("{x_col}", "{y_col}"),
                     ST_Point("{x_col}", "{y_col}") AS geometry
-                FROM read_csv('{resolved_csv}', auto_detect=true, null_padding=true)
+                FROM read_csv('{resolved_csv}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
             )
             ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
         ) TO '{resolved_parquet}'

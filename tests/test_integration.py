@@ -324,28 +324,6 @@ def test_dtf_gpkg_written(dtf_table, dtf_cfg, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# from_sources convenience constructor
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_from_sources_prepares_and_matches(tmp_path):
-    _skip_if_missing(USRN_GPKG, SOIL_GPKG)
-    cfg = DatasetConfig(
-        name="soil",
-        source_path=SOIL_GPKG,
-        parquet_path=tmp_path / "soil_27700.parquet",
-    )
-    matcher = UsrnMatcher.from_sources(
-        usrn_gpkg=USRN_GPKG,
-        rhs_config=cfg,
-        cache_dir=tmp_path,
-    )
-    table = matcher.match_intersect(bbox=LEEDS)
-    assert len(table) > 0
-
-
-# ---------------------------------------------------------------------------
 # to_csv and to_parquet writers
 # ---------------------------------------------------------------------------
 
