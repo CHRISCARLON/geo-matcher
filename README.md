@@ -34,10 +34,10 @@ uv sync
 usrn-matcher init
 
 # 2. Prepare source files (run once)
-usrn-matcher prepare \
-  --usrn-gpkg input_data/osopenusrn.gpkg \
-  --rhs-gpkg  input_data/dataset.gpkg \
-  --rhs-name  dataset_one
+usrn-matcher prepare-usrns
+usrn-matcher prepare-gpkg \
+  --rhs-gpkg input_data/dataset.gpkg \
+  --rhs-name dataset_one
 
 # 3a. Run spatial join
 usrn-matcher match --rhs-name dataset_one --city LEEDS

@@ -29,33 +29,40 @@ Creates `input_data/`, `output_data/`, and `matched_data/` in the current direct
 ### 2. Prepare (pre-spatial phase)
 
 Convert source files into spatially-sorted GeoParquet. Run once, or with `--force` to
-re-prepare.
+re-prepare. USRNs and RHS datasets are prepared with separate commands.
 
-**From a GeoPackage or shapefile:**
+**USRNs:**
 
 ```bash
-usrn-matcher prepare \
-  --usrn-gpkg input_data/osopenusrn.gpkg \
-  --rhs-gpkg  input_data/dataset.gpkg \
-  --rhs-name  dataset_one
+usrn-matcher prepare-usrns
 ```
 
-Writes:
-- `output_data/usrns_27700.parquet`
-- `output_data/dataset_one_27700.parquet`
-
-Key options:
+Reads `input_data/osopenusrn.gpkg` by default and writes `output_data/usrns_27700.parquet`.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--usrn-gpkg` | `input_data/osopenusrn.gpkg` | OS Open USRN source |
-| `--rhs-gpkg` | _(required)_ | RHS source file |
-| `--rhs-name` | _(required)_ | Short identifier, used as filename stem |
-| `--rhs-geometry-col` | `geometry` | Geometry column name in RHS file |
 | `--cache-dir` | `output_data` | Where to write GeoParquet files |
 | `--force` | false | Re-prepare even if output already exists |
 
-**From a CSV with coordinate columns:**
+**RHS from a GeoPackage or shapefile:**
+
+```bash
+usrn-matcher prepare-gpkg \
+  --rhs-gpkg  input_data/dataset.gpkg \
+  --rhs-name  dataset_one
+```
+
+Writes `output_data/dataset_one_27700.parquet`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rhs-gpkg` | _(required)_ | RHS source file |
+| `--rhs-name` | _(required)_ | Short identifier, used as filename stem |
+| `--cache-dir` | `output_data` | Where to write GeoParquet files |
+| `--force` | false | Re-prepare even if output already exists |
+
+**RHS from a CSV with coordinate columns:**
 
 ```bash
 usrn-matcher prepare-csv \
@@ -64,8 +71,6 @@ usrn-matcher prepare-csv \
   --x-col Easting \
   --y-col Northing
 ```
-
-Key options:
 
 | Flag | Default | Description |
 |---|---|---|
