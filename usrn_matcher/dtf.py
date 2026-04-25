@@ -323,8 +323,7 @@ def to_dtf_csv(
 
     The ``table`` must contain a ``rhs_geometry`` column (WKB bytes) produced
     by calling :meth:`~usrn_matcher.UsrnMatcher.match_intersect` or
-    :meth:`~usrn_matcher.UsrnMatcher.match_nearest` with
-    ``include_rhs_geometry=True``.
+    :meth:`~usrn_matcher.UsrnMatcher.match_nearest` with ``include_rhs_geometry=True``.
 
     Parameters
     ----------

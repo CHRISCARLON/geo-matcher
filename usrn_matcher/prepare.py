@@ -18,7 +18,7 @@ log: logging.Logger = get_logger()
 # EPSG:27700 (British National Grid) extent used as the Hilbert sort envelope.
 # ST_Hilbert maps each geometry's centroid to a Hilbert curve index within this bbox,
 # so spatially nearby features get consecutive indices and land in the same row groups.
-# Shared by prepare_dataset / prepare_from_csv (file write) and _build_dtf_gdf (in-memory sort).
+# Shared by prepare_dataset / prepare_from_csv (file write) and _build_dtf_table (in-memory sort).
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
 
 

@@ -16,8 +16,8 @@ There are two output routes:
 
 | Route | Command | Geometry kept | Best for |
 |---|---|---|---|
-| **Standard** | `usrn-matcher match` | USRN street geometry | Street-centric analysis |
-| **DTF export** | `usrn-matcher export` | Matched RHS feature geometry | Dataset-centric exchange in DTF8.1-inspired format |
+| **Standard** | `usrn-matcher match` | Optional — controlled by `--geometry` flag | Street-centric analysis |
+| **DTF export** | `usrn-matcher dtf-export` | Matched RHS feature geometry | Dataset-centric exchange in DTF8.1-inspired format |
 
 ## Installation
 
@@ -42,8 +42,8 @@ usrn-matcher prepare \
 # 3a. Run spatial join
 usrn-matcher match --rhs-name dataset_one --city LEEDS
 
-# 3b. Or export in DTF8.1-inspired format
-usrn-matcher export \
+# 3b. Or export in DTF8.1-inspired format (optional)
+usrn-matcher dtf-export \
   --rhs-name     dataset_one \
   --city         LEEDS \
   --dtf-org-name "My Org" \

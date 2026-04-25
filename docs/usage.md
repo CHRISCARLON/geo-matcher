@@ -124,10 +124,10 @@ usrn-matcher dtf-export \
 ```
 
 Writes to `matched_data/`:
-- `usrn_stops_attribution.csv` — DTF8.1a CSV (type 10/69/70/99 records)
-- `usrn_stops_attribution.parquet` — GeoParquet 1.1
-- `usrn_stops_attribution_flat.csv` — flat CSV with WKT geometry column
-- `usrn_stops_attribution.gpkg` — GeoPackage
+- `matched_stops_ad.csv` — DTF8.1a CSV (type 10/69/70/99 records)
+- `matched_stops_ad.parquet` — GeoParquet 1.1
+- `matched_stops_ad_flat.csv` — flat CSV with WKT geometry column
+- `matched_stops_ad.gpkg` — GeoPackage
 
 Key options (in addition to match options):
 
@@ -209,8 +209,9 @@ table = matcher.match_nearest(bbox=LEEDS, distance_m=25)
 ```
 
 Both methods return a `pyarrow.Table` with columns: `usrn`, `street_type`,
-plus all selected RHS columns. Pass `geometry="rhs"` to include the RHS geometry column
-(required for DTF export).
+plus all selected RHS columns. Pass `geometry="rhs"` to include a `geometry` column
+in the output (useful for GIS analysis). Pass `include_rhs_geometry=True` to add a
+`rhs_geometry` column required by the DTF export functions.
 
 ---
 
@@ -237,8 +238,8 @@ dtf_cfg = DTFConfig(
 
 out = pathlib.Path("matched_data")
 
-# geometry="rhs" is required for DTF export — includes the matched RHS geometry column
-table = matcher.match_nearest(bbox=LEEDS, distance_m=25, geometry="rhs")
+# include_rhs_geometry=True adds the rhs_geometry column required by DTF export functions
+table = matcher.match_nearest(bbox=LEEDS, distance_m=25, include_rhs_geometry=True)
 
 to_dtf_csv(table, dtf_cfg, out / "stops.csv")
 to_dtf_geoparquet(table, dtf_cfg, out / "stops.parquet")

@@ -175,7 +175,7 @@ def test_intersect_join_schema(soil_matcher):
     table = soil_matcher.match_intersect(bbox=LEEDS)
     assert "usrn" in table.schema.names
     assert "street_type" in table.schema.names
-    assert "geometry" in table.schema.names
+    assert "geometry" not in table.schema.names  # default geometry="none"
 
 
 @pytest.mark.integration
@@ -289,23 +289,19 @@ def test_dtf_csv_written(dtf_table, dtf_cfg, tmp_path):
     content = out.read_text(encoding="utf-8")
     assert content.startswith("10,")  # type 10 header record
     assert "99," in content  # type 99 trailer record
-    assert '"63a",' in content  # attribution records
+    assert '"70",' in content  # type 70 attribution records
 
 
 @pytest.mark.integration
 def test_dtf_csv_trailer_count_matches(dtf_table, dtf_cfg, tmp_path):
-    """Trailer record count must equal type69 + 63a + 67a records."""
+    """Trailer record count must equal type69 + type70 records."""
     out = tmp_path / "stops.csv"
     to_dtf_csv(dtf_table, dtf_cfg, out)
     lines = out.read_text(encoding="utf-8").strip().splitlines()
     trailer = lines[-1]
     declared_count = int(trailer.split(",")[1])
     actual_count = sum(
-        1
-        for line in lines
-        if line.startswith("69,")
-        or line.startswith('"63a",')
-        or line.startswith('"67a",')
+        1 for line in lines if line.startswith("69,") or line.startswith('"70",')
     )
     assert declared_count == actual_count
 
@@ -354,14 +350,14 @@ def test_dtf_gpkg_written(dtf_table, dtf_cfg, tmp_path):
 
 
 @pytest.mark.integration
-def test_to_csv_writes_wkt_geometry(soil_matcher, tmp_path):
+def test_to_csv_writes_file(soil_matcher, tmp_path):
     table = soil_matcher.match_intersect(bbox=LEEDS)
     out = tmp_path / "result.csv"
     soil_matcher.to_csv(table, out)
     assert out.exists()
-    content = out.read_text(encoding="utf-8")
-    assert "usrn" in content.splitlines()[0]
-    assert "LINESTRING" in content or "MULTILINESTRING" in content or "POINT" in content
+    header = out.read_text(encoding="utf-8").splitlines()[0]
+    assert "usrn" in header
+    assert "street_type" in header
 
 
 @pytest.mark.integration
@@ -389,15 +385,16 @@ def test_cli_prepare_and_match(tmp_path, monkeypatch):
     cache_dir.mkdir()
     matched_dir.mkdir()
 
-    # -- prepare --
+    # -- prepare USRNs --
+    prepare_usrns(USRN_GPKG, cache_dir / "usrns_27700.parquet")
+
+    # -- prepare RHS via CLI --
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "usrn-matcher",
-            "prepare",
-            "--usrn-gpkg",
-            str(USRN_GPKG),
+            "prepare-gpkg",
             "--rhs-gpkg",
             str(SOIL_GPKG),
             "--rhs-name",

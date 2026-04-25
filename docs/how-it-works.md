@@ -58,15 +58,22 @@ Sedona's default `execution_mode` is `Speculative(N)`. It samples the first N pr
 
 In practice, Speculative sometimes chooses `prepare_none` (`execution_mode=0`) for point datasets (e.g. Naptan Nodes).
 
-**Geometry clipping (intersect join)**
+**Geometry modes**
 
-`ST_Intersection(u.geometry, s.geometry)` is used rather than returning full USRN geometries. A USRN crossing three polygons produces three rows, each with only the segment inside that polygon. When a bbox is supplied the result is also clipped to its boundary.
+The `--geometry` flag controls whether geometry is returned and which geometry it is. The default is `none` (attribute-only — fastest, no geometry serialisation overhead):
+
+| Mode | SQL expression | Notes |
+|---|---|---|
+| `none` (default) | — | No geometry column in output |
+| `usrn` | `ST_AsWKB(u.geometry)` / `ST_Intersection(u.geometry, bbox)` | Full USRN linestring; clipped to bbox if supplied |
+| `clip` (intersect only) | `ST_Intersection(u.geometry, s.geometry)` | Segment of the USRN inside the RHS polygon; also clipped to bbox if supplied. A USRN crossing three polygons produces three rows each with only the segment inside that polygon |
+| `rhs` | `ST_AsWKB(s.geometry)` | Full unclipped RHS feature geometry — required for DTF export |
 
 ---
 
 ## DTF export phase
 
-The DTF GeoParquet output uses the same DuckDB pipeline as the prepare phase. After building the DTF column layout, the shapely geometries are serialised to WKB and registered as a PyArrow table directly in DuckDB memory (no temp file).
+The DTF GeoParquet output uses the same DuckDB pipeline as the prepare phase. `_build_dtf_table` constructs a pure PyArrow table with the type 70 fixed fields, RHS attribute columns, and a WKB `geometry` column — no GeoDataFrame involved. That table is registered directly in DuckDB memory (no temp file).
 
 DuckDB then computes the inline `bbox` struct, Hilbert-sorts the rows, and writes the GeoParquet file via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1 with the covering key and CRS PROJJSON.
 

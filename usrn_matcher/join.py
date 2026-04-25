@@ -104,7 +104,7 @@ def execute_join(
             rg.column(bbox_col_idx["ymax"]).statistics.max for rg in slice_rg_metas
         )
         bbox_wkt = f"POLYGON(({xmin} {ymin},{xmax} {ymin},{xmax} {ymax},{xmin} {ymax},{xmin} {ymin}))"
-        batch_filter = f"WHERE ST_Intersects(s.geometry, ST_SetSRID(ST_GeomFromWKT('{bbox_wkt}'), 27700))"
+        batch_filter = f"AND ST_Intersects(s.geometry, ST_SetSRID(ST_GeomFromWKT('{bbox_wkt}'), 27700))"
         batch_query = query.format(batch_filter=batch_filter)
 
         sd.create_data_frame(usrn_batch).to_view("usrns_raw", overwrite=True)
@@ -241,6 +241,7 @@ def run_intersect_join(
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_Intersects(u.geometry, s.geometry)
+        WHERE TRUE
         {bbox_filter}
         {{batch_filter}}
         ORDER BY u.usrn
@@ -365,6 +366,7 @@ def run_nearest_join(
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_DWithin(u.geometry, s.geometry, {distance_m})
+        WHERE TRUE
         {bbox_filter}
         {{batch_filter}}
         ORDER BY u.usrn, distance_m
@@ -384,10 +386,11 @@ def _read_auto_cols(parquet_path: str) -> tuple[str, ...]:
 
 
 def _bbox_pruner(bbox: BBox | None) -> str:
-    """Return a WHERE clause that prunes both parquet scans to the given EPSG:27700 bbox.
+    """Return AND conditions that prune both parquet scans to the given EPSG:27700 bbox.
 
     Both ``u`` (USRNs) and ``s`` (RHS) are filtered so Sedona can skip row groups
     on both files. Any RHS feature outside the bbox cannot intersect a USRN inside it.
+    Returns an empty string when bbox is None; the caller must supply a WHERE TRUE base.
     """
     if bbox is None:
         return ""
@@ -399,7 +402,7 @@ def _bbox_pruner(bbox: BBox | None) -> str:
     wkt: str = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
     bbox_geom: str = f"ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700)"
     return (
-        f"WHERE ST_Intersects(u.geometry, {bbox_geom})"
+        f"AND ST_Intersects(u.geometry, {bbox_geom})"
         f" AND ST_Intersects(s.geometry, {bbox_geom})"
     )
 
@@ -470,4 +473,4 @@ def _bbox_nearest_filters(bbox: BBox | None, distance_m: float) -> str:
         xmax + distance_m,
         ymax + distance_m,
     )
-    return f"WHERE {usrn_pred} AND {point_pred}"
+    return f"AND {usrn_pred} AND {point_pred}"

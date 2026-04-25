@@ -8,6 +8,7 @@ STOPS_CSV = input_data/Stops.csv
 	prepare-usrns prepare-usrns-force \
 	prepare-soil prepare-stops prepare-counts prepare-all \
 	match-soil-national match-soil-national-explain \
+	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
 	dtf-export-soil-national dtf-export-stops-national dtf-export-counts-national dtf-export-all-national \
 	clean-output clean-matched
@@ -67,6 +68,21 @@ match-counts-national:
 		--mode     nearest \
 		--distance 10 \
 		--output   csv \
+
+match-soil-leeds:
+	usrn-matcher match \
+		--rhs-name soil \
+		--mode     intersect \
+		--city     LEEDS \
+		--output   csv
+
+match-soil-leeds-explain:
+	usrn-matcher match \
+		--rhs-name soil \
+		--mode     intersect \
+		--city     LEEDS \
+		--output   csv \
+		--explain
 
 match-soil-national-explain:
 	usrn-matcher match \
