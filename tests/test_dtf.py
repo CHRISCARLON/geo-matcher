@@ -523,7 +523,8 @@ class TestToDtfFlatCsv:
     def test_dtf_columns_in_header(self, cfg, multi_row_table, tmp_path):
         out = tmp_path / "out_flat.csv"
         to_dtf_flat_csv(multi_row_table, cfg, out)
-        header = out.read_text(encoding="utf-8").splitlines()[0].split(",")
+        with out.open(encoding="utf-8") as f:
+            header = next(_csv.reader(f))
         for col in ("USRN", "RECORD_IDENTIFIER", "GEOMETRY_TYPE", "geometry"):
             assert col in header, f"Expected {col!r} in flat CSV header"
 

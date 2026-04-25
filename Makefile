@@ -5,6 +5,7 @@ STOPS_CSV = input_data/Stops.csv
 
 .PHONY: \
 	init \
+	prepare-usrns prepare-usrns-force \
 	prepare-soil prepare-stops prepare-counts prepare-all \
 	prepare-soil-force prepare-stops-force prepare-counts-force prepare-all-force \
 	match-soil-leeds-parquet match-soil-leeds-csv match-soil-leeds \
@@ -21,10 +22,18 @@ STOPS_CSV = input_data/Stops.csv
 init:
 	usrn-matcher init
 
+# ── Prepare USRNs ─────────────────────────────────────────────────────────────
+
+prepare-usrns:
+	usrn-matcher prepare-usrns
+
+prepare-usrns-force:
+	usrn-matcher prepare-usrns --force
+
 # ── Prepare (skip if parquet already exists) ──────────────────────────────────
 
 prepare-soil:
-	usrn-matcher prepare \
+	usrn-matcher prepare-gpkg \
 		--rhs-name soil
 
 prepare-stops:
@@ -45,7 +54,7 @@ prepare-all: prepare-soil prepare-stops prepare-counts
 # ── Prepare (force re-run) ────────────────────────────────────────────────────
 
 prepare-soil-force:
-	usrn-matcher prepare \
+	usrn-matcher prepare-gpkg \
 		--rhs-name soil \
 		--force
 

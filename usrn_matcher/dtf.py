@@ -62,8 +62,8 @@ from typing import Any
 import duckdb
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import pyarrow as pa
+import pyarrow.csv as pcsv
 import shapely
 from shapely.geometry import (
     LineString,
@@ -593,7 +593,7 @@ def _build_dtf_gdf(table: pa.Table, config: DTFConfig) -> gpd.GeoDataFrame:
     }
 
     gdf: gpd.GeoDataFrame = gpd.GeoDataFrame(
-        pd.DataFrame({**dtf_cols, **rhs_cols}),
+        {**dtf_cols, **rhs_cols},
         geometry=list(geoms),
         crs="EPSG:27700",
     )
@@ -648,9 +648,7 @@ def _write_dtf_geoparquet(
     wkb = pa.array(shapely.to_wkb(gdf.geometry.values), type=pa.binary())
 
     # Build PyArrow table: non-geometry columns first, WKB geometry last
-    base = pa.Table.from_pandas(
-        pd.DataFrame(gdf.drop(columns=["geometry"])), preserve_index=False
-    )
+    base = pa.Table.from_pandas(gdf.drop(columns=["geometry"]), preserve_index=False)
     arrow_table = base.append_column(pa.field("geometry", pa.binary()), wkb)
 
     con = duckdb.connect()
@@ -762,11 +760,10 @@ def to_dtf_flat_csv(
 
     gdf = _gdf if _gdf is not None else _build_dtf_gdf(table, config)
 
-    # Cast to plain DataFrame before replacing the geometry column with WKT strings.
-    # Writing WKT into a GeoDataFrame's geometry column triggers a GeoPandas warning.
-    df = pd.DataFrame(gdf)
-    df["geometry"] = gdf["geometry"].apply(shapely.to_wkt)
-    df.to_csv(resolved, index=False, encoding="utf-8")
+    base = pa.Table.from_pandas(gdf.drop(columns=["geometry"]), preserve_index=False)
+    wkt_col = pa.array(shapely.to_wkt(gdf.geometry.values), type=pa.string())
+    arrow_table = base.append_column(pa.field("geometry", pa.string()), wkt_col)
+    pcsv.write_csv(arrow_table, str(resolved))
 
     log.info("Written DTF flat CSV: %s (%d rows)", resolved, len(gdf))
     return resolved

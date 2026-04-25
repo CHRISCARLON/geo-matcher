@@ -3,8 +3,9 @@ import pathlib
 from collections.abc import Sequence
 from typing import TypeAlias
 
+import pyarrow as pa
 import pyarrow.parquet as pq
-from sedonadb.context import DataFrame, SedonaContext
+from sedonadb.context import SedonaContext
 
 from .config import DatasetConfig
 from .logger import get_logger
@@ -84,7 +85,7 @@ def run_intersect_join(
     bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
-) -> DataFrame:
+) -> pa.Table:
     """Run a spatial intersection join of USRNs against any right-hand side dataset.
 
     Parameters
@@ -173,7 +174,7 @@ def run_intersect_join(
         plan.show(width=400)
 
     log.info("Running spatial join (usrns × %s)...", rhs_view)
-    return sd.sql(query)
+    return sd.sql(query).to_arrow_table()
 
 
 def _bbox_nearest_filters(bbox: BBox | None, distance_m: float) -> tuple[str, str]:
@@ -219,7 +220,7 @@ def run_nearest_join(
     bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
-) -> DataFrame:
+) -> pa.Table:
     """Find the nearest USRN for each point in the RHS dataset.
 
     Uses a range join (``ST_DWithin``) to find all USRNs within ``distance_m``
@@ -330,4 +331,4 @@ def run_nearest_join(
     log.info(
         "Running nearest-USRN join (%s → usrns, radius=%.0fm)...", rhs_view, distance_m
     )
-    return sd.sql(query)
+    return sd.sql(query).to_arrow_table()

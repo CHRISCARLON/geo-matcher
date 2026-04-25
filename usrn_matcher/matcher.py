@@ -117,7 +117,7 @@ class UsrnMatcher:
             bbox=bbox,
             explain=explain,
             include_rhs_geometry=include_rhs_geometry,
-        ).to_arrow_table()
+        )
         log.info("Result row count: %d", len(table))
         return table
 
@@ -151,7 +151,7 @@ class UsrnMatcher:
             clipped distance in metres, and all selected RHS columns.
         """
         sd = self._connect()
-        result = run_nearest_join(
+        return run_nearest_join(
             sd,
             usrn_parquet=self._usrn_parquet,
             rhs_config=self._rhs_config,
@@ -160,8 +160,6 @@ class UsrnMatcher:
             explain=explain,
             include_rhs_geometry=include_rhs_geometry,
         )
-
-        return result.to_arrow_table()
 
     def to_parquet(self, table: pa.Table, path: str | pathlib.Path) -> None:
         """Write matched results as GeoParquet."""
@@ -256,17 +254,36 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare                                                              #
+        # prepare-usrns                                                        #
         # ------------------------------------------------------------------ #
-        p_prepare = sub.add_parser(
-            "prepare",
-            help="Pre-process source files into optimised GeoParquet (pre-spatial phase).",
+        p_prepare_usrns = sub.add_parser(
+            "prepare-usrns",
+            help="Pre-process the OS Open USRN GeoPackage into optimised GeoParquet.",
         )
-        p_prepare.add_argument(
+        p_prepare_usrns.add_argument(
             "--usrn-gpkg",
             default=DEFAULT_USRN_GPKG,
             metavar="PATH",
             help=f"Path to the OS Open USRN GeoPackage (default: {DEFAULT_USRN_GPKG}).",
+        )
+        p_prepare_usrns.add_argument(
+            "--cache-dir",
+            default=DEFAULT_OUTPUT_DIR,
+            metavar="DIR",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
+        )
+        p_prepare_usrns.add_argument(
+            "--force",
+            action="store_true",
+            help="Re-prepare even if the GeoParquet already exists.",
+        )
+
+        # ------------------------------------------------------------------ #
+        # prepare                                                              #
+        # ------------------------------------------------------------------ #
+        p_prepare = sub.add_parser(
+            "prepare-gpkg",
+            help="Pre-process source files into optimised GeoParquet (pre-spatial phase).",
         )
         p_prepare.add_argument(
             "--rhs-gpkg",
@@ -292,13 +309,6 @@ class UsrnMatcher:
             default=10_000,
             metavar="N",
             help="Row group size for the RHS GeoParquet (default: 10000).",
-        )
-        p_prepare.add_argument(
-            "--usrn-row-group-size",
-            type=int,
-            default=20_000,
-            metavar="N",
-            help="Row group size for the USRN GeoParquet (default: 20000).",
         )
         p_prepare.add_argument(
             "--cache-dir",
@@ -544,8 +554,18 @@ class UsrnMatcher:
         if args.command == "init":
             _cmd_init()
 
-        elif args.command == "prepare":
+        elif args.command == "prepare-usrns":
+            usrn_gpkg: pathlib.Path = pathlib.Path(args.usrn_gpkg)
+            _validate_input_file(usrn_gpkg)
             cache_dir: pathlib.Path = pathlib.Path(args.cache_dir)
+            prepare_usrns(
+                usrn_gpkg,
+                cache_dir / "usrns_27700.parquet",
+                force=args.force,
+            )
+
+        elif args.command == "prepare-gpkg":
+            cache_dir = pathlib.Path(args.cache_dir)
             rhs_gpkg: pathlib.Path = (
                 pathlib.Path(args.rhs_gpkg)
                 if args.rhs_gpkg is not None
@@ -558,11 +578,6 @@ class UsrnMatcher:
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
                 geometry_column=args.rhs_geometry_col,
                 row_group_size=args.rhs_row_group_size,
-            )
-            prepare_usrns(
-                args.usrn_gpkg,
-                cache_dir / "usrns_27700.parquet",
-                force=args.force,
             )
             prepare_dataset(rhs_config, force=args.force)
 

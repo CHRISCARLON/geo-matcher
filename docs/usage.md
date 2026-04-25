@@ -179,6 +179,10 @@ Pass `force=True` to either function to re-prepare even if the output already ex
 
 ### 2. Match
 
+> **Prepare must be run first.** `UsrnMatcher` expects both `usrns_27700.parquet` and
+> `{name}_27700.parquet` to already exist in `output_data/`. Run the prepare steps above
+> before constructing a matcher.
+
 ```python
 from usrn_matcher import DatasetConfig, UsrnMatcher
 from usrn_matcher.bboxes import LEEDS
@@ -206,16 +210,6 @@ Both methods return a `pyarrow.Table` with columns: `usrn`, `street_type`, `geom
 plus all selected RHS columns.
 
 Pass `include_rhs_geometry=True` if you intend to export to DTF format.
-
-**Convenience constructor** — prepare + match in one call:
-
-```python
-matcher = UsrnMatcher.from_sources(
-    usrn_gpkg="input_data/osopenusrn.gpkg",
-    rhs_config=cfg,
-    usrn_parquet="output_data/usrns_27700.parquet",
-)
-```
 
 ---
 
