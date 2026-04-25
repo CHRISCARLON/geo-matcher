@@ -238,6 +238,31 @@ def test_nearest_join_include_rhs_geometry(stops_matcher):
 
 
 # ---------------------------------------------------------------------------
+# Batched execution (usrn_batches > 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_intersect_batched_matches_unbatched(soil_matcher):
+    single = soil_matcher.match_intersect(bbox=LEEDS)
+    batched = soil_matcher.match_intersect(bbox=LEEDS, usrn_batches=4)
+    assert len(batched) == len(single)
+    assert sorted(batched.column("usrn").to_pylist()) == sorted(
+        single.column("usrn").to_pylist()
+    )
+
+
+@pytest.mark.integration
+def test_nearest_batched_matches_unbatched(stops_matcher):
+    single = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50)
+    batched = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50, usrn_batches=4)
+    assert len(batched) == len(single)
+    assert sorted(batched.column("usrn").to_pylist()) == sorted(
+        single.column("usrn").to_pylist()
+    )
+
+
+# ---------------------------------------------------------------------------
 # DTF export
 # ---------------------------------------------------------------------------
 

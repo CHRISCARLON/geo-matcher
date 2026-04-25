@@ -1,8 +1,7 @@
 import argparse
 import logging
 import pathlib
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, ClassVar
 
 import pyarrow as pa
 import pyarrow.csv as pcsv
@@ -16,6 +15,7 @@ from .config import (
     DEFAULT_MATCHED_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_USRN_GPKG,
+    BBox,
     DatasetConfig,
 )
 from .dtf import (
@@ -26,11 +26,9 @@ from .dtf import (
     to_dtf_geoparquet,
     to_dtf_gpkg,
 )
-from .join import run_intersect_join, run_nearest_join
+from .join import GeometryMode, JoinFn, run_intersect_join, run_nearest_join
 from .logger import get_logger
 from .prepare import prepare_dataset, prepare_from_csv, prepare_usrns
-
-BBox: TypeAlias = Sequence[float]
 
 if TYPE_CHECKING:
     from sedonadb.context import SedonaContext
@@ -38,8 +36,6 @@ if TYPE_CHECKING:
 log: logging.Logger = get_logger()
 
 
-# TODO: Use match statements for the dispatch at the bottom
-# TODO: Add in the possibility to do "Linestring/Multilinestring" matching
 class UsrnMatcher:
     """Spatially join USRNs to any polygon or point dataset using SedonaDB.
 
@@ -62,6 +58,16 @@ class UsrnMatcher:
         matcher.to_csv(table, "matched_data/usrn_highways_attribution.csv")
     """
 
+    _JOIN_FNS: ClassVar[dict[str, JoinFn]] = {
+        "intersect": run_intersect_join,
+        "nearest": run_nearest_join,
+    }
+    _OUTPUT_FORMATS: ClassVar[dict[str, str]] = {
+        "parquet": "to_parquet",
+        "csv": "to_csv",
+        "sample": "to_csv",
+    }
+
     _usrn_parquet: pathlib.Path
     _rhs_config: DatasetConfig
     _sd: "SedonaContext | None"
@@ -81,45 +87,56 @@ class UsrnMatcher:
         assert self._sd is not None
         return self._sd
 
+    def match_dispatch(
+        self,
+        mode: str,
+        bbox: BBox | None = None,
+        explain: bool = False,
+        include_rhs_geometry: bool = False,
+        usrn_batches: int = 1,
+        distance_m: float = 50.0,
+        geometry: GeometryMode = "none",
+    ) -> pa.Table:
+        """Dispatch to the registered JoinFn for the given mode."""
+        if mode not in self._JOIN_FNS:
+            raise ValueError(
+                f"Unknown join mode {mode!r}. Available: {sorted(self._JOIN_FNS)}"
+            )
+        if bbox is None and usrn_batches == 1:
+            usrn_batches = 10
+        sd = self._connect()
+        fn = self._JOIN_FNS[mode]
+        result = fn(
+            sd,
+            self._usrn_parquet,
+            self._rhs_config,
+            bbox=bbox,
+            explain=explain,
+            include_rhs_geometry=include_rhs_geometry,
+            usrn_batches=usrn_batches,
+            distance_m=distance_m,
+            geometry=geometry,
+        )
+        log.info("Result row count: %d", len(result))
+        return result
+
     def match_intersect(
         self,
         bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
+        usrn_batches: int = 1,
+        geometry: GeometryMode = "none",
     ) -> pa.Table:
-        """Spatially join USRNs to the configured dataset.
-
-        Parameters
-        ----------
-        bbox:
-            Optional ``[xmin, ymin, xmax, ymax]`` in EPSG:27700 (British
-            National Grid metres). When ``None``, the full national join is
-            executed — all USRNs are matched against all RHS geometries.
-        explain:
-            If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
-            The join runs twice when this flag is set.
-        include_rhs_geometry:
-            If ``True``, appends a ``rhs_geometry`` column (WKB bytes of the
-            matched RHS feature geometry). Required for DTF export.
-
-        Returns
-        -------
-        pa.Table
-            One row per USRN–RHS intersection. Geometry column contains WKB
-            bytes with ``geoarrow.wkb`` extension type. When a bbox is given
-            the geometries are clipped to its boundary.
-        """
-        sd = self._connect()
-        table: pa.Table = run_intersect_join(
-            sd,
-            usrn_parquet=self._usrn_parquet,
-            rhs_config=self._rhs_config,
+        """Intersect join USRNs against the configured dataset."""
+        return self.match_dispatch(
+            "intersect",
             bbox=bbox,
             explain=explain,
             include_rhs_geometry=include_rhs_geometry,
+            usrn_batches=usrn_batches,
+            geometry=geometry,
         )
-        log.info("Result row count: %d", len(table))
-        return table
 
     def match_nearest(
         self,
@@ -127,39 +144,40 @@ class UsrnMatcher:
         bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
+        usrn_batches: int = 1,
+        geometry: GeometryMode = "none",
     ) -> pa.Table:
-        """Find the nearest USRN for each point in the configured dataset.
-
-        Parameters
-        ----------
-        distance_m:
-            Search radius in metres. Only USRNs within this distance are
-            considered. Default 50 m.
-        bbox:
-            Optional ``[xmin, ymin, xmax, ymax]`` in EPSG:27700 to restrict
-            which points are matched.
-        explain:
-            If ``True``, runs EXPLAIN ANALYZE and logs the query plan.
-        include_rhs_geometry:
-            If ``True``, appends a ``rhs_geometry`` column (WKB bytes of the
-            matched RHS point geometry). Required for DTF export.
-
-        Returns
-        -------
-        pa.Table
-            One row per input point — the nearest USRN, its street type, the
-            clipped distance in metres, and all selected RHS columns.
-        """
-        sd = self._connect()
-        return run_nearest_join(
-            sd,
-            usrn_parquet=self._usrn_parquet,
-            rhs_config=self._rhs_config,
-            distance_m=distance_m,
+        """Find the nearest USRN for each point in the configured dataset."""
+        return self.match_dispatch(
+            "nearest",
             bbox=bbox,
             explain=explain,
             include_rhs_geometry=include_rhs_geometry,
+            usrn_batches=usrn_batches,
+            distance_m=distance_m,
+            geometry=geometry,
         )
+
+    def file_dispatch(
+        self,
+        table: pa.Table,
+        output: str,
+        matched_dir: pathlib.Path,
+        stem: str,
+        sample: int = 100_000,
+    ) -> None:
+        """Write match results to the requested output format."""
+        if output not in self._OUTPUT_FORMATS:
+            raise ValueError(
+                f"Unknown output format {output!r}. Available: {sorted(self._OUTPUT_FORMATS)}"
+            )
+        match output:
+            case "parquet":
+                self.to_parquet(table, matched_dir / f"{stem}.parquet")
+            case "csv":
+                self.to_csv(table, matched_dir / f"{stem}.csv")
+            case "sample":
+                self.to_csv(table, matched_dir / f"{stem}_sample.csv", sample=sample)
 
     def to_parquet(self, table: pa.Table, path: str | pathlib.Path) -> None:
         """Write matched results as GeoParquet."""
@@ -193,12 +211,13 @@ class UsrnMatcher:
 
         def _wkb_col_to_wkt(col: pa.ChunkedArray) -> pa.Array:
             """Convert a WKB column (geoarrow or plain binary) to WKT strings."""
-            raw: pa.ChunkedArray = (
+            chunked: pa.ChunkedArray = (
                 col.cast(col.type.storage_type)
                 if hasattr(col.type, "storage_type")
                 else col
             )
-            return pa.array(shapely.to_wkt(shapely.from_wkb(raw.to_pylist())))
+            raw = chunked.combine_chunks().to_numpy(zero_copy_only=False)
+            return pa.array(shapely.to_wkt(shapely.from_wkb(raw)))
 
         # Convert the geometry column to WKT.
         for geom_field in ("geometry",):
@@ -422,7 +441,7 @@ class UsrnMatcher:
 
         p_match.add_argument(
             "--output",
-            choices=["parquet", "csv", "sample"],
+            choices=list(cls._OUTPUT_FORMATS),
             default="csv",
             help="Output format (default: csv).",
         )
@@ -434,7 +453,7 @@ class UsrnMatcher:
         )
         p_match.add_argument(
             "--mode",
-            choices=["intersect", "nearest"],
+            choices=list(cls._JOIN_FNS),
             default="intersect",
             help=(
                 "Join mode: 'intersect' for polygon/line datasets (default); "
@@ -449,9 +468,32 @@ class UsrnMatcher:
             help="Search radius in metres for --mode nearest (default: 50).",
         )
         p_match.add_argument(
+            "--geometry",
+            choices=["none", "usrn", "clip", "rhs"],
+            default="none",
+            help=(
+                "Geometry column in the output (default: none). "
+                "'none' — attribute-only, fastest; "
+                "'usrn' — full USRN line; "
+                "'clip' — USRN clipped to matched polygon (intersect only, slower); "
+                "'rhs' — matched RHS feature geometry."
+            ),
+        )
+        p_match.add_argument(
             "--explain",
             action="store_true",
             help="Run EXPLAIN ANALYZE before the join (runs the join twice).",
+        )
+        p_match.add_argument(
+            "--batches",
+            type=int,
+            default=1,
+            metavar="N",
+            help=(
+                "Split the USRN parquet into N row-group batches and run the join once "
+                "per batch (default: 1 = no batching). Use 4 for national joins to "
+                "reduce peak memory and CPU pressure."
+            ),
         )
         p_match.add_argument(
             "--cache-dir",
@@ -504,7 +546,7 @@ class UsrnMatcher:
 
         p_export.add_argument(
             "--mode",
-            choices=["intersect", "nearest"],
+            choices=list(cls._JOIN_FNS),
             default="intersect",
             help="Join mode: 'intersect' (default) or 'nearest'.",
         )
@@ -541,9 +583,31 @@ class UsrnMatcher:
             help=f"Directory for output files (default: {DEFAULT_MATCHED_DIR}).",
         )
         p_export.add_argument(
+            "--geometry",
+            choices=["none", "usrn", "clip", "rhs"],
+            default="none",
+            help=(
+                "Geometry column in the output (default: none). "
+                "'none' — attribute-only, fastest; "
+                "'usrn' — full USRN line; "
+                "'clip' — USRN clipped to matched polygon (intersect only, slower); "
+                "'rhs' — matched RHS feature geometry."
+            ),
+        )
+        p_export.add_argument(
             "--explain",
             action="store_true",
             help="Run EXPLAIN ANALYZE before the join.",
+        )
+        p_export.add_argument(
+            "--batches",
+            type=int,
+            default=1,
+            metavar="N",
+            help=(
+                "Split the USRN parquet into N row-group batches (default: 1). "
+                "Use 4 for national exports to reduce peak memory and CPU pressure."
+            ),
         )
 
         args = parser.parse_args()
@@ -621,26 +685,21 @@ class UsrnMatcher:
             stem: str = f"usrn_{args.rhs_name}_attribution"
             matched_dir: pathlib.Path = pathlib.Path(args.matched_dir)
 
-            if args.mode == "nearest":
-                table: pa.Table = matcher.match_nearest(
-                    distance_m=args.distance,
-                    bbox=bbox,
-                    explain=args.explain,
-                )
-                stem = f"usrn_{args.rhs_name}_attribution"
-            else:
-                table = matcher.match_intersect(bbox=bbox, explain=args.explain)
-
-            if args.output == "parquet":
-                matcher.to_parquet(table, matched_dir / f"{stem}.parquet")
-            elif args.output == "csv":
-                matcher.to_csv(table, matched_dir / f"{stem}.csv")
-            elif args.output == "sample":
-                matcher.to_csv(
-                    table,
-                    matched_dir / f"{stem}_sample.csv",
-                    sample=args.sample_rows,
-                )
+            table: pa.Table = matcher.match_dispatch(
+                mode=args.mode,
+                bbox=bbox,
+                explain=args.explain,
+                usrn_batches=args.batches,
+                distance_m=args.distance,
+                geometry=args.geometry,
+            )
+            matcher.file_dispatch(
+                table,
+                output=args.output,
+                matched_dir=matched_dir,
+                stem=stem,
+                sample=args.sample_rows,
+            )
 
         elif args.command == "export":
             cache_dir = pathlib.Path(args.cache_dir)
@@ -660,19 +719,15 @@ class UsrnMatcher:
                 rhs_config=rhs_config,
             )
 
-            if args.mode == "nearest":
-                table = matcher.match_nearest(
-                    distance_m=args.distance,
-                    bbox=bbox,
-                    explain=args.explain,
-                    include_rhs_geometry=True,
-                )
-            else:
-                table = matcher.match_intersect(
-                    bbox=bbox,
-                    explain=args.explain,
-                    include_rhs_geometry=True,
-                )
+            table = matcher.match_dispatch(
+                mode=args.mode,
+                bbox=bbox,
+                explain=args.explain,
+                include_rhs_geometry=True,
+                usrn_batches=args.batches,
+                distance_m=args.distance,
+                geometry=args.geometry,
+            )
 
             dtf_config = DTFConfig(
                 swa_org_name=args.dtf_org_name,

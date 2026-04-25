@@ -91,6 +91,7 @@ def _get_src_geometry_col(con: Any, source_path: str) -> str:
     raise ValueError(f"No GEOMETRY column found in {source_path!r}")
 
 
+# TODO: We need a more generic dispatch system for preparing files
 def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
     """Read any spatial dataset and write an optimised GeoParquet 1.1 file.
 

@@ -1,90 +1,138 @@
+import functools
 import logging
 import pathlib
-from collections.abc import Sequence
-from typing import TypeAlias
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from sedonadb.context import SedonaContext
 
-from .config import DatasetConfig
+from .config import BBox, DatasetConfig
 from .logger import get_logger
-
-BBox: TypeAlias = Sequence[float]
 
 log: logging.Logger = get_logger()
 
+GeometryMode = Literal["none", "usrn", "clip", "rhs"]
 
-def _bbox_filter(bbox: BBox | None) -> str:
-    """Return a WHERE clause restricting both sides to the given EPSG:27700 bbox.
 
-    Filtering both ``u`` (USRNs) and ``s`` (RHS) lets Sedona prune row groups
-    on both parquet files.
+@runtime_checkable
+class JoinFn(Protocol):
+    """Contract every join implementation must satisfy.
 
-    Any RHS feature that doesn't overlap the bbox can't possibly intersect a USRN inside it!
-
-    This allows for the Lidl spatial indexing to work.
+    The four common keyword-only params must be declared. Mode-specific params
+    (e.g. ``distance_m`` for nearest joins) are absorbed via ``**kwargs``.
+    ``@runtime_checkable`` enables ``isinstance`` checks at runtime.
     """
-    if bbox is None:
-        return ""
-    xmin: float
-    ymin: float
-    xmax: float
-    ymax: float
-    xmin, ymin, xmax, ymax = bbox
-    wkt: str = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
-    bbox_geom: str = f"ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700)"
-    return (
-        f"WHERE ST_Intersects(u.geometry, {bbox_geom})"
-        f" AND ST_Intersects(s.geometry, {bbox_geom})"
-    )
+
+    def __call__(
+        self,
+        sd: SedonaContext,
+        usrn_parquet: pathlib.Path,
+        rhs_config: DatasetConfig,
+        *,
+        bbox: BBox | None = ...,
+        explain: bool = ...,
+        include_rhs_geometry: bool = ...,
+        usrn_batches: int = ...,
+        **kwargs: Any,
+    ) -> pa.Table: ...
 
 
-def _bbox_wkt(bbox: BBox | None) -> str | None:
-    """Return the bbox as a WKT geometry string for clipping, or None.
+def execute_join(
+    sd: SedonaContext,
+    usrn_parquet: pathlib.Path,
+    query: str,
+    explain: bool,
+    usrn_batches: int,
+) -> pa.Table:
+    """Register the USRN view and run a pre-built spatial join query.
 
-    _bbox_filter is for pruning — it goes in the WHERE clause and touches both scans.
+    When ``usrn_batches == 1`` the full parquet is registered as a single Sedona
+    scan.
 
-    _bbox_wkt is for clipping — it's used inside ST_Intersection(u.geometry, s.geometry, bbox_wkt)
+    When ``usrn_batches > 1`` the parquet row groups are divided into
+    equal-sized chunks; each chunk is loaded into an in-memory Arrow table and
+    registered via ``create_data_frame`` — no temp files.
 
-    It trims USRN lines at the bbox boundary so we don't get long roads extending
-    outside the area of interest in the output.
+    Results are concatenated in row-group order.
     """
-    if bbox is None:
-        return None
-    xmin: float
-    ymin: float
-    xmax: float
-    ymax: float
-    xmin, ymin, xmax, ymax = bbox
-    return f"ST_SetSRID(ST_GeomFromWKT('POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))'), 27700)"
+    if usrn_batches <= 1:
+        sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
+        filled: str = query.format(batch_filter="")
+        if explain:
+            log.info("Query plan (with execution metrics):")
+            sd.sql(f"EXPLAIN ANALYZE {filled}").show(width=400)
+        return sd.sql(filled).to_arrow_table()
 
-
-def _col_fragment(rhs_config: DatasetConfig) -> str:
-    """Return the SELECT fragment for RHS columns (prefixed with a leading comma).
-
-    If ``rhs_config.columns`` is non-empty the listed columns are used as-is.
-    Otherwise all columns except ``geometry`` and the internal ``bbox`` covering
-    column are discovered from the parquet file footer.
-    """
-    if rhs_config.columns:
-        return ", " + ", ".join(f's."{c}"' for c in rhs_config.columns)
-    # rhs_df.schema is a PySedonaSchema (not iterable like PyArrow) so read
-    # column names directly from the parquet file footer instead.
-    rhs_pa_schema: pq.ParquetSchema = pq.read_schema(str(rhs_config.parquet_path))
-    auto_cols: list[str] = [
-        name for name in rhs_pa_schema.names if name not in ("geometry", "bbox")
+    usrn_pf: pq.ParquetFile = pq.ParquetFile(str(usrn_parquet))
+    n_row_groups: int = usrn_pf.metadata.num_row_groups
+    rgs_per_batch: int = max(1, (n_row_groups + usrn_batches - 1) // usrn_batches)
+    usrn_slices: list[list[int]] = [
+        list(range(start, min(start + rgs_per_batch, n_row_groups)))
+        for start in range(0, n_row_groups, rgs_per_batch)
     ]
-    return ", " + ", ".join(f's."{c}"' for c in auto_cols)
+    n_batches: int = len(usrn_slices)
+    log.info("Batching USRN parquet: %d row groups → %d batches", n_row_groups, n_batches)
+
+    # Discover bbox leaf column indices from parquet schema once.
+    first_rg = usrn_pf.metadata.row_group(0)
+    col_path_to_idx: dict[Any, int] = {
+        first_rg.column(i).path_in_schema: i for i in range(first_rg.num_columns)
+    }
+    bbox_col_idx: dict[str, int] = {
+        f: col_path_to_idx[f"bbox.{f}"] for f in ("xmin", "ymin", "xmax", "ymax")
+    }
+
+    batch_results: list[pa.Table] = []
+    for i, usrn_slice in enumerate(usrn_slices):
+        usrn_batch: pa.Table = usrn_pf.read_row_groups(usrn_slice)
+
+        # Derive batch envelope from row-group statistics — no extra data scan.
+        slice_rg_metas = [usrn_pf.metadata.row_group(rg) for rg in usrn_slice]
+        xmin: float = min(rg.column(bbox_col_idx["xmin"]).statistics.min for rg in slice_rg_metas)
+        ymin: float = min(rg.column(bbox_col_idx["ymin"]).statistics.min for rg in slice_rg_metas)
+        xmax: float = max(rg.column(bbox_col_idx["xmax"]).statistics.max for rg in slice_rg_metas)
+        ymax: float = max(rg.column(bbox_col_idx["ymax"]).statistics.max for rg in slice_rg_metas)
+        bbox_wkt = f"POLYGON(({xmin} {ymin},{xmax} {ymin},{xmax} {ymax},{xmin} {ymax},{xmin} {ymin}))"
+        batch_filter = f"WHERE ST_Intersects(s.geometry, ST_SetSRID(ST_GeomFromWKT('{bbox_wkt}'), 27700))"
+        batch_query = query.format(batch_filter=batch_filter)
+
+        sd.create_data_frame(usrn_batch).to_view("usrns_raw", overwrite=True)
+        sd.sql(
+            "SELECT usrn, street_type,"
+            " ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry"
+            " FROM usrns_raw"
+        ).to_view("usrns", overwrite=True)
+        log.info(
+            "Batch %d/%d: %d row groups, %d rows — bbox xmin=%.0f ymin=%.0f xmax=%.0f ymax=%.0f",
+            i + 1,
+            n_batches,
+            len(usrn_slice),
+            len(usrn_batch),
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+        )
+        if explain and i == 0:
+            log.info("Query plan (batch 1 of %d):", n_batches)
+            sd.sql(f"EXPLAIN ANALYZE {batch_query}").show(width=400)
+        batch_results.append(sd.sql(batch_query).to_arrow_table())
+
+    return pa.concat_tables(batch_results)
 
 
 def run_intersect_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
+    *,
     bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
+    usrn_batches: int = 1,
+    geometry: GeometryMode = "none",
+    **_: Any,
 ) -> pa.Table:
     """Run a spatial intersection join of USRNs against any right-hand side dataset.
 
@@ -105,22 +153,29 @@ def run_intersect_join(
     explain:
         If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
     include_rhs_geometry:
-        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` in the
-        SELECT list. Used by the DTF export step, which encodes the matched RHS
-        feature geometry (not the USRN line) into type 67 coordinate records.
+        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` as an
+        additional column. Used by the DTF export step.
+    usrn_batches:
+        Split the USRN parquet into this many batches and concatenate results.
+        ``1`` loads the full file as a single Sedona scan. Use ``4`` or more
+        for national (no-bbox) joins to avoid memory spikes.
+    geometry:
+        Controls the primary ``geometry`` column in the output.
+        ``"none"`` (default) — omit geometry entirely (fastest; attribute-only output).
+        ``"usrn"`` — full USRN line (``ST_AsWKB``), clipped to bbox when one is supplied.
+        ``"clip"`` — USRN geometry clipped to the matched RHS polygon
+        (``ST_Intersection``). Slower; useful when the segmented line is needed.
+        ``"rhs"`` — the matched RHS feature geometry instead of the USRN line.
     """
     rhs_view: str = rhs_config.name
 
     rhs_df = sd.read_parquet(str(rhs_config.parquet_path))
-    usrn_df = sd.read_parquet(str(usrn_parquet))
-
     rhs_df.to_view(rhs_view, overwrite=True)
-    usrn_df.to_view("usrns", overwrite=True)
 
     log.info("RHS (%s) schema: %s", rhs_view, rhs_df.schema)
-    log.info("USRN schema: %s", usrn_df.schema)
     log.info("RHS (%s) count: %d", rhs_view, rhs_df.count())
-    log.info("USRN count: %d", usrn_df.count())
+    log.info("USRN schema: %s", pq.read_schema(str(usrn_parquet)))
+    log.info("USRN count: %d", pq.read_metadata(str(usrn_parquet)).num_rows)
 
     # IMPORTANT: We intentionally do not set sedona.spatial_join.execution_mode.
     # The default is Speculative(N), which samples the first N probe-side geometries
@@ -133,16 +188,28 @@ def run_intersect_join(
     # Sedona also handles build/probe side assignment automatically via should_swap_join_order(),
     # which puts the smaller table on the build side based on cardinality estimates.
 
-    bbox_filter: str = _bbox_filter(bbox)
-    bbox_wkt: str | None = _bbox_wkt(bbox)
+    bbox_filter: str = _bbox_pruner(bbox)
+    bbox_clip: str | None = _bbox_clipper(bbox)
 
-    # When a bbox is supplied, clip the intersection to it so long USRNs that
-    # extend outside the area of interest are trimmed at the boundary.
-    intersection_expr: str = (
-        f"ST_Intersection(ST_Intersection(u.geometry, s.geometry), {bbox_wkt})"
-        if bbox_wkt
-        else "ST_Intersection(u.geometry, s.geometry)"
-    )
+    geometry_select: str
+    if geometry == "none":
+        geometry_select = ""
+    elif geometry == "rhs":
+        geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
+    elif geometry == "clip":
+        geom_expr: str = (
+            f"ST_Intersection(ST_Intersection(u.geometry, s.geometry), {bbox_clip})"
+            if bbox_clip
+            else "ST_Intersection(u.geometry, s.geometry)"
+        )
+        geometry_select = f",\n            {geom_expr} AS geometry"
+    else:  # "usrn"
+        geom_expr = (
+            f"ST_Intersection(u.geometry, {bbox_clip})"
+            if bbox_clip
+            else "ST_AsWKB(u.geometry)"
+        )
+        geometry_select = f",\n            {geom_expr} AS geometry"
 
     if bbox:
         log.info("Applying bbox filter: xmin=%s ymin=%s xmax=%s ymax=%s", *bbox)
@@ -157,69 +224,34 @@ def run_intersect_join(
     query: str = f"""
         SELECT
             u.usrn,
-            u.street_type,
-            {intersection_expr} AS geometry
+            u.street_type
+            {geometry_select}
             {col_fragment}
             {rhs_geom_fragment}
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_Intersects(u.geometry, s.geometry)
         {bbox_filter}
+        {{batch_filter}}
         ORDER BY u.usrn
     """
 
-    if explain:
-        log.info("Query plan (with execution metrics):")
-        plan = sd.sql(f"EXPLAIN ANALYZE {query}")
-        plan.show(width=400)
-
     log.info("Running spatial join (usrns × %s)...", rhs_view)
-    return sd.sql(query).to_arrow_table()
-
-
-def _bbox_nearest_filters(bbox: BBox | None, distance_m: float) -> tuple[str, str]:
-    """Return a combined WHERE clause that prunes both sides of a nearest join.
-
-    USRNs (``u``) are filtered to the exact bbox (same as the intersect join).
-    Points (``s``) are filtered to the bbox expanded by ``distance_m`` so that
-    stops just outside the boundary can still match a USRN inside it.
-
-    Sedona pushes each predicate to its respective parquet scan, pruning row
-    groups on both files.
-
-    Returns an empty string when ``bbox`` is ``None``.
-    """
-    if bbox is None:
-        return "", ""
-    xmin: float
-    ymin: float
-    xmax: float
-    ymax: float
-    xmin, ymin, xmax, ymax = bbox
-
-    def _pred(alias: str, x0: float, y0: float, x1: float, y1: float) -> str:
-        wkt: str = f"POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))"
-        return f"ST_Intersects({alias}.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
-
-    usrn_pred: str = _pred("u", xmin, ymin, xmax, ymax)
-    point_pred: str = _pred(
-        "s",
-        xmin - distance_m,
-        ymin - distance_m,
-        xmax + distance_m,
-        ymax + distance_m,
-    )
-    return f"WHERE {usrn_pred} AND {point_pred}", ""
+    return execute_join(sd, usrn_parquet, query, explain, usrn_batches)
 
 
 def run_nearest_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
+    *,
     distance_m: float = 50.0,
     bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
+    usrn_batches: int = 1,
+    geometry: GeometryMode = "none",
+    **_: Any,
 ) -> pa.Table:
     """Find the nearest USRN for each point in the RHS dataset.
 
@@ -244,28 +276,27 @@ def run_nearest_join(
     explain:
         If ``True``, runs EXPLAIN ANALYZE first and logs the query plan.
     include_rhs_geometry:
-        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` in the
-        SELECT list. Used by the DTF export step, which stores the matched RHS
-        point geometry as WKT in the paired type 67a record.
-
-    Returns
-    -------
-    One row per USRN–point pair within ``distance_m``, ordered by
-    ``usrn, distance_m``. Columns: ``usrn``, ``street_type``, all RHS
-    ``columns`` (or auto-discovered), ``distance_m``.
+        If ``True``, include ``ST_AsWKB(s.geometry) AS rhs_geometry`` as an
+        additional column. Used by the DTF export step.
+    usrn_batches:
+        Split the USRN parquet into this many batches and concatenate results.
+        ``1`` loads the full file as a single Sedona scan. Use ``4`` or more
+        for national (no-bbox) joins to avoid memory spikes.
+    geometry:
+        Controls the primary ``geometry`` column in the output.
+        ``"none"`` (default) — omit geometry entirely (fastest; attribute-only output).
+        ``"usrn"`` or ``"clip"`` — full USRN line (no meaningful clip for nearest).
+        ``"rhs"`` — the matched RHS point geometry.
     """
     rhs_view: str = rhs_config.name
 
     rhs_df = sd.read_parquet(str(rhs_config.parquet_path))
-    usrn_df = sd.read_parquet(str(usrn_parquet))
-
     rhs_df.to_view(rhs_view, overwrite=True)
-    usrn_df.to_view("usrns", overwrite=True)
 
     log.info("RHS (%s) schema: %s", rhs_view, rhs_df.schema)
-    log.info("USRN schema: %s", usrn_df.schema)
     log.info("RHS (%s) count: %d", rhs_view, rhs_df.count())
-    log.info("USRN count: %d", usrn_df.count())
+    log.info("USRN schema: %s", pq.read_schema(str(usrn_parquet)))
+    log.info("USRN count: %d", pq.read_metadata(str(usrn_parquet)).num_rows)
 
     # We intentionally do not set sedona.spatial_join.execution_mode — see run_intersect_join.
 
@@ -277,8 +308,7 @@ def run_nearest_join(
     # Apply bbox to both sides so Sedona can prune row groups on both parquets:
     #   - USRNs: exact bbox (same as run_intersect_join)
     #   - Points: bbox expanded by distance_m to include points near the boundary
-    bbox_filter: str
-    bbox_filter, _ = _bbox_nearest_filters(bbox, distance_m)
+    bbox_filter: str = _bbox_nearest_filters(bbox, distance_m)
 
     # Rewrite as a combined WHERE instead of separate filters — Sedona pushes
     # each predicate down to its respective scan, pruning both parquets.
@@ -293,17 +323,23 @@ def run_nearest_join(
         log.info("No bbox supplied — matching all points.")
 
     col_fragment: str = _col_fragment(rhs_config)
-    bbox_wkt: str | None = _bbox_wkt(bbox)
+    bbox_clip: str | None = _bbox_clipper(bbox)
 
-    # Clip the USRN geometry to the bbox so long streets don't extend outside
-    # the area of interest — mirrors the ST_Intersection clipping in run_intersect_join.
-    # ST_Intersection also avoids the raw WkbView segfault in to_arrow_table(), so
-    # ST_AsWKB is only needed for the unclipped (no-bbox) case.
-    geometry_expr: str = (
-        f"ST_Intersection(u.geometry, {bbox_wkt})"
-        if bbox_wkt
-        else "ST_AsWKB(u.geometry)"
-    )
+    geometry_select: str
+    if geometry == "none":
+        geometry_select = ""
+    elif geometry == "rhs":
+        geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
+    else:  # "usrn" or "clip" — no meaningful clip for nearest, falls back to full USRN line
+        # ST_Intersection also avoids the raw WkbView segfault in to_arrow_table(), so
+        # ST_AsWKB is only needed for the unclipped (no-bbox) case.
+        geom_expr: str = (
+            f"ST_Intersection(u.geometry, {bbox_clip})"
+            if bbox_clip
+            else "ST_AsWKB(u.geometry)"
+        )
+        geometry_select = f",\n            {geom_expr} AS geometry"
+
     rhs_geom_fragment: str = (
         ", ST_AsWKB(s.geometry) AS rhs_geometry" if include_rhs_geometry else ""
     )
@@ -311,8 +347,8 @@ def run_nearest_join(
     query: str = f"""
         SELECT
             u.usrn,
-            u.street_type,
-            {geometry_expr} AS geometry
+            u.street_type
+            {geometry_select}
             {col_fragment},
             ST_Distance(u.geometry, s.geometry) AS distance_m
             {rhs_geom_fragment}
@@ -320,15 +356,108 @@ def run_nearest_join(
         JOIN {rhs_view} AS s
           ON ST_DWithin(u.geometry, s.geometry, {distance_m})
         {bbox_filter}
+        {{batch_filter}}
         ORDER BY u.usrn, distance_m
     """
-
-    if explain:
-        log.info("Query plan (with execution metrics):")
-        plan = sd.sql(f"EXPLAIN ANALYZE {query}")
-        plan.show(width=400)
 
     log.info(
         "Running nearest-USRN join (%s → usrns, radius=%.0fm)...", rhs_view, distance_m
     )
-    return sd.sql(query).to_arrow_table()
+    return execute_join(sd, usrn_parquet, query, explain, usrn_batches)
+
+
+@functools.lru_cache(maxsize=None)
+def _read_auto_cols(parquet_path: str) -> tuple[str, ...]:
+    """Return non-geometry column names from a parquet footer — cached per path."""
+    schema = pq.read_schema(parquet_path)
+    return tuple(name for name in schema.names if name not in ("geometry", "bbox"))
+
+
+def _bbox_pruner(bbox: BBox | None) -> str:
+    """Return a WHERE clause that prunes both parquet scans to the given EPSG:27700 bbox.
+
+    Both ``u`` (USRNs) and ``s`` (RHS) are filtered so Sedona can skip row groups
+    on both files. Any RHS feature outside the bbox cannot intersect a USRN inside it.
+    """
+    if bbox is None:
+        return ""
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    xmin, ymin, xmax, ymax = bbox
+    wkt: str = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
+    bbox_geom: str = f"ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700)"
+    return (
+        f"WHERE ST_Intersects(u.geometry, {bbox_geom})"
+        f" AND ST_Intersects(s.geometry, {bbox_geom})"
+    )
+
+
+def _bbox_clipper(bbox: BBox | None) -> str | None:
+    """Return the bbox as a Sedona geometry expression for use inside ST_Intersection, or None.
+
+    Clips USRN lines at the bbox boundary so long roads don't extend outside the
+    area of interest. Distinct from ``_bbox_pruner``, which goes in the WHERE clause
+    to skip row groups — this trims the output geometry itself.
+    """
+    if bbox is None:
+        return None
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    xmin, ymin, xmax, ymax = bbox
+    return f"ST_SetSRID(ST_GeomFromWKT('POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))'), 27700)"
+
+
+def _col_fragment(rhs_config: DatasetConfig) -> str:
+    """Return the SELECT fragment for RHS columns (prefixed with a leading comma).
+
+    If ``rhs_config.columns`` is non-empty the listed columns are used as-is.
+    Otherwise all columns except ``geometry`` and the internal ``bbox`` covering
+    column are discovered from the parquet file footer.
+    """
+    if rhs_config.columns:
+        return ", " + ", ".join(f's."{c}"' for c in rhs_config.columns)
+    # rhs_df.schema is a PySedonaSchema (not iterable like PyArrow) so read
+    # column names directly from the parquet file footer instead.
+    # Result is cached per path — only one I/O hit per process.
+    return ", " + ", ".join(
+        f's."{c}"' for c in _read_auto_cols(str(rhs_config.parquet_path))
+    )
+
+
+def _bbox_nearest_filters(bbox: BBox | None, distance_m: float) -> str:
+    """Return a combined WHERE clause that prunes both sides of a nearest join.
+
+    USRNs (``u``) are filtered to the exact bbox (same as the intersect join).
+    Points (``s``) are filtered to the bbox expanded by ``distance_m`` so that
+    stops just outside the boundary can still match a USRN inside it.
+
+    Sedona pushes each predicate to its respective parquet scan, pruning row
+    groups on both files.
+
+    Returns an empty string when ``bbox`` is ``None``.
+    """
+    if bbox is None:
+        return ""
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    xmin, ymin, xmax, ymax = bbox
+
+    def _pred(alias: str, x0: float, y0: float, x1: float, y1: float) -> str:
+        wkt: str = f"POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))"
+        return f"ST_Intersects({alias}.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
+
+    usrn_pred: str = _pred("u", xmin, ymin, xmax, ymax)
+    point_pred: str = _pred(
+        "s",
+        xmin - distance_m,
+        ymin - distance_m,
+        xmax + distance_m,
+        ymax + distance_m,
+    )
+    return f"WHERE {usrn_pred} AND {point_pred}"

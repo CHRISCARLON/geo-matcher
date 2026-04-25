@@ -7,37 +7,37 @@ import pyarrow.parquet as pq
 import pytest
 
 from usrn_matcher.config import DatasetConfig
-from usrn_matcher.join import _bbox_filter, _bbox_wkt, _col_fragment
+from usrn_matcher.join import _bbox_clipper, _bbox_pruner, _col_fragment
 
 pytestmark = pytest.mark.unit
 
 # ---------------------------------------------------------------------------
-# _bbox_filter
+# _bbox_pruner
 # ---------------------------------------------------------------------------
 
 
-def test_bbox_filter_none_returns_empty():
-    assert _bbox_filter(None) == ""
+def test_bbox_pruner_none_returns_empty():
+    assert _bbox_pruner(None) == ""
 
 
-def test_bbox_filter_produces_where_clause():
-    clause = _bbox_filter([100.0, 200.0, 300.0, 400.0])
+def test_bbox_pruner_produces_where_clause():
+    clause = _bbox_pruner([100.0, 200.0, 300.0, 400.0])
     assert clause.startswith("WHERE ST_Intersects")
     assert "100.0" in clause
     assert "400.0" in clause
 
 
 # ---------------------------------------------------------------------------
-# _bbox_wkt
+# _bbox_clipper
 # ---------------------------------------------------------------------------
 
 
-def test_bbox_wkt_none_returns_none():
-    assert _bbox_wkt(None) is None
+def test_bbox_clipper_none_returns_none():
+    assert _bbox_clipper(None) is None
 
 
-def test_bbox_wkt_produces_polygon():
-    wkt: str | None = _bbox_wkt([100.0, 200.0, 300.0, 400.0])
+def test_bbox_clipper_produces_polygon():
+    wkt: str | None = _bbox_clipper([100.0, 200.0, 300.0, 400.0])
     assert wkt is not None
     assert "POLYGON" in wkt
     assert "ST_SetSRID" in wkt

@@ -1,5 +1,9 @@
 import pathlib
 import re
+from collections.abc import Sequence
+from typing import TypeAlias
+
+BBox: TypeAlias = Sequence[float]
 
 DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
 DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")

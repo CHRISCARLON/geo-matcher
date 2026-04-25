@@ -78,6 +78,8 @@ from .prepare import _BNG_BOX, _patch_covering_metadata
 
 log: logging.Logger = get_logger()
 
+# TODO: Switch this over to Type 70 records and call dtf-export not just export
+
 
 @dataclass
 class DTFConfig:
