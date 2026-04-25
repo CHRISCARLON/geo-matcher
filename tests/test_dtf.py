@@ -20,9 +20,8 @@ from usrn_matcher.dtf import (
     _enc_text,
     _geom_type_code,
     _type_10,
-    _type_63a,
-    _type_67a,
     _type_69,
+    _type_70,
     _type_99,
     to_dtf_csv,
     to_dtf_flat_csv,
@@ -188,74 +187,65 @@ class TestType69:
         assert '"British National Grid"' in line
 
 
-class TestType63a:
-    def test_starts_with_63a(self, cfg):
-        line = _type_63a(
+class TestType70:
+    def test_starts_with_70(self, cfg):
+        line = _type_70(
             pro_order=1,
             usrn=12345678,
             seq_num=1,
             geom_type_code="P",
-            coord_count=5,
             rhs_attr_fields=['"SANDY"', "42"],
+            geometry_wkt="POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
             config=cfg,
             today=date(2026, 4, 13),
         )
-        assert line.startswith('"63a",')
+        assert line.startswith('"70",')
 
-    def test_point_no_inline_xy(self, cfg):
-        """Point geometry coordinates are in type 67a, not inline in type 63a."""
-        line = _type_63a(
+    def test_geometry_wkt_is_last_field(self, cfg):
+        wkt = "POINT (412000 426000)"
+        line = _type_70(
             pro_order=1,
             usrn=12345678,
             seq_num=1,
             geom_type_code="PT",
-            coord_count=1,
             rhs_attr_fields=[],
+            geometry_wkt=wkt,
             config=cfg,
             today=date(2026, 4, 13),
         )
-        # Coordinate values must NOT appear in the 63a line
-        assert "412000" not in line
-        assert "426000" not in line
+        # WKT is the last field — ends with the quoted WKT
+        assert line.endswith(f'"{wkt}"')
 
-    def test_asd_coordinate_always_1(self, cfg):
-        """ASD_COORDINATE is always 1 — geometry always in type 67a."""
-        line = _type_63a(
+    def test_rhs_attrs_before_geometry(self, cfg):
+        line = _type_70(
             pro_order=1,
             usrn=12345678,
             seq_num=1,
-            geom_type_code="P",
-            coord_count=5,
+            geom_type_code="L",
+            rhs_attr_fields=['"CLAY"'],
+            geometry_wkt="LINESTRING (0 0, 1 1)",
+            config=cfg,
+            today=date(2026, 4, 13),
+        )
+        clay_pos = line.index('"CLAY"')
+        wkt_pos = line.index("LINESTRING")
+        assert clay_pos < wkt_pos
+
+    def test_seq_num_field(self, cfg):
+        line = _type_70(
+            pro_order=3,
+            usrn=12345678,
+            seq_num=2,
+            geom_type_code="PT",
             rhs_attr_fields=[],
+            geometry_wkt="POINT (0 0)",
             config=cfg,
             today=date(2026, 4, 13),
         )
         fields = line.split(",")
-        # fields[9] = ASD_COORDINATE, fields[10] = ASD_COORDINATE_COUNT
-        assert fields[9] == "1"
-        assert fields[10] == "5"
-
-
-class TestType67a:
-    def test_starts_with_67a(self):
-        line = _type_67a(2, 12345678, 1, "L", "LINESTRING (0 0, 1 1)")
-        assert line.startswith('"67a",')
-
-    def test_wkt_embedded(self):
-        line = _type_67a(
-            2, 12345678, 1, "L", "LINESTRING (412000 426000, 413000 427000)"
-        )
-        assert "LINESTRING" in line
-        assert "412000" in line
-
-    def test_asd_record_identifier_63(self):
-        line = _type_67a(2, 12345678, 1, "P", "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))")
-        assert ",63," in line
-
-    def test_point_type_code(self):
-        line = _type_67a(1, 12345678, 1, "PT", "POINT (412000 426000)")
-        assert '"PT"' in line
-        assert "POINT" in line
+        # fields[2] = PRO_ORDER, fields[4] = ATTRIBUTION_SEQ_NUM
+        assert fields[2] == "3"
+        assert fields[4] == "2"
 
 
 class TestType99:
@@ -297,10 +287,10 @@ class TestToDtfCsv:
         lines = out.read_text(encoding="utf-8").strip().splitlines()
         assert lines[0].startswith("10,")
         assert lines[1].startswith("69,")
-        assert lines[2].startswith('"63a",')
+        assert lines[2].startswith('"70",')
         assert lines[-1].startswith("99,")
-        # Points now emit a type 67a record (not inline in 63a)
-        assert any(line.startswith('"67a",') for line in lines)
+        # No separate type 67a records — geometry is inline in type 70
+        assert not any(line.startswith('"67a",') for line in lines)
 
     def test_file_structure_polygon(self, cfg, tmp_path):
         poly_wkb = shapely.wkb.dumps(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
@@ -309,13 +299,9 @@ class TestToDtfCsv:
         to_dtf_csv(table, cfg, out)
 
         lines = out.read_text(encoding="utf-8").strip().splitlines()
-        assert lines[0].startswith("10,")
-        assert lines[1].startswith("69,")
-        assert lines[2].startswith('"63a",')
-        # One type 67a record per feature carrying the full WKT
-        type_67a_lines = [line for line in lines if line.startswith('"67a",')]
-        assert len(type_67a_lines) == 1
-        assert "POLYGON" in type_67a_lines[0]
+        type_70_lines = [line for line in lines if line.startswith('"70",')]
+        assert len(type_70_lines) == 1
+        assert "POLYGON" in type_70_lines[0]
         assert lines[-1].startswith("99,")
 
     def test_trailer_record_count(self, cfg, tmp_path):
@@ -325,10 +311,9 @@ class TestToDtfCsv:
         to_dtf_csv(table, cfg, out)
 
         lines = out.read_text(encoding="utf-8").strip().splitlines()
-        # Record count = type 69 (1) + type 63a (1) + type 67a (1) = 3
-        trailer = lines[-1]
-        count = int(trailer.split(",")[1])
-        assert count == 3
+        # Record count = type 69 (1) + type 70 (1) = 2
+        count = int(lines[-1].split(",")[1])
+        assert count == 2
 
     def test_rhs_attributes_written(self, cfg, tmp_path):
         point_wkb = shapely.wkb.dumps(Point(412000.0, 426000.0))
@@ -368,10 +353,10 @@ class TestToDtfCsv:
         to_dtf_csv(table, cfg, out)
 
         lines = out.read_text(encoding="utf-8").strip().splitlines()
-        type_63a = [line for line in lines if line.startswith('"63a",')]
-        assert len(type_63a) == 2
+        type_70 = [line for line in lines if line.startswith('"70",')]
+        assert len(type_70) == 2
         # ATTRIBUTION_SEQ_NUM is field index 4 (0-based after split)
-        seq_nums = [int(line.split(",")[4]) for line in type_63a]
+        seq_nums = [int(line.split(",")[4]) for line in type_70]
         assert seq_nums == [1, 2]
 
 
@@ -495,10 +480,17 @@ class TestToDtfGeoparquet:
     def test_rhs_cols_not_in_skip_set_are_preserved(
         self, cfg, multi_row_table, tmp_path
     ):
-        """RHS attribute columns (here: 'name') survive into the GeoParquet."""
         out = tmp_path / "out.parquet"
         to_dtf_geoparquet(multi_row_table, cfg, out)
         assert "name" in pq.read_schema(str(out)).names
+
+    def test_no_asd_coordinate_columns(self, cfg, multi_row_table, tmp_path):
+        """Type 70 drops ASD_COORDINATE and ASD_COORDINATE_COUNT."""
+        out = tmp_path / "out.parquet"
+        to_dtf_geoparquet(multi_row_table, cfg, out)
+        names = pq.read_schema(str(out)).names
+        assert "ASD_COORDINATE" not in names
+        assert "ASD_COORDINATE_COUNT" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +509,6 @@ class TestToDtfFlatCsv:
         out = tmp_path / "out_flat.csv"
         to_dtf_flat_csv(multi_row_table, cfg, out)
         lines = out.read_text(encoding="utf-8").strip().splitlines()
-        # One header + one row per input row
         assert len(lines) == len(multi_row_table) + 1
 
     def test_dtf_columns_in_header(self, cfg, multi_row_table, tmp_path):
@@ -533,7 +524,6 @@ class TestToDtfFlatCsv:
         to_dtf_flat_csv(multi_row_table, cfg, out)
         with open(out, newline="", encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
-        # Each geometry cell should be a WKT string, not raw bytes
         for row in rows:
             wkt = row["geometry"]
             assert any(
@@ -578,6 +568,5 @@ class TestToDtfGpkg:
     def test_custom_layer_name(self, cfg, multi_row_table, tmp_path):
         out = tmp_path / "out.gpkg"
         to_dtf_gpkg(multi_row_table, cfg, out, layer="my_layer")
-        # gpd.list_layers returns a DataFrame with a 'name' column (geopandas ≥ 0.14 / pyogrio)
         layer_names = gpd.list_layers(str(out))["name"].tolist()
         assert "my_layer" in layer_names

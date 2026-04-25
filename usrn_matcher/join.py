@@ -72,7 +72,9 @@ def execute_join(
         for start in range(0, n_row_groups, rgs_per_batch)
     ]
     n_batches: int = len(usrn_slices)
-    log.info("Batching USRN parquet: %d row groups → %d batches", n_row_groups, n_batches)
+    log.info(
+        "Batching USRN parquet: %d row groups → %d batches", n_row_groups, n_batches
+    )
 
     # Discover bbox leaf column indices from parquet schema once.
     first_rg = usrn_pf.metadata.row_group(0)
@@ -89,10 +91,18 @@ def execute_join(
 
         # Derive batch envelope from row-group statistics — no extra data scan.
         slice_rg_metas = [usrn_pf.metadata.row_group(rg) for rg in usrn_slice]
-        xmin: float = min(rg.column(bbox_col_idx["xmin"]).statistics.min for rg in slice_rg_metas)
-        ymin: float = min(rg.column(bbox_col_idx["ymin"]).statistics.min for rg in slice_rg_metas)
-        xmax: float = max(rg.column(bbox_col_idx["xmax"]).statistics.max for rg in slice_rg_metas)
-        ymax: float = max(rg.column(bbox_col_idx["ymax"]).statistics.max for rg in slice_rg_metas)
+        xmin: float = min(
+            rg.column(bbox_col_idx["xmin"]).statistics.min for rg in slice_rg_metas
+        )
+        ymin: float = min(
+            rg.column(bbox_col_idx["ymin"]).statistics.min for rg in slice_rg_metas
+        )
+        xmax: float = max(
+            rg.column(bbox_col_idx["xmax"]).statistics.max for rg in slice_rg_metas
+        )
+        ymax: float = max(
+            rg.column(bbox_col_idx["ymax"]).statistics.max for rg in slice_rg_metas
+        )
         bbox_wkt = f"POLYGON(({xmin} {ymin},{xmax} {ymin},{xmax} {ymax},{xmin} {ymax},{xmin} {ymin}))"
         batch_filter = f"WHERE ST_Intersects(s.geometry, ST_SetSRID(ST_GeomFromWKT('{bbox_wkt}'), 27700))"
         batch_query = query.format(batch_filter=batch_filter)
@@ -245,7 +255,7 @@ def run_nearest_join(
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
     *,
-    distance_m: float = 50.0,
+    distance_m: float = 10.0,
     bbox: BBox | None = None,
     explain: bool = False,
     include_rhs_geometry: bool = False,
@@ -269,7 +279,7 @@ def run_nearest_join(
         empty means auto-discover from the parquet schema.
     distance_m:
         Search radius in metres (EPSG:27700). Only USRNs within this distance
-        are considered candidates. Default is 50 m.
+        are considered candidates. Default is 10 m.
     bbox:
         Optional ``[xmin, ymin, xmax, ymax]`` in EPSG:27700 to restrict which
         points are matched. When ``None`` all points are matched.

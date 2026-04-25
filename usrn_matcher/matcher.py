@@ -20,7 +20,7 @@ from .config import (
 )
 from .dtf import (
     DTFConfig,
-    _build_dtf_gdf,
+    _build_dtf_table,
     to_dtf_csv,
     to_dtf_flat_csv,
     to_dtf_geoparquet,
@@ -94,7 +94,7 @@ class UsrnMatcher:
         explain: bool = False,
         include_rhs_geometry: bool = False,
         usrn_batches: int = 1,
-        distance_m: float = 50.0,
+        distance_m: float = 10.0,
         geometry: GeometryMode = "none",
     ) -> pa.Table:
         """Dispatch to the registered JoinFn for the given mode."""
@@ -140,7 +140,7 @@ class UsrnMatcher:
 
     def match_nearest(
         self,
-        distance_m: float = 50.0,
+        distance_m: float = 10.0,
         bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
@@ -463,9 +463,9 @@ class UsrnMatcher:
         p_match.add_argument(
             "--distance",
             type=float,
-            default=50.0,
+            default=10.0,
             metavar="METRES",
-            help="Search radius in metres for --mode nearest (default: 50).",
+            help="Search radius in metres for --mode nearest (default: 10).",
         )
         p_match.add_argument(
             "--geometry",
@@ -512,7 +512,7 @@ class UsrnMatcher:
         # export                                                               #
         # ------------------------------------------------------------------ #
         p_export = sub.add_parser(
-            "export",
+            "dtf-export",
             help="Export join results as a DTF8.1-inspired CSV + GeoParquet.",
         )
         p_export.add_argument(
@@ -553,9 +553,9 @@ class UsrnMatcher:
         p_export.add_argument(
             "--distance",
             type=float,
-            default=50.0,
+            default=10.0,
             metavar="METRES",
-            help="Search radius in metres for --mode nearest (default: 50).",
+            help="Search radius in metres for --mode nearest (default: 10).",
         )
         p_export.add_argument(
             "--dtf-org-name",
@@ -581,18 +581,6 @@ class UsrnMatcher:
             default=DEFAULT_MATCHED_DIR,
             metavar="DIR",
             help=f"Directory for output files (default: {DEFAULT_MATCHED_DIR}).",
-        )
-        p_export.add_argument(
-            "--geometry",
-            choices=["none", "usrn", "clip", "rhs"],
-            default="none",
-            help=(
-                "Geometry column in the output (default: none). "
-                "'none' — attribute-only, fastest; "
-                "'usrn' — full USRN line; "
-                "'clip' — USRN clipped to matched polygon (intersect only, slower); "
-                "'rhs' — matched RHS feature geometry."
-            ),
         )
         p_export.add_argument(
             "--explain",
@@ -701,7 +689,7 @@ class UsrnMatcher:
                 sample=args.sample_rows,
             )
 
-        elif args.command == "export":
+        elif args.command == "dtf-export":
             cache_dir = pathlib.Path(args.cache_dir)
             rhs_config = DatasetConfig(
                 name=args.rhs_name,
@@ -726,7 +714,6 @@ class UsrnMatcher:
                 include_rhs_geometry=True,
                 usrn_batches=args.batches,
                 distance_m=args.distance,
-                geometry=args.geometry,
             )
 
             dtf_config = DTFConfig(
@@ -738,15 +725,17 @@ class UsrnMatcher:
             stem = f"matched_{args.rhs_name}_ad"
             # Build the sorted GDF once — shared by the three geometry-bearing writers
             # so the Hilbert sort only runs once instead of once per output format.
-            gdf = _build_dtf_gdf(table, dtf_config)
+            dtf_tbl = _build_dtf_table(table, dtf_config)
             to_dtf_csv(table, dtf_config, matched_dir / f"{stem}.csv")
             to_dtf_geoparquet(
-                table, dtf_config, matched_dir / f"{stem}.parquet", _gdf=gdf
+                table, dtf_config, matched_dir / f"{stem}.parquet", _dtf_table=dtf_tbl
             )
             to_dtf_flat_csv(
-                table, dtf_config, matched_dir / f"{stem}_flat.csv", _gdf=gdf
+                table, dtf_config, matched_dir / f"{stem}_flat.csv", _dtf_table=dtf_tbl
             )
-            to_dtf_gpkg(table, dtf_config, matched_dir / f"{stem}.gpkg", _gdf=gdf)
+            to_dtf_gpkg(
+                table, dtf_config, matched_dir / f"{stem}.gpkg", _dtf_table=dtf_tbl
+            )
 
 
 def _validate_input_file(path: pathlib.Path) -> None:

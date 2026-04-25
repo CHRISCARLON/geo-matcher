@@ -9,7 +9,7 @@ STOPS_CSV = input_data/Stops.csv
 	prepare-soil prepare-stops prepare-counts prepare-all \
 	match-soil-national match-soil-national-explain \
 	match-stops-national match-counts-national match-all-national \
-	export-soil-national export-stops-national export-counts-national export-all-national \
+	dtf-export-soil-national dtf-export-stops-national dtf-export-counts-national dtf-export-all-national \
 	clean-output clean-matched
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -78,26 +78,24 @@ match-soil-national-explain:
 
 match-all-national: match-soil-national match-stops-national match-counts-national
 
-# ── Export — DTF format, national ────────────────────────────────────────────
+# ── DTF Export — national ─────────────────────────────────────────────────────
 
-export-soil-national:
-	usrn-matcher export \
+dtf-export-soil-national:
+	usrn-matcher dtf-export \
 		--rhs-name soil \
 		--mode     intersect
 
-export-stops-national:
-	usrn-matcher export \
+dtf-export-stops-national:
+	usrn-matcher dtf-export \
 		--rhs-name stops \
-		--mode     nearest \
-		--distance 10
+		--mode     nearest
 
-export-counts-national:
-	usrn-matcher export \
+dtf-export-counts-national:
+	usrn-matcher dtf-export \
 		--rhs-name count_points \
-		--mode     nearest \
-		--distance 10
+		--mode     nearest
 
-export-all-national: export-soil-national export-stops-national export-counts-national
+dtf-export-all-national: dtf-export-soil-national dtf-export-stops-national dtf-export-counts-national
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

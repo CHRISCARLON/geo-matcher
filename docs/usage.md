@@ -4,7 +4,7 @@ There are two ways to use usrn-matcher: the **CLI** and the **Python API**.
 Both follow the same three-phase pipeline:
 
 ```
-prepare  →  match  →  export
+prepare  →  match  →  dtf-export (optional)
 ```
 
 The prepare step is slow and only needs to run once — it converts source files into
@@ -94,10 +94,11 @@ Key options:
 |---|---|---|
 | `--rhs-name` | _(required)_ | Must match the name used in prepare |
 | `--mode` | `intersect` | `intersect` or `nearest` |
-| `--distance` | `50` | Search radius in metres (nearest only) |
+| `--distance` | `10` | Search radius in metres (nearest only) |
 | `--bbox` | none | `XMIN YMIN XMAX YMAX` in EPSG:27700 |
 | `--city` | none | Named bbox shortcut (see `bboxes.py`) |
 | `--rhs-columns` | all | Columns to select from RHS dataset |
+| `--geometry` | `none` | `none`, `usrn`, `clip`, or `rhs` |
 | `--output` | `csv` | `csv`, `parquet`, or `sample` |
 | `--cache-dir` | `output_data` | Where to find prepared GeoParquet |
 | `--matched-dir` | `matched_data` | Where to write output |
@@ -107,12 +108,13 @@ Omit `--bbox` / `--city` for a full national join (slow).
 
 ---
 
-### 4. Export (DTF8.1)
+### 4. DTF Export (optional)
 
-Runs the match and writes all four DTF output formats in one step.
+Runs the match and writes all four DTF output formats in one step. This is separate from `match`
+because it always requires RHS geometry and is slower to produce.
 
 ```bash
-usrn-matcher export \
+usrn-matcher dtf-export \
   --rhs-name     stops \
   --city         LEEDS \
   --mode         nearest \
@@ -122,9 +124,9 @@ usrn-matcher export \
 ```
 
 Writes to `matched_data/`:
-- `usrn_stops_attribution.csv` — DTF8.1a CSV (type 10/69/63a/67a/99 records)
+- `usrn_stops_attribution.csv` — DTF8.1a CSV (type 10/69/70/99 records)
 - `usrn_stops_attribution.parquet` — GeoParquet 1.1
-- `usrn_stops_attribution_flat.csv` — flat CSV
+- `usrn_stops_attribution_flat.csv` — flat CSV with WKT geometry column
 - `usrn_stops_attribution.gpkg` — GeoPackage
 
 Key options (in addition to match options):
@@ -206,10 +208,9 @@ table = matcher.match_intersect(bbox=LEEDS)
 table = matcher.match_nearest(bbox=LEEDS, distance_m=25)
 ```
 
-Both methods return a `pyarrow.Table` with columns: `usrn`, `street_type`, `geometry`,
-plus all selected RHS columns.
-
-Pass `include_rhs_geometry=True` if you intend to export to DTF format.
+Both methods return a `pyarrow.Table` with columns: `usrn`, `street_type`,
+plus all selected RHS columns. Pass `geometry="rhs"` to include the RHS geometry column
+(required for DTF export).
 
 ---
 
@@ -236,8 +237,8 @@ dtf_cfg = DTFConfig(
 
 out = pathlib.Path("matched_data")
 
-# match must have been run with include_rhs_geometry=True
-table = matcher.match_nearest(bbox=LEEDS, distance_m=25, include_rhs_geometry=True)
+# geometry="rhs" is required for DTF export — includes the matched RHS geometry column
+table = matcher.match_nearest(bbox=LEEDS, distance_m=25, geometry="rhs")
 
 to_dtf_csv(table, dtf_cfg, out / "stops.csv")
 to_dtf_geoparquet(table, dtf_cfg, out / "stops.parquet")
