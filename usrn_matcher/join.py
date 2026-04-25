@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 from sedonadb.context import SedonaContext
 
 from .config import BBox, DatasetConfig
+from .explain import log_plan
 from .logger import get_logger
 
 log: logging.Logger = get_logger()
@@ -60,8 +61,7 @@ def execute_join(
         sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
         filled: str = query.format(batch_filter="")
         if explain:
-            log.info("Query plan (with execution metrics):")
-            sd.sql(f"EXPLAIN ANALYZE {filled}").show(width=400)
+            log_plan(sd,filled)
         return sd.sql(filled).to_arrow_table()
 
     usrn_pf: pq.ParquetFile = pq.ParquetFile(str(usrn_parquet))
@@ -125,8 +125,7 @@ def execute_join(
             ymax,
         )
         if explain and i == 0:
-            log.info("Query plan (batch 1 of %d):", n_batches)
-            sd.sql(f"EXPLAIN ANALYZE {batch_query}").show(width=400)
+            log_plan(sd,batch_query)
         batch_results.append(sd.sql(batch_query).to_arrow_table())
 
     return pa.concat_tables(batch_results)
