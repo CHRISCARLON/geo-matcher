@@ -22,7 +22,7 @@ def test_bbox_pruner_none_returns_empty():
 
 def test_bbox_pruner_produces_where_clause():
     clause = _bbox_pruner([100.0, 200.0, 300.0, 400.0])
-    assert clause.startswith("WHERE ST_Intersects")
+    assert clause.startswith("AND ST_Intersects")
     assert "100.0" in clause
     assert "400.0" in clause
 

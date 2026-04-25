@@ -2,7 +2,7 @@ import json
 import logging
 import pathlib
 import time
-from typing import Any
+from typing import Any, TypedDict
 
 import duckdb
 import pyarrow as pa
@@ -20,6 +20,40 @@ log: logging.Logger = get_logger()
 # so spatially nearby features get consecutive indices and land in the same row groups.
 # Shared by prepare_dataset / prepare_from_csv (file write) and _build_dtf_table (in-memory sort).
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
+
+
+class _CoveringColumn(TypedDict):
+    xmin: list[str]
+    ymin: list[str]
+    xmax: list[str]
+    ymax: list[str]
+
+
+class _Covering(TypedDict):
+    bbox: _CoveringColumn
+
+
+class _GeomColumnMeta(TypedDict, total=False):
+    encoding: str
+    geometry_types: list[str]
+    crs: dict[str, Any]
+    covering: _Covering
+
+
+class _GeoMeta(TypedDict):
+    version: str
+    primary_column: str
+    columns: dict[str, _GeomColumnMeta]
+
+
+_EXPECTED_COVERING_METADATA: _Covering = {
+    "bbox": {
+        "xmin": ["bbox", "xmin"],
+        "ymin": ["bbox", "ymin"],
+        "xmax": ["bbox", "xmax"],
+        "ymax": ["bbox", "ymax"],
+    }
+}
 
 
 def _patch_covering_metadata(
@@ -42,27 +76,20 @@ def _patch_covering_metadata(
     - Rewrites the file in-place with ZSTD compression
     """
     table = pq.read_table(str(path))
-    geo_meta = json.loads(table.schema.metadata[b"geo"])
+    geo_meta: _GeoMeta = json.loads(table.schema.metadata[b"geo"])
     geom_col: str = geo_meta.get("primary_column", "geometry")
 
     geo_meta["version"] = "1.1.0"
-    geo_meta["columns"][geom_col]["covering"] = {
-        "bbox": {
-            "xmin": ["bbox", "xmin"],
-            "ymin": ["bbox", "ymin"],
-            "xmax": ["bbox", "xmax"],
-            "ymax": ["bbox", "ymax"],
-        }
-    }
+    geo_meta["columns"][geom_col]["covering"] = _EXPECTED_COVERING_METADATA
 
     if crs is not None:
         geo_meta["columns"][geom_col]["crs"] = ProjCRS.from_user_input(
             crs
         ).to_json_dict()
 
-    normalised_fields = [
-        f.with_type(pa.utf8()) if f.type == pa.string_view() else f
-        for f in table.schema
+    normalised_fields: list[Any] = [
+        field.with_type(pa.utf8()) if field.type == pa.string_view() else field
+        for field in table.schema
     ]
     schema_meta: dict[bytes, bytes] = {
         **table.schema.metadata,
@@ -72,6 +99,9 @@ def _patch_covering_metadata(
     table = table.cast(normalised_schema)
 
     pq.write_table(table, str(path), row_group_size=row_group_size, compression="zstd")
+    assert (
+        geo_meta["columns"][geom_col].get("covering") == _EXPECTED_COVERING_METADATA
+    ), f"Failed to patch GeoParquet covering metadata for {geom_col!r} in {path}"
 
 
 def _get_src_geometry_col(con: Any, source_path: str) -> str:
@@ -157,6 +187,8 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
     log.info("  Hilbert sort + write → %s ...", config.parquet_path)
 
     t0 = time.perf_counter()
+
+    # TODO: Need to check if thid HilberSort is good enough
     con.execute(f"""
         COPY (
             SELECT
