@@ -8,7 +8,7 @@ Usage::
     from usrn_matcher.bboxes import LEEDS, LONDON
 
     matcher = UsrnMatcher(...)
-    table = matcher.match_intersect(bbox=LEEDS)
+    table = matcher.match_dispatch("intersect", bbox=LEEDS)
 """
 
 # Approximate administrative boundaries in EPSG:27700.

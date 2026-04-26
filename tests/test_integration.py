@@ -165,14 +165,14 @@ def test_prepare_geoparquet_has_covering_metadata(usrn_parquet):
 
 @pytest.mark.integration
 def test_intersect_join_returns_rows(soil_matcher):
-    table = soil_matcher.match_intersect(bbox=LEEDS)
+    table = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
     assert isinstance(table, pa.Table)
     assert len(table) > 0
 
 
 @pytest.mark.integration
 def test_intersect_join_schema(soil_matcher):
-    table = soil_matcher.match_intersect(bbox=LEEDS)
+    table = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
     assert "usrn" in table.schema.names
     assert "street_type" in table.schema.names
     assert "geometry" not in table.schema.names  # default geometry="none"
@@ -180,13 +180,15 @@ def test_intersect_join_schema(soil_matcher):
 
 @pytest.mark.integration
 def test_intersect_join_usrn_column_is_integer(soil_matcher):
-    table = soil_matcher.match_intersect(bbox=LEEDS)
+    table = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
     assert pa.types.is_integer(table.schema.field("usrn").type)
 
 
 @pytest.mark.integration
 def test_intersect_join_include_rhs_geometry(soil_matcher):
-    table = soil_matcher.match_intersect(bbox=LEEDS, include_rhs_geometry=True)
+    table = soil_matcher.match_dispatch(
+        "intersect", bbox=LEEDS, include_rhs_geometry=True
+    )
     assert "rhs_geometry" in table.schema.names
     # rhs_geometry should be non-null for at least some rows
     rhs_col = table.column("rhs_geometry")
@@ -200,14 +202,14 @@ def test_intersect_join_include_rhs_geometry(soil_matcher):
 
 @pytest.mark.integration
 def test_nearest_join_returns_rows(stops_matcher):
-    table = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50)
+    table = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
     assert isinstance(table, pa.Table)
     assert len(table) > 0
 
 
 @pytest.mark.integration
 def test_nearest_join_schema(stops_matcher):
-    table = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50)
+    table = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
     assert "usrn" in table.schema.names
     assert "distance_m" in table.schema.names
     assert "ATCOCode" in table.schema.names
@@ -216,7 +218,7 @@ def test_nearest_join_schema(stops_matcher):
 
 @pytest.mark.integration
 def test_nearest_join_distances_are_positive(stops_matcher):
-    table = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50)
+    table = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
     distances = table.column("distance_m").to_pylist()
     assert all(d >= 0 for d in distances)
 
@@ -224,15 +226,15 @@ def test_nearest_join_distances_are_positive(stops_matcher):
 @pytest.mark.integration
 def test_nearest_join_distances_within_radius(stops_matcher):
     radius = 25.0
-    table = stops_matcher.match_nearest(bbox=LEEDS, distance_m=radius)
+    table = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=radius)
     distances = table.column("distance_m").to_pylist()
     assert all(d <= radius for d in distances), "Results outside search radius"
 
 
 @pytest.mark.integration
 def test_nearest_join_include_rhs_geometry(stops_matcher):
-    table = stops_matcher.match_nearest(
-        bbox=LEEDS, distance_m=50, include_rhs_geometry=True
+    table = stops_matcher.match_dispatch(
+        "nearest", bbox=LEEDS, distance_m=50, include_rhs_geometry=True
     )
     assert "rhs_geometry" in table.schema.names
 
@@ -244,8 +246,8 @@ def test_nearest_join_include_rhs_geometry(stops_matcher):
 
 @pytest.mark.integration
 def test_intersect_batched_matches_unbatched(soil_matcher):
-    single = soil_matcher.match_intersect(bbox=LEEDS)
-    batched = soil_matcher.match_intersect(bbox=LEEDS, usrn_batches=4)
+    single = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
+    batched = soil_matcher.match_dispatch("intersect", bbox=LEEDS, usrn_batches=4)
     assert len(batched) == len(single)
     assert sorted(batched.column("usrn").to_pylist()) == sorted(
         single.column("usrn").to_pylist()
@@ -254,8 +256,10 @@ def test_intersect_batched_matches_unbatched(soil_matcher):
 
 @pytest.mark.integration
 def test_nearest_batched_matches_unbatched(stops_matcher):
-    single = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50)
-    batched = stops_matcher.match_nearest(bbox=LEEDS, distance_m=50, usrn_batches=4)
+    single = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
+    batched = stops_matcher.match_dispatch(
+        "nearest", bbox=LEEDS, distance_m=50, usrn_batches=4
+    )
     assert len(batched) == len(single)
     assert sorted(batched.column("usrn").to_pylist()) == sorted(
         single.column("usrn").to_pylist()
@@ -270,8 +274,8 @@ def test_nearest_batched_matches_unbatched(stops_matcher):
 @pytest.fixture(scope="session")
 def dtf_table(stops_matcher) -> pa.Table:
     """Nearest join result with rhs_geometry — used for all DTF export tests."""
-    return stops_matcher.match_nearest(
-        bbox=LEEDS, distance_m=50, include_rhs_geometry=True
+    return stops_matcher.match_dispatch(
+        "nearest", bbox=LEEDS, distance_m=50, include_rhs_geometry=True
     )
 
 
@@ -351,7 +355,7 @@ def test_dtf_gpkg_written(dtf_table, dtf_cfg, tmp_path):
 
 @pytest.mark.integration
 def test_to_csv_writes_file(soil_matcher, tmp_path):
-    table = soil_matcher.match_intersect(bbox=LEEDS)
+    table = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
     out = tmp_path / "result.csv"
     soil_matcher.to_csv(table, out)
     assert out.exists()
@@ -362,7 +366,7 @@ def test_to_csv_writes_file(soil_matcher, tmp_path):
 
 @pytest.mark.integration
 def test_to_parquet_writes_file(soil_matcher, tmp_path):
-    table = soil_matcher.match_intersect(bbox=LEEDS)
+    table = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
     out = tmp_path / "result.parquet"
     soil_matcher.to_parquet(table, out)
     assert out.exists()

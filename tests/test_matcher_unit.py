@@ -4,7 +4,7 @@ import pyarrow as pa
 import pytest
 
 from usrn_matcher import DatasetConfig, UsrnMatcher
-from usrn_matcher.join import JoinFn, run_intersect_join, run_nearest_join
+from usrn_matcher.join import JoinFn, _registry, get_join
 
 
 @pytest.fixture()
@@ -31,12 +31,12 @@ def test_file_dispatch_unknown_format_raises(matcher, tmp_path):
 
 
 def test_join_fns_registry_keys():
-    assert "intersect" in UsrnMatcher._JOIN_FNS
-    assert "nearest" in UsrnMatcher._JOIN_FNS
+    assert "intersect" in _registry
+    assert "nearest" in _registry
 
 
 def test_join_fns_values_are_callable():
-    for fn in UsrnMatcher._JOIN_FNS.values():
+    for fn in _registry.values():
         assert callable(fn)
 
 
@@ -52,8 +52,8 @@ def test_output_formats_registry_keys():
 
 
 def test_builtin_fns_are_joinfn_instances():
-    assert isinstance(run_intersect_join, JoinFn)
-    assert isinstance(run_nearest_join, JoinFn)
+    assert isinstance(get_join("intersect"), JoinFn)
+    assert isinstance(get_join("nearest"), JoinFn)
 
 
 def test_non_callable_is_not_joinfn():

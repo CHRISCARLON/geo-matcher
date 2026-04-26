@@ -26,7 +26,7 @@ from .dtf import (
     to_dtf_geoparquet,
     to_dtf_gpkg,
 )
-from .join import GeometryMode, JoinFn, run_intersect_join, run_nearest_join
+from .join import GeometryMode, JoinFn, _registry, get_join
 from .logger import get_logger
 from .prepare import prepare_dataset, prepare_from_csv, prepare_usrns
 
@@ -53,15 +53,11 @@ class UsrnMatcher:
             usrn_parquet="output_data/usrns_27700.parquet",
             rhs_config=cfg,
         )
-        table = matcher.match_intersect()
-        table = matcher.match_intersect(bbox=[412000, 426000, 444000, 445000])
+        table = matcher.match_dispatch("intersect")
+        table = matcher.match_dispatch("intersect", bbox=[412000, 426000, 444000, 445000])
         matcher.to_csv(table, "matched_data/usrn_highways_attribution.csv")
     """
 
-    _JOIN_FNS: ClassVar[dict[str, JoinFn]] = {
-        "intersect": run_intersect_join,
-        "nearest": run_nearest_join,
-    }
     _OUTPUT_FORMATS: ClassVar[dict[str, str]] = {
         "parquet": "to_parquet",
         "csv": "to_csv",
@@ -97,16 +93,17 @@ class UsrnMatcher:
         distance_m: float = 10.0,
         geometry: GeometryMode = "none",
     ) -> pa.Table:
-        """Dispatch to the registered JoinFn for the given mode."""
-        if mode not in self._JOIN_FNS:
+        """Dispatch to the registered JoinFn"""
+        try:
+            fn: JoinFn = get_join(mode)
+        except KeyError:
             raise ValueError(
-                f"Unknown join mode {mode!r}. Available: {sorted(self._JOIN_FNS)}"
-            )
+                f"Unknown join mode {mode!r}. Available: {sorted(_registry)}"
+            ) from None
         if bbox is None and usrn_batches == 1:
             usrn_batches = 10
         sd = self._connect()
-        fn = self._JOIN_FNS[mode]
-        result = fn(
+        result: pa.Table = fn(
             sd,
             self._usrn_parquet,
             self._rhs_config,
@@ -119,44 +116,6 @@ class UsrnMatcher:
         )
         log.info("Result row count: %d", len(result))
         return result
-
-    def match_intersect(
-        self,
-        bbox: BBox | None = None,
-        explain: bool = False,
-        include_rhs_geometry: bool = False,
-        usrn_batches: int = 1,
-        geometry: GeometryMode = "none",
-    ) -> pa.Table:
-        """Intersect join USRNs against the configured dataset."""
-        return self.match_dispatch(
-            "intersect",
-            bbox=bbox,
-            explain=explain,
-            include_rhs_geometry=include_rhs_geometry,
-            usrn_batches=usrn_batches,
-            geometry=geometry,
-        )
-
-    def match_nearest(
-        self,
-        distance_m: float = 10.0,
-        bbox: BBox | None = None,
-        explain: bool = False,
-        include_rhs_geometry: bool = False,
-        usrn_batches: int = 1,
-        geometry: GeometryMode = "none",
-    ) -> pa.Table:
-        """Find the nearest USRN for each point in the configured dataset."""
-        return self.match_dispatch(
-            "nearest",
-            bbox=bbox,
-            explain=explain,
-            include_rhs_geometry=include_rhs_geometry,
-            usrn_batches=usrn_batches,
-            distance_m=distance_m,
-            geometry=geometry,
-        )
 
     def file_dispatch(
         self,
@@ -197,7 +156,7 @@ class UsrnMatcher:
         Parameters
         ----------
         table:
-            Result from :meth:`match_intersect`.
+            Result from :meth:`match_dispatch`.
         path:
             Output file path.
         sample:
@@ -453,7 +412,7 @@ class UsrnMatcher:
         )
         p_match.add_argument(
             "--mode",
-            choices=list(cls._JOIN_FNS),
+            choices=list(_registry),
             default="intersect",
             help=(
                 "Join mode: 'intersect' for polygon/line datasets (default); "
@@ -546,7 +505,7 @@ class UsrnMatcher:
 
         p_export.add_argument(
             "--mode",
-            choices=list(cls._JOIN_FNS),
+            choices=list(_registry),
             default="intersect",
             help="Join mode: 'intersect' (default) or 'nearest'.",
         )

@@ -46,8 +46,12 @@ parser.add_argument(
 args = parser.parse_args()
 
 _DEFAULT_VARIANTS = [
-    ("optimised",   "output_data/usrns_27700.parquet",        "output_data/soil_27700.parquet"),
-    ("unoptimised", "output_data/usrns_unoptimised.parquet",  "output_data/soil_unoptimised.parquet"),
+    ("optimised", "output_data/usrns_27700.parquet", "output_data/soil_27700.parquet"),
+    (
+        "unoptimised",
+        "output_data/usrns_unoptimised.parquet",
+        "output_data/soil_unoptimised.parquet",
+    ),
 ]
 
 variants = [
@@ -56,7 +60,9 @@ variants = [
 ]
 
 
-def _run(label: str, usrn_parquet: str, soil_parquet: str, bbox: list[int]) -> tuple[float, int]:
+def _run(
+    label: str, usrn_parquet: str, soil_parquet: str, bbox: list[int]
+) -> tuple[float, int]:
     soil_cfg = DatasetConfig(
         name="soil",
         source_path="input_data/soil.gpkg",
@@ -64,7 +70,7 @@ def _run(label: str, usrn_parquet: str, soil_parquet: str, bbox: list[int]) -> t
     )
     matcher = UsrnMatcher(usrn_parquet=usrn_parquet, rhs_config=soil_cfg)
     t0 = time.perf_counter()
-    result = matcher.match_intersect(bbox=bbox)
+    result = matcher.match_dispatch("intersect", bbox=bbox)
     return time.perf_counter() - t0, len(result)
 
 

@@ -38,7 +38,7 @@ Usage:
     from usrn_matcher.dtf import DTFConfig, to_dtf_csv, to_dtf_geoparquet
 
     cfg = DTFConfig(swa_org_name="My Council", swa_org_ref=1234, rhs_name="stops")
-    table = matcher.match_nearest(bbox=LEEDS, include_rhs_geometry=True)
+    table = matcher.match_dispatch("nearest", bbox=LEEDS, include_rhs_geometry=True)
     to_dtf_csv(table, cfg, "matched_data/matched_stops_ad.csv")
     to_dtf_geoparquet(table, cfg, "matched_data/matched_stops_ad.parquet")
 """
@@ -322,8 +322,7 @@ def to_dtf_csv(
     """Write match results as a DTF8.1-inspired CSV.
 
     The ``table`` must contain a ``rhs_geometry`` column (WKB bytes) produced
-    by calling :meth:`~usrn_matcher.UsrnMatcher.match_intersect` or
-    :meth:`~usrn_matcher.UsrnMatcher.match_nearest` with ``include_rhs_geometry=True``.
+    by calling :meth:`~usrn_matcher.UsrnMatcher.match_dispatch` with ``include_rhs_geometry=True``.
 
     Parameters
     ----------
@@ -355,7 +354,7 @@ def to_dtf_csv(
     if "rhs_geometry" not in table.schema.names:
         raise ValueError(
             "Table is missing 'rhs_geometry' column. "
-            "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
+            "Call match_dispatch() with include_rhs_geometry=True."
         )
 
     today: date = date.today()
@@ -560,7 +559,7 @@ def to_dtf_geoparquet(
     if "rhs_geometry" not in table.schema.names:
         raise ValueError(
             "Table is missing 'rhs_geometry' column. "
-            "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
+            "Call match_dispatch() with include_rhs_geometry=True."
         )
 
     dtf_tbl = _dtf_table if _dtf_table is not None else _build_dtf_table(table, config)
@@ -597,7 +596,7 @@ def to_dtf_flat_csv(
     if "rhs_geometry" not in table.schema.names:
         raise ValueError(
             "Table is missing 'rhs_geometry' column. "
-            "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
+            "Call match_dispatch() with include_rhs_geometry=True."
         )
 
     dtf_tbl = _dtf_table if _dtf_table is not None else _build_dtf_table(table, config)
@@ -643,7 +642,7 @@ def to_dtf_gpkg(
     if "rhs_geometry" not in table.schema.names:
         raise ValueError(
             "Table is missing 'rhs_geometry' column. "
-            "Call match_intersect() or match_nearest() with include_rhs_geometry=True."
+            "Call match_dispatch() with include_rhs_geometry=True."
         )
 
     dtf_tbl = _dtf_table if _dtf_table is not None else _build_dtf_table(table, config)

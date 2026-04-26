@@ -1,12 +1,10 @@
 # usrn-matcher — task runner
 # Usage: make <target>
 
-STOPS_CSV = input_data/Stops.csv
-
 .PHONY: \
 	init \
-	prepare-usrns prepare-usrns-force \
-	prepare-soil prepare-stops prepare-counts prepare-all \
+	prepare-usrns \
+	prepare-soil prepare-stops prepare-counts prepare-built prepare-all \
 	match-soil-national match-soil-national-explain \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
@@ -21,31 +19,35 @@ init:
 # ── Prepare USRNs ─────────────────────────────────────────────────────────────
 
 prepare-usrns:
-	usrn-matcher prepare-usrns
-
-prepare-usrns-force:
 	usrn-matcher prepare-usrns --force
 
 # ── Prepare ───────────────────────────────────────────────────────────────────
 
 prepare-soil:
 	usrn-matcher prepare-gpkg \
-		--rhs-name soil
+		--rhs-name soil \
+		--force
+
+prepare-built:
+	usrn-matcher prepare-gpkg \
+		--rhs-name os_open_built_up_areas \
+		--force
 
 prepare-stops:
 	usrn-matcher prepare-csv \
-		--csv    $(STOPS_CSV) \
 		--name   stops \
 		--x-col  Easting \
-		--y-col  Northing
+		--y-col  Northing \
+		--force
 
 prepare-counts:
 	usrn-matcher prepare-csv \
 		--name   count_points \
 		--x-col  easting \
-		--y-col  northing
+		--y-col  northing \
+		--force
 
-prepare-all: prepare-soil prepare-stops prepare-counts
+prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
 
 # ── Match — National (no bbox) ────────────────────────────────────────────────
 
@@ -53,14 +55,14 @@ match-soil-national:
 	usrn-matcher match \
 		--rhs-name   soil \
 		--mode       intersect \
-		--output     csv \
+		--output     parquet \
 
 match-stops-national:
 	usrn-matcher match \
-		--rhs-name stop \
+		--rhs-name stops \
 		--mode     nearest \
 		--distance 10 \
-		--output   csv \
+		--output   parquet \
 
 match-counts-national:
 	usrn-matcher match \

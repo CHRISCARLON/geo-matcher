@@ -25,7 +25,7 @@ python benchmark/compare_parquet.py output_data/usrns_unoptimised.parquet output
 
 ### `bench_optimised_vs_unoptimised.py`
 
-Runs `UsrnMatcher.match_intersect` across nine UK city bounding boxes for each supplied variant, reporting elapsed time and result row count.
+Runs `UsrnMatcher.match_dispatch("intersect", ...)` across nine UK city bounding boxes for each supplied variant, reporting elapsed time and result row count.
 
 ```bash
 python benchmark/bench_optimised_vs_unoptimised.py \

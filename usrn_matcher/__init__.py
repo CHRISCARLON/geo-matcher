@@ -5,8 +5,7 @@ from .join import (
     GeometryMode,
     JoinFn,
     execute_join,
-    run_intersect_join,
-    run_nearest_join,
+    get_join,
 )
 from .matcher import UsrnMatcher
 from .prepare import prepare_dataset, prepare_from_csv, prepare_usrns
@@ -18,8 +17,7 @@ __all__ = [
     "GeometryMode",
     "JoinFn",
     "execute_join",
-    "run_intersect_join",
-    "run_nearest_join",
+    "get_join",
     "DTFConfig",
     "to_dtf_csv",
     "to_dtf_flat_csv",

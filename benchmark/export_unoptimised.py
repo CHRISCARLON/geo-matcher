@@ -15,7 +15,9 @@ import pathlib
 
 import duckdb
 
-parser = argparse.ArgumentParser(description="Export unoptimised Parquet from GeoPackage files.")
+parser = argparse.ArgumentParser(
+    description="Export unoptimised Parquet from GeoPackage files."
+)
 parser.add_argument("sources", nargs="+", type=pathlib.Path, help="Input .gpkg file(s)")
 parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("output_data"))
 args = parser.parse_args()

@@ -1,7 +1,7 @@
 import functools
 import logging
 import pathlib
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, TypeVar, runtime_checkable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,14 +16,10 @@ log: logging.Logger = get_logger()
 GeometryMode = Literal["none", "usrn", "clip", "rhs"]
 
 
+# Define a proper JoinFunction type
 @runtime_checkable
 class JoinFn(Protocol):
-    """Contract every join implementation must satisfy.
-
-    The four common keyword-only params must be declared. Mode-specific params
-    (e.g. ``distance_m`` for nearest joins) are absorbed via ``**kwargs``.
-    ``@runtime_checkable`` enables ``isinstance`` checks at runtime.
-    """
+    """Contract every join implementation must satisfy."""
 
     def __call__(
         self,
@@ -37,6 +33,26 @@ class JoinFn(Protocol):
         usrn_batches: int = ...,
         **kwargs: Any,
     ) -> pa.Table: ...
+
+
+_registry: dict[str, JoinFn] = {}
+_J = TypeVar("_J", bound=JoinFn)
+
+
+def register(name: str) -> Callable[[_J], _J]:
+    """Register a join function under *name*"""
+
+    def decorator(fn: _J) -> _J:
+        _registry[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_join(name: str) -> JoinFn:
+    if name not in _registry:
+        raise KeyError(f"No join registered for '{name}'. Available: {list(_registry)}")
+    return _registry[name]
 
 
 def execute_join(
@@ -131,6 +147,7 @@ def execute_join(
     return pa.concat_tables(batch_results)
 
 
+@register("intersect")
 def run_intersect_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -200,25 +217,25 @@ def run_intersect_join(
     bbox_filter: str = _bbox_pruner(bbox)
     bbox_clip: str | None = _bbox_clipper(bbox)
 
-    geometry_select: str
-    if geometry == "none":
-        geometry_select = ""
-    elif geometry == "rhs":
-        geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
-    elif geometry == "clip":
-        geom_expr: str = (
-            f"ST_Intersection(ST_Intersection(u.geometry, s.geometry), {bbox_clip})"
-            if bbox_clip
-            else "ST_Intersection(u.geometry, s.geometry)"
-        )
-        geometry_select = f",\n            {geom_expr} AS geometry"
-    else:  # "usrn"
-        geom_expr = (
-            f"ST_Intersection(u.geometry, {bbox_clip})"
-            if bbox_clip
-            else "ST_AsWKB(u.geometry)"
-        )
-        geometry_select = f",\n            {geom_expr} AS geometry"
+    match geometry:
+        case "none":
+            geometry_select = ""
+        case "rhs":
+            geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
+        case "clip":
+            geom_expr: str = (
+                f"ST_Intersection(ST_Intersection(u.geometry, s.geometry), {bbox_clip})"
+                if bbox_clip
+                else "ST_Intersection(u.geometry, s.geometry)"
+            )
+            geometry_select = f",\n            {geom_expr} AS geometry"
+        case "usrn":
+            geom_expr = (
+                f"ST_Intersection(u.geometry, {bbox_clip})"
+                if bbox_clip
+                else "ST_AsWKB(u.geometry)"
+            )
+            geometry_select = f",\n            {geom_expr} AS geometry"
 
     if bbox:
         log.info("Applying bbox filter: xmin=%s ymin=%s xmax=%s ymax=%s", *bbox)
@@ -250,6 +267,7 @@ def run_intersect_join(
     return execute_join(sd, usrn_parquet, query, explain, usrn_batches)
 
 
+@register("nearest")
 def run_nearest_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -335,20 +353,21 @@ def run_nearest_join(
     col_fragment: str = _col_fragment(rhs_config)
     bbox_clip: str | None = _bbox_clipper(bbox)
 
-    geometry_select: str
-    if geometry == "none":
-        geometry_select = ""
-    elif geometry == "rhs":
-        geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
-    else:  # "usrn" or "clip" — no meaningful clip for nearest, falls back to full USRN line
-        # ST_Intersection also avoids the raw WkbView segfault in to_arrow_table(), so
-        # ST_AsWKB is only needed for the unclipped (no-bbox) case.
-        geom_expr: str = (
-            f"ST_Intersection(u.geometry, {bbox_clip})"
-            if bbox_clip
-            else "ST_AsWKB(u.geometry)"
-        )
-        geometry_select = f",\n            {geom_expr} AS geometry"
+    match geometry:
+        case "none":
+            geometry_select = ""
+        case "rhs":
+            geometry_select = ",\n            ST_AsWKB(s.geometry) AS geometry"
+        case "usrn" | "clip":
+            # ST_Intersection also avoids the raw WkbView segfault in to_arrow_table(), so
+            # ST_AsWKB is only needed for the unclipped (no-bbox) case.
+            # No meaningful clip for nearest — "clip" falls back to full USRN line.
+            geom_expr: str = (
+                f"ST_Intersection(u.geometry, {bbox_clip})"
+                if bbox_clip
+                else "ST_AsWKB(u.geometry)"
+            )
+            geometry_select = f",\n            {geom_expr} AS geometry"
 
     rhs_geom_fragment: str = (
         ", ST_AsWKB(s.geometry) AS rhs_geometry" if include_rhs_geometry else ""

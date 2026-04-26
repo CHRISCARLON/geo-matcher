@@ -22,6 +22,7 @@ log: logging.Logger = get_logger()
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
 
 
+# TODO: Add a protcol here as well
 class _CoveringColumn(TypedDict):
     xmin: list[str]
     ymin: list[str]

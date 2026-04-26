@@ -207,10 +207,10 @@ matcher = UsrnMatcher(
 )
 
 # Intersect join — polygons / lines
-table = matcher.match_intersect(bbox=LEEDS)
+table = matcher.match_dispatch("intersect", bbox=LEEDS)
 
 # Nearest join — points
-table = matcher.match_nearest(bbox=LEEDS, distance_m=25)
+table = matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=25)
 ```
 
 Both methods return a `pyarrow.Table` with columns: `usrn`, `street_type`,
@@ -244,7 +244,7 @@ dtf_cfg = DTFConfig(
 out = pathlib.Path("matched_data")
 
 # include_rhs_geometry=True adds the rhs_geometry column required by DTF export functions
-table = matcher.match_nearest(bbox=LEEDS, distance_m=25, include_rhs_geometry=True)
+table = matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=25, include_rhs_geometry=True)
 
 to_dtf_csv(table, dtf_cfg, out / "stops.csv")
 to_dtf_geoparquet(table, dtf_cfg, out / "stops.parquet")
