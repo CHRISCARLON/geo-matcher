@@ -64,6 +64,7 @@ ignore = [
     "B006", # mutable default arguments
     "B905", # zip() without strict=
     "E501", # line too long — ruff format can't reflow comments/docstrings
+    "T201"
 ]
 
 [tool.ruff.lint.isort]

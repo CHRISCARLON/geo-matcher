@@ -61,7 +61,7 @@ def execute_join(
         sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
         filled: str = query.format(batch_filter="")
         if explain:
-            log_plan(sd,filled)
+            log_plan(sd, filled)
         return sd.sql(filled).to_arrow_table()
 
     usrn_pf: pq.ParquetFile = pq.ParquetFile(str(usrn_parquet))
@@ -125,7 +125,7 @@ def execute_join(
             ymax,
         )
         if explain and i == 0:
-            log_plan(sd,batch_query)
+            log_plan(sd, batch_query)
         batch_results.append(sd.sql(batch_query).to_arrow_table())
 
     return pa.concat_tables(batch_results)

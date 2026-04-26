@@ -1,16 +1,3 @@
-"""Explain-plan utilities for Sedona spatial joins.
-
-Parses the indented text from ``EXPLAIN ANALYZE`` into a nested dict tree and
-logs it as coloured JSON — one metric per line, top-to-bottom.
-
-Note on ``row_groups_spatial_pruned`` counts
---------------------------------------------
-Sedona reports row-group pruning evaluations *across all parallel workers*, not
-unique row groups in the file.  With N workers, the total = file_row_groups × N
-and matched = matched_per_worker × N, so the pruning ratio is correct but the
-absolute numbers are inflated by parallelism.
-"""
-
 import json
 import re
 import sys
@@ -31,13 +18,24 @@ _RULE = f"{_BLUE}{'─' * 60}{_RESET}"
 
 _METRICS_BLOCK_RE = re.compile(r",?\s*metrics=\[([^\]]*)\]")
 _KV_RE = re.compile(r"(\w+)=([^,\]]+)")
-_KEEP_METRICS = frozenset({
-    "output_rows", "elapsed_compute", "bytes_scanned", "output_bytes",
-    "row_groups_spatial_pruned", "row_groups_pruned_statistics",
-    "files_ranges_spatial_pruned", "selectivity",
-    "build_mem_used", "join_time", "execution_mode",
-    "fetch_time", "time_elapsed_scanning_total", "metadata_load_time",
-})
+_KEEP_METRICS = frozenset(
+    {
+        "output_rows",
+        "elapsed_compute",
+        "bytes_scanned",
+        "output_bytes",
+        "row_groups_spatial_pruned",
+        "row_groups_pruned_statistics",
+        "files_ranges_spatial_pruned",
+        "selectivity",
+        "build_mem_used",
+        "join_time",
+        "execution_mode",
+        "fetch_time",
+        "time_elapsed_scanning_total",
+        "metadata_load_time",
+    }
+)
 _MAX_PARAMS = 100  # truncate verbose params (file_groups, projection lists, etc.)
 
 _NODE_JSON_RE = re.compile(r'("node":\s*)"([^"]+)"')
@@ -47,7 +45,7 @@ _METRIC_JSON_RE = re.compile(
 
 
 def _parse_plan_node(stripped: str) -> dict[str, Any]:
-    """Parse one indented plan line into a node dict (no children yet)."""
+    """Parse one indented plan line."""
     m = _METRICS_BLOCK_RE.search(stripped)
     metrics_text = m.group(1) if m else ""
     header = _METRICS_BLOCK_RE.sub("", stripped).rstrip(", ") if m else stripped
