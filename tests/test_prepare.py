@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 from shapely.geometry import box
 
+from usrn_matcher import prepare as prepare_module
 from usrn_matcher.config import DatasetConfig
 from usrn_matcher.prepare import prepare_dataset, prepare_from_csv
 
@@ -186,6 +187,26 @@ def test_prepare_dataset_crs_in_metadata(tiny_gpkg, tmp_path):
     assert crs_meta is not None, "CRS should be present in geometry column metadata"
     # PROJJSON for EPSG:27700 should identify as British National Grid
     assert "27700" in str(crs_meta)
+
+
+# ---------------------------------------------------------------------------
+# _patch_covering_metadata unhappy path
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_dataset_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
+    """RuntimeError propagates when _patch_covering_metadata raises."""
+
+    def _always_raise(*a, **kw):
+        raise RuntimeError("Failed to patch GeoParquet covering metadata")
+
+    monkeypatch.setattr(prepare_module, "_patch_covering_metadata", _always_raise)
+    out = tmp_path / "fail.parquet"
+    cfg = DatasetConfig(name="fail", source_path=tiny_gpkg, parquet_path=out)
+    with pytest.raises(
+        RuntimeError, match="Failed to patch GeoParquet covering metadata"
+    ):
+        prepare_dataset(cfg, force=True)
 
 
 # ---------------------------------------------------------------------------

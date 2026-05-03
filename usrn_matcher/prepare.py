@@ -100,9 +100,10 @@ def _patch_covering_metadata(
     table = table.cast(normalised_schema)
 
     pq.write_table(table, str(path), row_group_size=row_group_size, compression="zstd")
-    assert (
-        geo_meta["columns"][geom_col].get("covering") == _EXPECTED_COVERING_METADATA
-    ), f"Failed to patch GeoParquet covering metadata for {geom_col!r} in {path}"
+    if geo_meta["columns"][geom_col].get("covering") != _EXPECTED_COVERING_METADATA:
+        raise RuntimeError(
+            f"Failed to patch GeoParquet covering metadata for {geom_col!r} in {path}"
+        )
 
 
 def _get_src_geometry_col(con: Any, source_path: str) -> str:
@@ -189,7 +190,7 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
 
     t0 = time.perf_counter()
 
-    # TODO: Need to check if thid HilberSort is good enough
+    # TODO: Need to check if this HilberSort is good enough
     con.execute(f"""
         COPY (
             SELECT

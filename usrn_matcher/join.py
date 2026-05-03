@@ -1,7 +1,7 @@
 import functools
 import logging
 import pathlib
-from typing import Any, Callable, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -17,6 +17,8 @@ GeometryMode = Literal["none", "usrn", "clip", "rhs"]
 
 
 # Define a proper JoinFunction type
+# TODO: Fix the fact that distance_m needs to
+# be declared for things that don't need it
 @runtime_checkable
 class JoinFn(Protocol):
     """Contract every join implementation must satisfy."""
@@ -31,7 +33,8 @@ class JoinFn(Protocol):
         explain: bool = ...,
         include_rhs_geometry: bool = ...,
         usrn_batches: int = ...,
-        **kwargs: Any,
+        distance_m: float = ...,
+        geometry: GeometryMode = ...,
     ) -> pa.Table: ...
 
 
@@ -78,7 +81,7 @@ def execute_join(
         filled: str = query.format(batch_filter="")
         if explain:
             log_plan(sd, filled)
-        return sd.sql(filled).to_arrow_table()
+        return cast(pa.Table, sd.sql(filled).to_arrow_table())
 
     usrn_pf: pq.ParquetFile = pq.ParquetFile(str(usrn_parquet))
     n_row_groups: int = usrn_pf.metadata.num_row_groups
@@ -142,7 +145,7 @@ def execute_join(
         )
         if explain and i == 0:
             log_plan(sd, batch_query)
-        batch_results.append(sd.sql(batch_query).to_arrow_table())
+        batch_results.append(cast(pa.Table, sd.sql(batch_query).to_arrow_table()))
 
     return pa.concat_tables(batch_results)
 
@@ -157,8 +160,8 @@ def run_intersect_join(
     explain: bool = False,
     include_rhs_geometry: bool = False,
     usrn_batches: int = 1,
+    distance_m: float = 10.0,  # noqa: ARG001
     geometry: GeometryMode = "none",
-    **_: Any,
 ) -> pa.Table:
     """Run a spatial intersection join of USRNs against any right-hand side dataset.
 
@@ -279,7 +282,6 @@ def run_nearest_join(
     include_rhs_geometry: bool = False,
     usrn_batches: int = 1,
     geometry: GeometryMode = "none",
-    **_: Any,
 ) -> pa.Table:
     """Find the nearest USRN for each point in the RHS dataset.
 
