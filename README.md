@@ -10,7 +10,9 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 Given any spatial dataset (bus stops, soil polygons, flood zones — anything with a geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN reference and the original dataset's attributes.
 
-All geometries must be in British National Grid (EPSG:27700). Output is attribute-only — no geometry column.
+All geometries must be in British National Grid (EPSG:27700). 
+
+Output is attribute-only — no geometry column.
 
 ## Installation
 
