@@ -10,7 +10,7 @@ import duckdb
 # Define a proper Uploader type
 @runtime_checkable
 class Uploader(Protocol):
-    """Defining an uploader type contract"""
+    """Contract every uploader must satisfy."""
 
     def upload(
         self,
@@ -27,9 +27,8 @@ _registry: dict[str, Uploader] = {}
 _U = TypeVar("_U", bound=Uploader)
 
 
-# TODO: add this as a util somewhere as it gets repeated in join.py
 def register(name: str) -> Callable[[type[_U]], type[_U]]:
-    """Register a class as an Uploader type"""
+    """Register a class under *name* and validate it satisfies the Uploader protocol."""
 
     def decorator(cls: type[_U]) -> type[_U]:
         instance = cls()
@@ -45,6 +44,7 @@ def register(name: str) -> Callable[[type[_U]], type[_U]]:
 
 
 def get_uploader(name: str) -> Uploader:
+    """Return the registered Uploader for *name*, raising KeyError if not found."""
     if name not in _registry:
         raise KeyError(
             f"No uploader registered for '{name}'. Available: {list(_registry)}"
@@ -53,6 +53,7 @@ def get_uploader(name: str) -> Uploader:
 
 
 def _motherduck_connection() -> duckdb.DuckDBPyConnection:
+    """Open a MotherDuck connection using the motherduck_token env var."""
     token = os.environ.get("motherduck_token") or os.environ.get("MOTHERDUCK_TOKEN")
     if not token:
         raise ValueError(
@@ -63,6 +64,8 @@ def _motherduck_connection() -> duckdb.DuckDBPyConnection:
 
 @register("parquet")
 class ParquetUploader(Uploader):
+    """Upload a local Parquet file to a MotherDuck table via read_parquet."""
+
     def upload(
         self,
         source: str | pathlib.Path,
@@ -71,6 +74,7 @@ class ParquetUploader(Uploader):
         table: str,
         replace: bool = True,
     ) -> None:
+        """Copy *source* into ``database.schema.table`` on MotherDuck."""
         path = pathlib.Path(source).resolve()
         if not path.exists():
             raise FileNotFoundError(f"Parquet file not found: {path}")

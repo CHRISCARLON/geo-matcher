@@ -19,17 +19,7 @@ from typing import Any
 import duckdb
 import sedona.db
 
-from usrn_matcher.bboxes import (
-    BIRMINGHAM,
-    BRISTOL,
-    LEEDS,
-    LIVERPOOL,
-    LONDON,
-    MANCHESTER,
-    NEWCASTLE,
-    NOTTINGHAM,
-    SHEFFIELD,
-)
+from usrn_matcher.bboxes import LEEDS
 from usrn_matcher.explain import (
     _build_plan_tree,
 )
@@ -59,17 +49,7 @@ class SedonaResult:
     output_rows: int
 
 
-CITIES: dict[str, list[int]] = {
-    "London": LONDON,
-    "Leeds": LEEDS,
-    "Manchester": MANCHESTER,
-    "Birmingham": BIRMINGHAM,
-    "Liverpool": LIVERPOOL,
-    "Sheffield": SHEFFIELD,
-    "Bristol": BRISTOL,
-    "Newcastle": NEWCASTLE,
-    "Nottingham": NOTTINGHAM,
-}
+CITIES: dict[str, list[int]] = {"Leeds": LEEDS}
 
 parser = argparse.ArgumentParser(description="Benchmark USRN Parquet variants.")
 parser.add_argument(

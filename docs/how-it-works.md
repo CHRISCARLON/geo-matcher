@@ -16,24 +16,69 @@ Source files are converted to optimised GeoParquet 1.1 in `output_data/`. Run on
 
 ## Match phase
 
-**Why bbox struct predicates, not `ST_Intersects`** — `ST_Intersects` is a geometry computation; DataFusion cannot push it to parquet row-group statistics. Scalar `bbox.xmin <= X` predicates ARE pushed to parquet column min/max statistics, skipping entire row groups before a single geometry byte is read.
+Output is attribute-only — no geometry column. Results are a plain tabular join of USRNs to RHS dataset attributes.
 
-**Filtered joins (bbox / city)** — Both the USRN and RHS parquets are registered as Sedona/DataFusion views. A single SQL query runs with bbox struct predicates on both `u.bbox.*` and `s.bbox.*` pushed down to parquet column statistics on both sides.
+**Filtered joins (bbox / city)** — Both the USRN and RHS parquets are registered as Sedona/DataFusion views. A single SQL query runs with `ST_Intersects` predicates against the bbox polygon in the WHERE clause; Sedona skips non-overlapping row groups on both sides via GeoParquet 1.1 covering metadata.
 
-**National joins (no bbox)** — The RHS parquet is registered as a persistent Sedona view once. USRN row groups are split into batches via PyArrow. For each batch: the USRN rows are loaded into memory, the batch's spatial envelope is derived from the parquet row-group statistics, and that envelope is passed as the SQL `{spatial_filter}`. DataFusion prunes the persistent RHS scan to matching row groups at query time — no RHS data is ever loaded into Python. Each USRN appears in exactly one batch, so there are no duplicate (usrn, rhs) pairs.
+**National joins (no bbox)** — The USRN parquet is registered as a Sedona view once (metadata only — no rows loaded). The RHS parquet is split into `--batches` in-memory slices via PyArrow. For each slice, its spatial envelope is derived from the Parquet footer row-group statistics (no geometry read) and injected as an `ST_Intersects` predicate into the SQL. Sedona uses the USRN GeoParquet 1.1 covering metadata to skip row groups that don't overlap that envelope — so only the USRN row groups that spatially overlap the current RHS slice are read from disk and joined. Results are written incrementally to a `ParquetWriter` — at most one slice's matched rows are in memory at a time.
 
-**Join types:**
+**Join modes:**
 
-| Mode | Predicate | Use for |
-|---|---|---|
-| `intersect` | `ST_Intersects(u.geometry, s.geometry)` | Polygons, lines |
-| `nearest` | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
-| `line` | `ST_DWithin` + intersection-preference post-filter when `--rhs-id-col` is set | Linestrings |
+| Mode | Architecture | Predicate | Use for |
+|---|---|---|---|
+| `polygon` | Single-phase · 1 USRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
+| `point` | Single-phase · 1 USRN file | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
+| `line` | Three-phase · 2 USRN files | Phase 1: `ST_Intersects`; Phase 2: corridor; Phase 3: nearest fallback | Linestrings |
 
-**Geometry modes** — `--geometry none` (default) is attribute-only and fastest. `usrn` returns the USRN linestring; `clip` returns `ST_Intersection(usrn, rhs_polygon)`; `rhs` returns the matched RHS feature geometry (required for DTF export).
+**Line join three-phase strategy**
+
+Each phase only processes features that were not matched by the previous phase.
 
 ---
 
-## DTF export phase
+**Phase 1 — Direct intersection** (`is_intersection=true`, `match_phase=1`)
 
-`_build_dtf_table` constructs a PyArrow table with type 70 fixed fields, RHS attribute columns, and a WKB geometry column. That table is registered directly in DuckDB memory via `con.register()` — no temp file, no copy (DuckDB reads Arrow columnar buffers in place via its replacement scan feature). DuckDB then computes inline bbox struct, Hilbert-sorts, and writes GeoParquet via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1.
+The RHS line crosses the USRN centreline. Definitive match — kept unconditionally.
+
+```
+USRN centreline  ───────────────────────
+                          │
+                          │  RHS line crosses
+                          │
+```
+
+Predicate: `ST_Intersects(usrn.geometry, rhs.geometry)`
+
+---
+
+**Phase 2 — Corridor match** (`is_intersection=false`, `match_phase=2`)
+
+The RHS line runs alongside the USRN without crossing it, but at least 10 % of the
+line's length falls inside the USRN's buffer corridor. Typical for pipes or cables
+running under a pavement parallel to the road.
+
+```
+USRN centreline  ───────────────────────
+buffer           ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+                   ═══════════════════   RHS line (parallel, inside buffer)
+```
+
+Predicate: `ST_Intersects(usrn_corridor.geometry, rhs.geometry)`  
+Post-filter: `overlap_length_pct >= --overlap-threshold` (default 10 %)
+
+---
+
+**Phase 3 — Nearest fallback** (`is_intersection=false`, `overlap_length_pct=0.0`, `match_phase=3`)
+
+The RHS line didn't intersect any centreline or corridor. The single closest USRN
+within `--phase3-distance` metres is assigned. Catches short stubs and diagonal mains
+that fall just outside the corridor threshold.
+
+```
+USRN centreline  ───────────────────────
+                  ·  ·  ·  ·  ·  ·        (within phase3-distance)
+                          ════            RHS line (no corridor overlap)
+```
+
+Predicate: `ST_DWithin(usrn.geometry, rhs.geometry, phase3_distance_m)`  
+Dedup: one row per RHS feature (closest USRN wins)

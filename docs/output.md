@@ -1,49 +1,47 @@
 # Output
 
-## Standard match (`usrn-matcher match`)
-
-**Intersect join** — one row per USRN–feature intersection:
-
-| Column | Description |
-|---|---|
-| `usrn` | Unique Street Reference Number |
-| `street_type` | Road classification |
-| `geometry` | Present only when `--geometry` is not `none` |
-| *(RHS columns)* | All selected columns from the RHS dataset |
-
-**Nearest join** — one row per USRN–point pair within `--distance`:
-
-| Column | Description |
-|---|---|
-| `usrn` | Unique Street Reference Number |
-| `street_type` | Road classification |
-| `geometry` | Present only when `--geometry` is not `none` |
-| *(RHS columns)* | All selected columns from the RHS dataset |
-| `distance_m` | Distance in metres between the point and the USRN |
-
-**Geometry modes (`--geometry`):**
-
-| Mode | Default | Description |
-|---|---|---|
-| `none` | ✓ | No geometry — fastest, attribute-only |
-| `usrn` | | Full USRN linestring (clipped to bbox if supplied) |
-| `clip` | | `ST_Intersection(usrn, rhs_polygon)` — intersect only |
-| `rhs` | | Full unclipped RHS feature geometry — required for DTF export |
+All match results are attribute-only (no geometry column). Output is a tabular join of USRNs to RHS dataset attributes.
 
 ---
 
-## DTF export (`usrn-matcher dtf-export`)
+## Polygon join
 
-Four files written per run (stem = `matched_{name}_ad`):
+One row per USRN–feature intersection:
 
-| File | Format | Description |
-|---|---|---|
-| `matched_{name}_ad.csv` | DTF 8.1a CSV | Type 70 records. Exchange format for NSG-aware tools. |
-| `matched_{name}_ad.parquet` | GeoParquet 1.1 | Hilbert-sorted, ZSTD-compressed. |
-| `matched_{name}_ad_flat.csv` | Flat CSV | WKT geometry column. Opens in QGIS, Excel, GeoPandas. |
-| `matched_{name}_ad.gpkg` | GeoPackage | Native geometry. Opens in QGIS, ArcGIS, any OGR tool. |
+| Column | Description |
+|---|---|
+| `usrn` | Unique Street Reference Number |
+| `street_type` | Road classification |
+| *(RHS columns)* | All selected columns from the RHS dataset |
 
-See [dtf-mapping.md](dtf-mapping.md) for the full DTF8.1 field layout.
+---
+
+## Point join
+
+One row per USRN–point pair within `--distance`:
+
+| Column | Description |
+|---|---|
+| `usrn` | Unique Street Reference Number |
+| `street_type` | Road classification |
+| *(RHS columns)* | All selected columns from the RHS dataset |
+| `distance_m` | Distance in metres between the point and the USRN |
+
+---
+
+## Line join
+
+One row per USRN–line pair:
+
+| Column | Description |
+|---|---|
+| `usrn` | Unique Street Reference Number |
+| `street_type` | Road classification |
+| *(RHS columns)* | All selected columns from the RHS dataset |
+| `distance_m` | Distance in metres between the USRN and the RHS line |
+| `is_intersection` | `true` if the pair came from the Phase 1 intersect pass |
+| `overlap_length_pct` | Corridor overlap score: intersection length with the USRN buffer ÷ max(line length, 2 × distance_m). Higher = better alignment. `0.0` for Phase 3 rows. |
+| `match_phase` | `1` = Phase 1 intersect, `2` = Phase 2 corridor, `3` = Phase 3 nearest fallback |
 
 ---
 
@@ -51,8 +49,5 @@ See [dtf-mapping.md](dtf-mapping.md) for the full DTF8.1 field layout.
 
 The join is many-to-many. A USRN can cross many RHS features; an RHS feature can touch many USRNs.
 
-**Example — soil data for Leeds (39,582 rows):**
-- A soil polygon covering a large area may touch 50+ USRNs → appears 50+ times
-- A long A-road crossing 10 soil types → appears 10 times, each with a different soil attribute
 - Unique streets: `GROUP BY usrn`
 - Unique RHS features: `GROUP BY` RHS attribute columns

@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pyogrio
 from pyproj import CRS as ProjCRS
 
-from .config import CsvSource, DatasetConfig, OgrSource, ParquetSource
+from .config import CsvSource, DatasetConfig, OgrSource, ParquetSource, UsrnLineSource
 from .logger import get_logger
 
 log: logging.Logger = get_logger()
@@ -60,6 +60,7 @@ def _patch_covering_metadata(
     path: pathlib.Path,
     row_group_size: int,
     crs: str | None = None,
+    primary_column: str | None = None,
 ) -> None:
     """Patch a GeoParquet file's geo metadata to add the GeoParquet 1.1 covering key.
 
@@ -77,6 +78,8 @@ def _patch_covering_metadata(
     """
     table = pq.read_table(str(path))
     geo_meta: _GeoMeta = json.loads(table.schema.metadata[b"geo"])
+    if primary_column is not None:
+        geo_meta["primary_column"] = primary_column
     geom_col: str = geo_meta.get("primary_column", "geometry")
 
     geo_meta["version"] = "1.1.0"
@@ -387,6 +390,72 @@ def _prepare_parquet(
     return parquet_path
 
 
+def _prepare_usrn_line(
+    source: UsrnLineSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    if not force and parquet_path.exists():
+        log.info(
+            "GeoParquet already exists at %s — skipping. Pass force=True to re-prepare.",
+            parquet_path,
+        )
+        return parquet_path
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    if threads is not None:
+        con.execute(f"SET threads = {threads};")
+
+    pq_src = pq.read_metadata(str(source.path))
+    log.info(
+        "Preparing %s (buffer=%.0fm) from %s (%s rows / %d row groups)",
+        name,
+        source.buffer_m,
+        source.path,
+        f"{pq_src.num_rows:,}",
+        pq_src.num_row_groups,
+    )
+
+    t0 = time.perf_counter()
+    con.execute(f"""
+        COPY (
+            SELECT
+                usrn,
+                street_type,
+                geometry AS geometry_line,
+                ST_Buffer(geometry, {source.buffer_m}) AS geometry,
+                {{
+                    'xmin': ST_XMin(ST_Buffer(geometry, {source.buffer_m})),
+                    'ymin': ST_YMin(ST_Buffer(geometry, {source.buffer_m})),
+                    'xmax': ST_XMax(ST_Buffer(geometry, {source.buffer_m})),
+                    'ymax': ST_YMax(ST_Buffer(geometry, {source.buffer_m}))
+                }} AS bbox
+            FROM read_parquet('{source.path}')
+            ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
+        ) TO '{parquet_path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
+    """)
+    _patch_covering_metadata(
+        parquet_path, source.row_group_size, crs="EPSG:27700", primary_column="geometry"
+    )
+    elapsed = time.perf_counter() - t0
+
+    pq_out = pq.read_metadata(str(parquet_path))
+    log.info(
+        "  Done in %.1fs — %s rows | %d row groups | %.1f MB",
+        elapsed,
+        f"{pq_out.num_rows:,}",
+        pq_out.num_row_groups,
+        parquet_path.stat().st_size / 1024 / 1024,
+    )
+    return parquet_path
+
+
 def prepare(
     config: DatasetConfig,
     force: bool = False,
@@ -399,6 +468,7 @@ def prepare(
     - ``OgrSource`` — any GDAL-readable vector format (GeoPackage, Shapefile, …)
     - ``CsvSource`` — CSV with explicit x/y coordinate columns
     - ``ParquetSource`` — existing GeoParquet to re-sort and re-compress
+    - ``UsrnLineSource`` — buffer USRN centrelines for line join Phase 2
 
     A ``config.source`` must always be provided.
 
@@ -433,5 +503,9 @@ def prepare(
             return _prepare_csv(src, config.parquet_path, config.name, force, threads)
         case ParquetSource() as src:
             return _prepare_parquet(
+                src, config.parquet_path, config.name, force, threads
+            )
+        case UsrnLineSource() as src:
+            return _prepare_usrn_line(
                 src, config.parquet_path, config.name, force, threads
             )

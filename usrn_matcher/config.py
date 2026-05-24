@@ -48,7 +48,22 @@ class ParquetSource:
     source_crs: str | None = None
 
 
-AnySource: TypeAlias = OgrSource | CsvSource | ParquetSource
+@dataclass(frozen=True)
+class UsrnLineSource:
+    """Buffered USRN centreline GeoParquet for line join Phase 2.
+
+    Reads an existing ``usrns_27700.parquet`` and produces a new file where
+    ``geometry`` is ``ST_Buffer(centreline, buffer_m)`` (the join predicate) and
+    ``geometry_line`` is the original centreline WKB (used for distance and
+    overlap calculations). ``buffer_m`` must be >= ``--distance`` at match time.
+    """
+
+    path: pathlib.Path
+    buffer_m: float
+    row_group_size: int = 10_000
+
+
+AnySource: TypeAlias = OgrSource | CsvSource | ParquetSource | UsrnLineSource
 
 DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
 DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")

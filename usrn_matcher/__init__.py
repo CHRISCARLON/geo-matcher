@@ -1,13 +1,20 @@
 from . import bboxes
-from .config import AnySource, BBox, CsvSource, DatasetConfig, OgrSource, ParquetSource
-from .dtf import DTFConfig, to_dtf_csv, to_dtf_flat_csv, to_dtf_geoparquet, to_dtf_gpkg
+from .config import (
+    AnySource,
+    BBox,
+    CsvSource,
+    DatasetConfig,
+    OgrSource,
+    ParquetSource,
+    UsrnLineSource,
+)
 from .join import (
     AnalysisMode,
     FilteredMode,
-    GeometryMode,
     JoinFn,
     NationalMode,
     execute_join,
+    execute_line_join,
     get_join,
 )
 from .matcher import UsrnMatcher
@@ -20,17 +27,13 @@ __all__ = [
     "DatasetConfig",
     "OgrSource",
     "ParquetSource",
+    "UsrnLineSource",
     "AnalysisMode",
     "FilteredMode",
     "NationalMode",
-    "GeometryMode",
     "JoinFn",
     "execute_join",
+    "execute_line_join",
     "get_join",
-    "DTFConfig",
-    "to_dtf_csv",
-    "to_dtf_flat_csv",
-    "to_dtf_geoparquet",
-    "to_dtf_gpkg",
     "bboxes",
 ]

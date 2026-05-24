@@ -1,10 +1,15 @@
-"""Unit tests for UsrnMatcher dispatch methods"""
+"""Unit tests for UsrnMatcher dispatch methods."""
 
 import pyarrow as pa
 import pytest
 
 from usrn_matcher import DatasetConfig, UsrnMatcher
-from usrn_matcher.join import JoinFn, _registry, get_join
+from usrn_matcher.join import (
+    FilteredMode,
+    JoinFn,
+    _registry,
+    get_join,
+)
 
 
 @pytest.fixture()
@@ -14,10 +19,7 @@ def matcher(tmp_path) -> UsrnMatcher:
         source_path=tmp_path / "test.parquet",
         parquet_path=tmp_path / "test.parquet",
     )
-    return UsrnMatcher(
-        usrn_parquet=tmp_path / "usrns_27700.parquet",
-        rhs_config=cfg,
-    )
+    return UsrnMatcher(usrn_parquet=tmp_path / "usrns_27700.parquet", rhs_config=cfg)
 
 
 def test_match_dispatch_unknown_mode_raises(matcher):
@@ -30,32 +32,19 @@ def test_file_dispatch_unknown_format_raises(matcher, tmp_path):
         matcher.file_dispatch(pa.table({}), "xlsx", tmp_path, "stem")
 
 
-def test_join_fns_registry_keys():
-    assert "intersect" in _registry
-    assert "nearest" in _registry
+def test_registry_contains_expected_modes():
+    assert "polygon" in _registry
+    assert "point" in _registry
+    assert "line" in _registry
+    assert all(isinstance(get_join(k), JoinFn) for k in _registry)
 
 
-def test_join_fns_values_are_callable():
-    for fn in _registry.values():
-        assert callable(fn)
+def test_filtered_mode_rejects_oversized_bbox():
+    # 200km × 200km = 40,000 km² — well above the 3,000 km² limit
+    with pytest.raises(ValueError, match="km².*limit"):
+        FilteredMode(bbox=(0, 0, 200_000, 200_000))
 
 
-def test_output_formats_registry_keys():
-    assert "parquet" in UsrnMatcher._OUTPUT_FORMATS
-    assert "csv" in UsrnMatcher._OUTPUT_FORMATS
-    assert "sample" in UsrnMatcher._OUTPUT_FORMATS
-
-
-# ---------------------------------------------------------------------------
-# JoinFn runtime checks
-# ---------------------------------------------------------------------------
-
-
-def test_builtin_fns_are_joinfn_instances():
-    assert isinstance(get_join("intersect"), JoinFn)
-    assert isinstance(get_join("nearest"), JoinFn)
-
-
-def test_non_callable_is_not_joinfn():
-    assert not isinstance("not_a_fn", JoinFn)
-    assert not isinstance(42, JoinFn)
+def test_filtered_mode_accepts_city_sized_bbox():
+    # London bbox — should be just under the limit
+    FilteredMode(bbox=(503000, 156000, 562000, 201000))
