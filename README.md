@@ -10,14 +10,7 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 Given any spatial dataset (bus stops, soil polygons, flood zones — anything with a geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN reference and the original dataset's attributes.
 
-It expects all geometries to already be in British National Grid/27700.
-
-There are two output routes:
-
-| Route | Command | Geometry kept | Best for |
-|---|---|---|---|
-| **Standard** | `usrn-matcher match` | Optional — controlled by `--geometry` flag | Street-centric analysis |
-| **DTF export** | `usrn-matcher dtf-export` | Matched RHS feature geometry | Dataset-centric exchange in DTF8.1-inspired format |
+All geometries must be in British National Grid (EPSG:27700). Output is attribute-only — no geometry column.
 
 ## Installation
 
@@ -33,21 +26,47 @@ uv sync
 # 1. Create project directories
 usrn-matcher init
 
-# 2. Prepare source files (run once)
-usrn-matcher prepare-usrns
+# 2. Prepare USRNs (run once, or when OS Open USRN is updated)
+usrn-matcher prepare-usrns \
+  --usrn-gpkg  input_data/osopenusrn.gpkg \
+  --cache-dir  output_data
+
+# 3. Prepare your dataset
 usrn-matcher prepare-gpkg \
-  --rhs-gpkg input_data/dataset.gpkg \
-  --rhs-name dataset_one
+  --rhs-name   my_dataset \
+  --rhs-gpkg   input_data/my_dataset.gpkg \
+  --cache-dir  output_data
 
-# 3a. Run spatial join
-usrn-matcher match --rhs-name dataset_one --city LEEDS
+# 4. Run the join
+usrn-matcher match \
+  --rhs-name    my_dataset \   # prepared dataset name
+  --mode        polygon \      # polygon, point, or line
+  --city        LEEDS \        # pre-defined bbox (see bboxes.py) or use --bbox
+  --output      parquet \      # parquet or csv
+  --cache-dir   output_data \  # where prepared parquets live
+  --matched-dir matched_data   # where output is written
+```
 
-# 3b. Or export in DTF8.1-inspired format (optional)
-usrn-matcher dtf-export \
-  --rhs-name     dataset_one \
-  --city         LEEDS \
-  --dtf-org-name "My Org" \
-  --dtf-org-ref  1234
+### Line datasets (e.g. pipes, cables)
+
+```bash
+# Prepare buffered USRN corridors first
+usrn-matcher prepare-usrns-line \
+  --buffer-m  10 \
+  --cache-dir output_data
+
+# Three-phase line join
+usrn-matcher match \
+  --rhs-name          my_lines \                               # prepared dataset name
+  --mode              line \                                   # three-phase line strategy
+  --distance          10 \                                     # Phase 1+2 buffer width in metres
+  --phase3-distance   15 \                                     # Phase 3 nearest-fallback radius (catches features just outside the buffer)
+  --rhs-id-col        asset_id \                               # unique ID column to track matched features between phases
+  --usrn-line-parquet output_data/usrns_line_10m_27700.parquet \ # buffered USRN corridors for Phase 2
+  --city              LEEDS \                                  # spatial filter
+  --output            csv \
+  --cache-dir         output_data \
+  --matched-dir       matched_data
 ```
 
 ## Docs
@@ -55,4 +74,3 @@ usrn-matcher dtf-export \
 - [Usage — CLI & Python API](docs/usage.md)
 - [Output formats & cardinality](docs/output.md)
 - [How it works](docs/how-it-works.md)
-- [DTF8.1 mapping](docs/dtf-mapping.md)
