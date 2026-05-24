@@ -16,7 +16,10 @@ from .config import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_USRN_GPKG,
     BBox,
+    CsvSource,
     DatasetConfig,
+    OgrSource,
+    ParquetSource,
 )
 from .dtf import (
     DTFConfig,
@@ -26,9 +29,18 @@ from .dtf import (
     to_dtf_geoparquet,
     to_dtf_gpkg,
 )
-from .join import GeometryMode, JoinFn, _registry, get_join
+from .join import (
+    AnalysisMode,
+    FilteredMode,
+    GeometryMode,
+    JoinFn,
+    NationalMode,
+    _configure_session,
+    _registry,
+    get_join,
+)
 from .logger import get_logger
-from .prepare import prepare_dataset, prepare_from_csv, prepare_usrns
+from .prepare import prepare
 
 if TYPE_CHECKING:
     from sedonadb.context import SedonaContext
@@ -67,19 +79,25 @@ class UsrnMatcher:
     _usrn_parquet: pathlib.Path
     _rhs_config: DatasetConfig
     _sd: "SedonaContext | None"
+    _threads: int | None
 
     def __init__(
         self,
         usrn_parquet: str | pathlib.Path,
         rhs_config: DatasetConfig,
+        *,
+        threads: int | None = None,
     ) -> None:
         self._usrn_parquet = pathlib.Path(usrn_parquet)
         self._rhs_config = rhs_config
         self._sd = None
+        self._threads = threads
 
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
-            self._sd = sedona.db.connect()
+            sd = sedona.db.connect()
+            _configure_session(sd, target_partitions=self._threads or 4)
+            self._sd = sd
         assert self._sd is not None
         return self._sd
 
@@ -89,9 +107,11 @@ class UsrnMatcher:
         bbox: BBox | None = None,
         explain: bool = False,
         include_rhs_geometry: bool = False,
-        usrn_batches: int = 1,
+        n_chunks: int = 50,
         distance_m: float = 10.0,
         geometry: GeometryMode = "none",
+        rhs_id_col: str | None = None,
+        output_path: pathlib.Path | None = None,
     ) -> pa.Table:
         """Dispatch to the registered JoinFn"""
         try:
@@ -100,21 +120,32 @@ class UsrnMatcher:
             raise ValueError(
                 f"Unknown join mode {mode!r}. Available: {sorted(_registry)}"
             ) from None
-        if bbox is None and usrn_batches == 1:
-            usrn_batches = 10
+        analysis_mode: AnalysisMode = (
+            FilteredMode(bbox=bbox)
+            if bbox is not None
+            else NationalMode(n_chunks=n_chunks)
+        )
         sd = self._connect()
         result: pa.Table = fn(
             sd,
             self._usrn_parquet,
             self._rhs_config,
-            bbox=bbox,
+            mode=analysis_mode,
             explain=explain,
             include_rhs_geometry=include_rhs_geometry,
-            usrn_batches=usrn_batches,
             distance_m=distance_m,
             geometry=geometry,
+            rhs_id_col=rhs_id_col,
+            output_path=output_path,
         )
-        log.info("Result row count: %d", len(result))
+        if output_path is not None and output_path.exists():
+            log.info(
+                "Result row count: %d (streamed to %s)",
+                pq.read_metadata(str(output_path)).num_rows,
+                output_path,
+            )
+        else:
+            log.info("Result row count: %d", len(result))
         return result
 
     def file_dispatch(
@@ -255,6 +286,13 @@ class UsrnMatcher:
             action="store_true",
             help="Re-prepare even if the GeoParquet already exists.",
         )
+        p_prepare_usrns.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
 
         # ------------------------------------------------------------------ #
         # prepare                                                              #
@@ -298,6 +336,13 @@ class UsrnMatcher:
             "--force",
             action="store_true",
             help="Re-prepare GeoParquet files even if they already exist.",
+        )
+        p_prepare.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
         )
 
         # ------------------------------------------------------------------ #
@@ -361,6 +406,84 @@ class UsrnMatcher:
             action="store_true",
             help="Re-prepare even if the GeoParquet already exists.",
         )
+        p_prepare_csv.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+
+        # ------------------------------------------------------------------ #
+        # prepare-parquet                                                       #
+        # ------------------------------------------------------------------ #
+        p_prepare_parquet = sub.add_parser(
+            "prepare-parquet",
+            help="Re-sort and re-compress an existing GeoParquet into the optimised format.",
+        )
+        p_prepare_parquet.add_argument(
+            "--parquet",
+            default=None,
+            metavar="PATH",
+            help=f"Path to the source GeoParquet file (default: {DEFAULT_INPUT_DIR}/{{name}}.parquet).",
+        )
+        p_prepare_parquet.add_argument(
+            "--name",
+            required=True,
+            metavar="NAME",
+            help="Short identifier for the dataset (valid SQL identifier, e.g. 'highways').",
+        )
+        p_prepare_parquet.add_argument(
+            "--crs",
+            default="EPSG:27700",
+            metavar="CRS",
+            help="CRS to record in the output GeoParquet metadata (default: EPSG:27700).",
+        )
+        p_prepare_parquet.add_argument(
+            "--row-group-size",
+            type=int,
+            default=10_000,
+            metavar="N",
+            help="Row group size for the output GeoParquet (default: 10000).",
+        )
+        p_prepare_parquet.add_argument(
+            "--cache-dir",
+            default=DEFAULT_OUTPUT_DIR,
+            metavar="DIR",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
+        )
+        p_prepare_parquet.add_argument(
+            "--geometry-col",
+            default="geometry",
+            metavar="COL",
+            help=(
+                "Name of the geometry column in the source file (default: geometry). "
+                "For pipeline-produced files this is always 'geometry' (WKB). "
+                "For external files set this to the actual column name, e.g. 'geo_shape'."
+            ),
+        )
+        p_prepare_parquet.add_argument(
+            "--source-crs",
+            default=None,
+            metavar="CRS",
+            help=(
+                "CRS of the source geometry column, e.g. 'EPSG:4326'. "
+                "Required when the source column is in a different CRS than --crs. "
+                "The geometry will be reprojected to --crs during prepare."
+            ),
+        )
+        p_prepare_parquet.add_argument(
+            "--force",
+            action="store_true",
+            help="Re-prepare even if the GeoParquet already exists.",
+        )
+        p_prepare_parquet.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
 
         # ------------------------------------------------------------------ #
         # match                                                                #
@@ -415,7 +538,8 @@ class UsrnMatcher:
             choices=list(_registry),
             default="intersect",
             help=(
-                "Join mode: 'intersect' for polygon/line datasets (default); "
+                "Join mode: 'intersect' for polygon datasets (default); "
+                "'line' for linestring datasets — USRNs within distance_m of each RHS line; "
                 "'nearest' for point datasets — assigns each point to its closest USRN."
             ),
         )
@@ -424,7 +548,7 @@ class UsrnMatcher:
             type=float,
             default=10.0,
             metavar="METRES",
-            help="Search radius in metres for --mode nearest (default: 10).",
+            help="Tolerance/search radius in metres for --mode line and --mode nearest (default: 10).",
         )
         p_match.add_argument(
             "--geometry",
@@ -446,12 +570,34 @@ class UsrnMatcher:
         p_match.add_argument(
             "--batches",
             type=int,
-            default=1,
+            default=50,
             metavar="N",
             help=(
-                "Split the USRN parquet into N row-group batches and run the join once "
-                "per batch (default: 1 = no batching). Use 4 for national joins to "
-                "reduce peak memory and CPU pressure."
+                "Number of RHS chunks for national (no-bbox) joins (default: 50). "
+                "The RHS parquet is split into this many in-memory slices; only one "
+                "chunk's data is in memory at a time. Ignored when --bbox or --city is supplied."
+            ),
+        )
+        p_match.add_argument(
+            "--rhs-id-col",
+            default=None,
+            metavar="COL",
+            help=(
+                "Column that uniquely identifies each RHS feature (e.g. 'ASSET_ID'). "
+                "Used with --mode line to apply intersection-preferred matching: "
+                "features that touch a USRN keep all touching matches; "
+                "features with no intersection keep only the single closest match."
+            ),
+        )
+        p_match.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "DataFusion target_partitions for the spatial join (default: 4). "
+                "Lower values reduce CPU saturation at the cost of longer wall time. "
+                "Use 1-2 to run in the background without impacting other processes."
             ),
         )
         p_match.add_argument(
@@ -507,7 +653,7 @@ class UsrnMatcher:
             "--mode",
             choices=list(_registry),
             default="intersect",
-            help="Join mode: 'intersect' (default) or 'nearest'.",
+            help="Join mode: 'intersect' (default), 'line', or 'nearest'.",
         )
         p_export.add_argument(
             "--distance",
@@ -549,11 +695,11 @@ class UsrnMatcher:
         p_export.add_argument(
             "--batches",
             type=int,
-            default=1,
+            default=50,
             metavar="N",
             help=(
-                "Split the USRN parquet into N row-group batches (default: 1). "
-                "Use 4 for national exports to reduce peak memory and CPU pressure."
+                "Number of RHS chunks for national (no-bbox) exports (default: 50). "
+                "Ignored when --bbox or --city is supplied."
             ),
         )
 
@@ -569,10 +715,14 @@ class UsrnMatcher:
             usrn_gpkg: pathlib.Path = pathlib.Path(args.usrn_gpkg)
             _validate_input_file(usrn_gpkg)
             cache_dir: pathlib.Path = pathlib.Path(args.cache_dir)
-            prepare_usrns(
-                usrn_gpkg,
-                cache_dir / "usrns_27700.parquet",
+            prepare(
+                DatasetConfig(
+                    name="usrns",
+                    source=OgrSource(path=usrn_gpkg, row_group_size=20_000),
+                    parquet_path=cache_dir / "usrns_27700.parquet",
+                ),
                 force=args.force,
+                threads=args.threads,
             )
 
         elif args.command == "prepare-gpkg":
@@ -585,12 +735,13 @@ class UsrnMatcher:
             _validate_input_file(rhs_gpkg)
             rhs_config: DatasetConfig = DatasetConfig(
                 name=args.rhs_name,
-                source_path=rhs_gpkg,
+                source=OgrSource(
+                    path=rhs_gpkg,
+                    row_group_size=args.rhs_row_group_size,
+                ),
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
-                geometry_column=args.rhs_geometry_col,
-                row_group_size=args.rhs_row_group_size,
             )
-            prepare_dataset(rhs_config, force=args.force)
+            prepare(rhs_config, force=args.force, threads=args.threads)
 
         elif args.command == "prepare-csv":
             csv_path: pathlib.Path = (
@@ -599,17 +750,41 @@ class UsrnMatcher:
                 else DEFAULT_INPUT_DIR / f"{args.name}.csv"
             )
             _validate_input_file(csv_path)
-            prepare_from_csv(
-                csv_path=csv_path,
+            rhs_config = DatasetConfig(
+                name=args.name,
+                source=CsvSource(
+                    path=csv_path,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    geometry_type=args.geometry_type,
+                    crs=args.crs,
+                    row_group_size=args.row_group_size,
+                ),
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
-                geometry_type=args.geometry_type,
-                x_col=args.x_col,
-                y_col=args.y_col,
-                crs=args.crs,
-                row_group_size=args.row_group_size,
-                force=args.force,
             )
+            prepare(rhs_config, force=args.force, threads=args.threads)
+
+        elif args.command == "prepare-parquet":
+            src_parquet: pathlib.Path = (
+                pathlib.Path(args.parquet)
+                if args.parquet is not None
+                else DEFAULT_INPUT_DIR / f"{args.name}.parquet"
+            )
+            _validate_input_file(src_parquet)
+            rhs_config = DatasetConfig(
+                name=args.name,
+                source=ParquetSource(
+                    path=src_parquet,
+                    crs=args.crs,
+                    row_group_size=args.row_group_size,
+                    geometry_col=args.geometry_col,
+                    source_crs=args.source_crs,
+                ),
+                parquet_path=pathlib.Path(args.cache_dir)
+                / f"{args.name}_27700.parquet",
+            )
+            prepare(rhs_config, force=args.force, threads=args.threads)
 
         elif args.command == "match":
             cache_dir = pathlib.Path(args.cache_dir)
@@ -627,26 +802,38 @@ class UsrnMatcher:
             matcher: UsrnMatcher = cls(
                 usrn_parquet=cache_dir / "usrns_27700.parquet",
                 rhs_config=rhs_config,
+                threads=args.threads,
             )
 
             stem: str = f"usrn_{args.rhs_name}_attribution"
             matched_dir: pathlib.Path = pathlib.Path(args.matched_dir)
 
+            # National + parquet output → stream each RHS chunk directly to file
+            streaming: bool = bbox is None and args.output == "parquet"
+            output_path: pathlib.Path | None = (
+                matched_dir / f"{stem}.parquet" if streaming else None
+            )
+
             table: pa.Table = matcher.match_dispatch(
                 mode=args.mode,
                 bbox=bbox,
                 explain=args.explain,
-                usrn_batches=args.batches,
+                n_chunks=args.batches,
                 distance_m=args.distance,
                 geometry=args.geometry,
+                rhs_id_col=args.rhs_id_col,
+                output_path=output_path,
             )
-            matcher.file_dispatch(
-                table,
-                output=args.output,
-                matched_dir=matched_dir,
-                stem=stem,
-                sample=args.sample_rows,
-            )
+            if streaming:
+                log.info("Streaming output written to %s", output_path)
+            else:
+                matcher.file_dispatch(
+                    table,
+                    output=args.output,
+                    matched_dir=matched_dir,
+                    stem=stem,
+                    sample=args.sample_rows,
+                )
 
         elif args.command == "dtf-export":
             cache_dir = pathlib.Path(args.cache_dir)
@@ -671,7 +858,7 @@ class UsrnMatcher:
                 bbox=bbox,
                 explain=args.explain,
                 include_rhs_geometry=True,
-                usrn_batches=args.batches,
+                n_chunks=args.batches,
                 distance_m=args.distance,
             )
 

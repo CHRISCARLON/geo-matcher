@@ -4,10 +4,11 @@
 .PHONY: \
 	init \
 	prepare-usrns \
-	prepare-soil prepare-stops prepare-counts prepare-built prepare-all \
+	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-all \
 	match-soil-national match-soil-national-explain \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
+	match-gas-pipe-sample match-gas-pipe-national \
 	dtf-export-soil-national dtf-export-stops-national dtf-export-counts-national dtf-export-all-national \
 	clean-output clean-matched
 
@@ -47,6 +48,15 @@ prepare-counts:
 		--y-col  northing \
 		--force
 
+prepare-gas-pipe:
+	usrn-matcher prepare-parquet \
+		--name         gas_pipe \
+		--parquet      /Users/cmcarlon/Downloads/gas-pipe-infrastructure-gpi_open.parquet \
+		--geometry-col geo_shape \
+		--source-crs   EPSG:4326 \
+		--threads      2 \
+		--force
+
 prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
 
 # ── Match — National (no bbox) ────────────────────────────────────────────────
@@ -63,6 +73,7 @@ match-stops-national:
 		--mode     nearest \
 		--distance 10 \
 		--output   parquet \
+		--explain
 
 match-counts-national:
 	usrn-matcher match \
@@ -91,7 +102,25 @@ match-soil-national-explain:
 		--rhs-name soil \
 		--mode     intersect \
 		--output   csv \
-		--batches  10 \
+		--explain
+
+match-gas-pipe-sample:
+	usrn-matcher match \
+		--rhs-name    gas_pipe \
+		--mode        line \
+		--distance    2 \
+		--city        MANCHESTER \
+		--output      csv \
+		--explain
+
+match-gas-pipe-national:
+	usrn-matcher match \
+		--rhs-name   gas_pipe \
+		--mode       line \
+		--distance   2 \
+		--rhs-id-col asset_id \
+		--threads    4 \
+		--output     parquet \
 		--explain
 
 match-all-national: match-soil-national match-stops-national match-counts-national

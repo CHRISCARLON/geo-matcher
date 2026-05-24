@@ -1,4 +1,4 @@
-"""Tests for the pre-spatial phase: prepare_dataset and prepare_from_csv."""
+"""Tests for the prepare module: prepare() with source type structs."""
 
 import csv
 import json
@@ -8,9 +8,9 @@ import pyarrow.parquet as pq
 import pytest
 from shapely.geometry import box
 
-from usrn_matcher import prepare as prepare_module
-from usrn_matcher.config import DatasetConfig
-from usrn_matcher.prepare import prepare_dataset, prepare_from_csv
+import usrn_matcher.prepare as prepare_module
+from usrn_matcher import CsvSource, DatasetConfig, OgrSource
+from usrn_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
 
@@ -39,15 +39,15 @@ def tiny_gpkg(tiny_gdf, tmp_path):
 
 @pytest.fixture
 def prepared_parquet(tiny_gpkg, tmp_path):
-    """GeoParquet written from the synthetic GDF via prepare_dataset."""
+    """GeoParquet written from the synthetic GDF via prepare()."""
     out = tmp_path / "test.parquet"
-    cfg = DatasetConfig(name="test", source_path=tiny_gpkg, parquet_path=out)
-    prepare_dataset(cfg, force=True)
+    cfg = DatasetConfig(name="test", source=OgrSource(path=tiny_gpkg), parquet_path=out)
+    prepare(cfg, force=True)
     return out
 
 
 # ---------------------------------------------------------------------------
-# prepare_dataset metadata tests
+# OGR source metadata tests
 # ---------------------------------------------------------------------------
 
 
@@ -84,89 +84,83 @@ def test_crs_in_metadata(prepared_parquet):
 
 
 # ---------------------------------------------------------------------------
-# prepare_dataset behaviour tests
+# OGR source behaviour tests
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_dataset_skips_when_exists(tmp_path):
-    """prepare_dataset returns immediately (no file read) when output exists and force=False."""
+def test_prepare_skips_when_exists(tmp_path):
+    """prepare() returns immediately (no file read) when output exists and force=False."""
     out = tmp_path / "fake_27700.parquet"
-    out.touch()  # simulate pre-existing file
-
+    out.touch()
     cfg = DatasetConfig(
         name="fake",
-        source_path=tmp_path / "does_not_exist.gpkg",  # would error if read
+        source=OgrSource(path=tmp_path / "does_not_exist.gpkg"),
         parquet_path=out,
     )
-    result = prepare_dataset(cfg, force=False)
+    result = prepare(cfg, force=False)
     assert result == out
-    # File unchanged (still empty touch)
-    assert out.stat().st_size == 0
+    assert out.stat().st_size == 0  # untouched
 
 
-def test_prepare_dataset_force_overwrites(tiny_gpkg, tmp_path):
-    """prepare_dataset re-writes the file when force=True."""
+def test_prepare_force_overwrites(tiny_gpkg, tmp_path):
+    """prepare() re-writes the file when force=True."""
     out = tmp_path / "forced_27700.parquet"
     out.touch()
-
     cfg = DatasetConfig(
         name="forced",
-        source_path=tiny_gpkg,
+        source=OgrSource(path=tiny_gpkg),
         parquet_path=out,
     )
-
-    result = prepare_dataset(cfg, force=True)
+    result = prepare(cfg, force=True)
     assert result == out
-    assert out.stat().st_size > 0  # actual parquet content written
+    assert out.stat().st_size > 0
 
 
-def test_prepare_dataset_geometry_renamed(tiny_gpkg, tmp_path):
+def test_prepare_geometry_renamed(tiny_gpkg, tmp_path):
     """DuckDB always outputs the geometry column as 'geometry'."""
     out = tmp_path / "renamed_27700.parquet"
     cfg = DatasetConfig(
-        name="renamed",
-        source_path=tiny_gpkg,
-        parquet_path=out,
+        name="renamed", source=OgrSource(path=tiny_gpkg), parquet_path=out
     )
-
-    result = prepare_dataset(cfg, force=True)
+    result = prepare(cfg, force=True)
     schema = pq.read_schema(str(result))
     assert "geometry" in schema.names
     assert "geom" not in schema.names
 
 
-def test_prepare_dataset_wrong_crs_raises(tiny_gdf, tmp_path):
-    """AssertionError raised when the source CRS doesn't match config.crs."""
+def test_prepare_wrong_crs_raises(tiny_gdf, tmp_path):
+    """AssertionError raised when the source CRS doesn't match OgrSource.crs."""
     wrong_crs_gdf = tiny_gdf.to_crs("EPSG:4326")
     src_gpkg = tmp_path / "wrong_crs.gpkg"
     wrong_crs_gdf.to_file(str(src_gpkg), driver="GPKG")
-
     out = tmp_path / "wrong_crs.parquet"
     cfg = DatasetConfig(
         name="bad",
-        source_path=src_gpkg,
+        source=OgrSource(path=src_gpkg, crs="EPSG:27700"),
         parquet_path=out,
-        crs="EPSG:27700",
     )
-
     with pytest.raises(AssertionError, match="EPSG:27700"):
-        prepare_dataset(cfg, force=True)
+        prepare(cfg, force=True)
 
 
-def test_prepare_dataset_geoparquet_version(tiny_gpkg, tmp_path):
-    """prepare_dataset output has GeoParquet 1.1.0 version."""
+def test_prepare_geoparquet_version(tiny_gpkg, tmp_path):
+    """prepare() output has GeoParquet 1.1.0 version."""
     out = tmp_path / "hilbert_27700.parquet"
-    cfg = DatasetConfig(name="hilbert", source_path=tiny_gpkg, parquet_path=out)
-    prepare_dataset(cfg, force=True)
+    cfg = DatasetConfig(
+        name="hilbert", source=OgrSource(path=tiny_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     assert geo["version"] == "1.1.0"
 
 
-def test_prepare_dataset_covering_metadata(tiny_gpkg, tmp_path):
-    """prepare_dataset output has GeoParquet 1.1 bbox covering key."""
+def test_prepare_covering_metadata(tiny_gpkg, tmp_path):
+    """prepare() output has GeoParquet 1.1 bbox covering key."""
     out = tmp_path / "covering_27700.parquet"
-    cfg = DatasetConfig(name="covering", source_path=tiny_gpkg, parquet_path=out)
-    prepare_dataset(cfg, force=True)
+    cfg = DatasetConfig(
+        name="covering", source=OgrSource(path=tiny_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
     assert covering == {
@@ -177,15 +171,14 @@ def test_prepare_dataset_covering_metadata(tiny_gpkg, tmp_path):
     }
 
 
-def test_prepare_dataset_crs_in_metadata(tiny_gpkg, tmp_path):
-    """prepare_dataset patches the CRS into the GeoParquet geometry column metadata."""
+def test_prepare_crs_in_metadata(tiny_gpkg, tmp_path):
+    """prepare() patches the CRS into the GeoParquet geometry column metadata."""
     out = tmp_path / "crs_27700.parquet"
-    cfg = DatasetConfig(name="crs", source_path=tiny_gpkg, parquet_path=out)
-    prepare_dataset(cfg, force=True)
+    cfg = DatasetConfig(name="crs", source=OgrSource(path=tiny_gpkg), parquet_path=out)
+    prepare(cfg, force=True)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
     assert crs_meta is not None, "CRS should be present in geometry column metadata"
-    # PROJJSON for EPSG:27700 should identify as British National Grid
     assert "27700" in str(crs_meta)
 
 
@@ -194,7 +187,7 @@ def test_prepare_dataset_crs_in_metadata(tiny_gpkg, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_dataset_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
+def test_prepare_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
     """RuntimeError propagates when _patch_covering_metadata raises."""
 
     def _always_raise(*a, **kw):
@@ -202,15 +195,15 @@ def test_prepare_dataset_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatc
 
     monkeypatch.setattr(prepare_module, "_patch_covering_metadata", _always_raise)
     out = tmp_path / "fail.parquet"
-    cfg = DatasetConfig(name="fail", source_path=tiny_gpkg, parquet_path=out)
+    cfg = DatasetConfig(name="fail", source=OgrSource(path=tiny_gpkg), parquet_path=out)
     with pytest.raises(
         RuntimeError, match="Failed to patch GeoParquet covering metadata"
     ):
-        prepare_dataset(cfg, force=True)
+        prepare(cfg, force=True)
 
 
 # ---------------------------------------------------------------------------
-# prepare_from_csv tests
+# CsvSource tests
 # ---------------------------------------------------------------------------
 
 
@@ -233,32 +226,38 @@ def tiny_csv(tmp_path):
     return p
 
 
-def test_prepare_from_csv_skips_when_exists(tiny_csv, tmp_path):
-    """prepare_from_csv returns without writing when output exists and force=False."""
+def test_prepare_csv_skips_when_exists(tiny_csv, tmp_path):
+    """prepare() returns without writing when output exists and force=False."""
     out = tmp_path / "csv_out.parquet"
     out.touch()
-    result = prepare_from_csv(tiny_csv, out)
+    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
+    result = prepare(cfg)
     assert result == out
-    assert out.stat().st_size == 0  # untouched
+    assert out.stat().st_size == 0
 
 
-def test_prepare_from_csv_writes_parquet(tiny_csv, tmp_path):
+def test_prepare_csv_writes_parquet(tiny_csv, tmp_path):
     out = tmp_path / "csv_out.parquet"
-    result = prepare_from_csv(tiny_csv, out, row_group_size=5)
+    cfg = DatasetConfig(
+        name="tiny", source=CsvSource(path=tiny_csv, row_group_size=5), parquet_path=out
+    )
+    result = prepare(cfg)
     assert result == out
     assert out.stat().st_size > 0
 
 
-def test_prepare_from_csv_geoparquet_version(tiny_csv, tmp_path):
+def test_prepare_csv_geoparquet_version(tiny_csv, tmp_path):
     out = tmp_path / "csv_version.parquet"
-    prepare_from_csv(tiny_csv, out)
+    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
+    prepare(cfg)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     assert geo["version"] == "1.1.0"
 
 
-def test_prepare_from_csv_covering_metadata(tiny_csv, tmp_path):
+def test_prepare_csv_covering_metadata(tiny_csv, tmp_path):
     out = tmp_path / "csv_covering.parquet"
-    prepare_from_csv(tiny_csv, out)
+    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
+    prepare(cfg)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
     assert covering == {
@@ -269,18 +268,22 @@ def test_prepare_from_csv_covering_metadata(tiny_csv, tmp_path):
     }
 
 
-def test_prepare_from_csv_crs_in_metadata(tiny_csv, tmp_path):
+def test_prepare_csv_crs_in_metadata(tiny_csv, tmp_path):
     out = tmp_path / "csv_crs.parquet"
-    prepare_from_csv(tiny_csv, out, crs="EPSG:27700")
+    cfg = DatasetConfig(
+        name="tiny", source=CsvSource(path=tiny_csv, crs="EPSG:27700"), parquet_path=out
+    )
+    prepare(cfg)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
     assert crs_meta is not None, "CRS should be present in geometry column metadata"
     assert "27700" in str(crs_meta)
 
 
-def test_prepare_from_csv_compression_zstd(tiny_csv, tmp_path):
+def test_prepare_csv_compression_zstd(tiny_csv, tmp_path):
     out = tmp_path / "csv_zstd.parquet"
-    prepare_from_csv(tiny_csv, out)
+    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
+    prepare(cfg)
     rg = pq.ParquetFile(out).metadata.row_group(0)
     for i in range(rg.num_columns):
         col = rg.column(i)
@@ -289,17 +292,27 @@ def test_prepare_from_csv_compression_zstd(tiny_csv, tmp_path):
         )
 
 
-def test_prepare_from_csv_xy_cols_dropped(tiny_csv, tmp_path):
+def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
     """Source X/Y columns must not appear in the output — replaced by 'geometry'."""
     out = tmp_path / "csv_cols.parquet"
-    prepare_from_csv(tiny_csv, out, x_col="Easting", y_col="Northing")
+    cfg = DatasetConfig(
+        name="tiny",
+        source=CsvSource(path=tiny_csv, x_col="Easting", y_col="Northing"),
+        parquet_path=out,
+    )
+    prepare(cfg)
     schema = pq.read_schema(str(out))
     assert "geometry" in schema.names
     assert "Easting" not in schema.names
     assert "Northing" not in schema.names
 
 
-def test_prepare_from_csv_unsupported_geometry_type_raises(tiny_csv, tmp_path):
+def test_prepare_csv_unsupported_geometry_type_raises(tiny_csv, tmp_path):
     out = tmp_path / "csv_bad.parquet"
+    cfg = DatasetConfig(
+        name="tiny",
+        source=CsvSource(path=tiny_csv, geometry_type="polygon"),
+        parquet_path=out,
+    )
     with pytest.raises(NotImplementedError):
-        prepare_from_csv(tiny_csv, out, geometry_type="polygon")
+        prepare(cfg)

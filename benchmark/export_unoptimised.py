@@ -1,4 +1,4 @@
-"""Export plain (unoptimised) Parquet files from GeoPackage sources.
+"""Export plain (unoptimised) Parquet files
 
 Produces one <stem>_unoptimised.parquet per input file.
 
@@ -20,6 +20,9 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("sources", nargs="+", type=pathlib.Path, help="Input .gpkg file(s)")
 parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("output_data"))
+parser.add_argument(
+    "--shuffle", action="store_true", help="Randomise row order before export"
+)
 args = parser.parse_args()
 
 args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -38,13 +41,28 @@ def _geom_col(path: pathlib.Path) -> str:
 
 for src in args.sources:
     out = args.out_dir / f"{src.stem}_unoptimised.parquet"
-    geom = _geom_col(src)
-    print(f"Exporting {src.stem!r} ({geom!r}) → {out} ...")
-    con.execute(f"""
-        COPY (
-            SELECT * EXCLUDE "{geom}", "{geom}" AS geometry
-            FROM st_read('{src}')
-        ) TO '{out}'
-        (FORMAT PARQUET, COMPRESSION ZSTD)
-    """)
+    order_clause = "ORDER BY random()" if args.shuffle else ""
+    if src.suffix.lower() == ".csv":
+        print(f"Exporting {src.stem!r} (CSV) → {out} ...")
+        con.execute(f"""
+            COPY (
+                SELECT * EXCLUDE (Longitude, Latitude),
+                    ST_Point(Longitude::DOUBLE, Latitude::DOUBLE) AS geometry
+                FROM read_csv('{src}')
+                {order_clause}
+            )
+            TO '{out}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+    else:
+        geom = _geom_col(src)
+        print(f"Exporting {src.stem!r} ({geom!r}) → {out} ...")
+        con.execute(f"""
+            COPY (
+                SELECT * EXCLUDE "{geom}", "{geom}" AS geometry
+                FROM st_read('{src}')
+                {order_clause}
+            ) TO '{out}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
     print("  done.")

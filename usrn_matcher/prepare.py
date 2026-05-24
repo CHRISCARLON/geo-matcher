@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pyogrio
 from pyproj import CRS as ProjCRS
 
-from .config import DatasetConfig
+from .config import CsvSource, DatasetConfig, OgrSource, ParquetSource
 from .logger import get_logger
 
 log: logging.Logger = get_logger()
@@ -22,7 +22,6 @@ log: logging.Logger = get_logger()
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
 
 
-# TODO: Add a protcol here as well
 class _CoveringColumn(TypedDict):
     xmin: list[str]
     ymin: list[str]
@@ -109,6 +108,8 @@ def _patch_covering_metadata(
 def _get_src_geometry_col(con: Any, source_path: str) -> str:
     """Return the geometry column name as exposed by DuckDB's ``st_read``.
 
+    This looks directly for "GEOMETRY".
+
     The column name in the output of ``st_read`` is determined by the source
     file's internal metadata (e.g. GeoPackage layers typically expose ``"geom"``
     regardless of the original column name).  This helper queries the schema
@@ -123,51 +124,26 @@ def _get_src_geometry_col(con: Any, source_path: str) -> str:
     raise ValueError(f"No GEOMETRY column found in {source_path!r}")
 
 
-# TODO: We need a more generic dispatch system for preparing files
-def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
-    """Read any spatial dataset and write an optimised GeoParquet 1.1 file.
-
-    The output is spatially sorted by Hilbert curve index, ZSTD-compressed, and
-    includes GeoParquet 1.1 bbox covering columns so SedonaDB can prune row groups
-    during spatial joins.
-
-    Uses DuckDB's ``ST_Hilbert()`` function to compute a Z-order (Hilbert) index
-    from each geometry's centroid within the EPSG:27700 (British National Grid)
-    extent.
-
-    Sorting by this index clusters spatially adjacent features into
-    consecutive row groups, maximising SedonaDB's ability to skip irrelevant row
-    groups when a bbox filter is applied.
-
-    Parameters
-    ----------
-    config:
-        Dataset configuration describing the source file, output path, geometry
-        column name, row group size, and expected CRS.
-    force:
-        If ``True``, re-prepare even if ``config.parquet_path`` already exists.
-        If ``False`` (default), skip preparation when the file is present.
-
-    Returns
-    -------
-    pathlib.Path
-        Path to the written (or already-existing) GeoParquet file.
-    """
-    if not force and config.parquet_path.exists():
+def _prepare_ogr(
+    source: OgrSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    if not force and parquet_path.exists():
         log.info(
             "GeoParquet already exists at %s — skipping. Pass force=True to re-prepare.",
-            config.parquet_path,
+            parquet_path,
         )
-        return config.parquet_path
+        return parquet_path
 
-    config.parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Preparing %s from %s", name, source.path)
 
-    log.info("Preparing %s from %s", config.name, config.source_path)
-
-    # CRS validation — lightweight check before starting the DuckDB pipeline
-    info = pyogrio.read_info(str(config.source_path))
-    assert info["crs"] == config.crs, (
-        f"Expected CRS {config.crs}, got {info['crs']} for {config.source_path}"
+    info = pyogrio.read_info(str(source.path))
+    assert info["crs"] == source.crs, (
+        f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
     )
     feature_count: int = info.get("features", -1)
     log.info(
@@ -179,18 +155,15 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
 
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
+    if threads is not None:
+        con.execute(f"SET threads = {threads};")
 
-    # Discover the geometry column name from the source file.
-    # DuckDB's st_read exposes the column using the file's internal name
-    # (e.g. GeoPackage layers typically use "geom"), which may differ from
-    # config.geometry_column.  We rename it to "geometry" in the SELECT.
-    src_geom: str = _get_src_geometry_col(con, str(config.source_path))
+    src_geom: str = _get_src_geometry_col(con, str(source.path))
     log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
-    log.info("  Hilbert sort + write → %s ...", config.parquet_path)
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
 
     t0 = time.perf_counter()
-
-    # TODO: Need to check if this HilberSort is good enough
+    # SPATIALLY SORT THE GEOPARQUET FILE
     con.execute(f"""
         COPY (
             SELECT
@@ -202,16 +175,18 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
                     'xmax': ST_XMax("{src_geom}"),
                     'ymax': ST_YMax("{src_geom}")
                 }} AS bbox
-            FROM st_read('{config.source_path}')
+            FROM st_read('{source.path}')
             ORDER BY ST_Hilbert("{src_geom}", {_BNG_BOX})
-        ) TO '{config.parquet_path}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {config.row_group_size})
+        ) TO '{parquet_path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
     """)
-    _patch_covering_metadata(config.parquet_path, config.row_group_size, crs=config.crs)
+
+    # NEED TO RE-READ IN THE PARQUET FILE TO PATCH THE COVERING DATA
+    _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
     elapsed = time.perf_counter() - t0
 
-    pq_meta = pq.read_metadata(str(config.parquet_path))
-    file_mb = config.parquet_path.stat().st_size / 1024 / 1024
+    pq_meta = pq.read_metadata(str(parquet_path))
+    file_mb = parquet_path.stat().st_size / 1024 / 1024
     log.info(
         "  Done in %.1fs — %s rows | %d row groups | %.1f MB",
         elapsed,
@@ -219,86 +194,53 @@ def prepare_dataset(config: DatasetConfig, force: bool = False) -> pathlib.Path:
         pq_meta.num_row_groups,
         file_mb,
     )
-    return config.parquet_path
+    return parquet_path
 
 
-def prepare_from_csv(
-    csv_path: str | pathlib.Path,
-    parquet_path: str | pathlib.Path,
-    geometry_type: str = "point",
-    x_col: str = "Easting",
-    y_col: str = "Northing",
-    crs: str = "EPSG:27700",
-    row_group_size: int = 10_000,
-    force: bool = False,
+def _prepare_csv(
+    source: CsvSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
 ) -> pathlib.Path:
-    """Read a CSV and write an optimised GeoParquet 1.1 file.
-
-    Follows the same Hilbert-sort + bbox-covering + ZSTD pipeline as
-    :func:`prepare_dataset`.
-
-    Parameters
-    ----------
-    csv_path:
-        Path to the source CSV file.
-    parquet_path:
-        Destination path for the GeoParquet output.
-    geometry_type:
-        How to build geometries from the CSV. Currently supports ``"point"``
-        (default) — builds point geometries from ``x_col`` / ``y_col``.
-    x_col:
-        Column holding the X / Easting coordinate (``"point"`` only).
-    y_col:
-        Column holding the Y / Northing coordinate (``"point"`` only).
-    crs:
-        Coordinate reference system of the coordinate columns (default EPSG:27700).
-    row_group_size:
-        Row group size for the output GeoParquet.
-    force:
-        Re-prepare even if the output file already exists.
-
-    Returns
-    -------
-    pathlib.Path
-        Path to the written (or already-existing) GeoParquet file.
-    """
-    resolved_parquet: pathlib.Path = pathlib.Path(parquet_path)
-
-    if not force and resolved_parquet.exists():
+    if not force and parquet_path.exists():
         log.info(
             "GeoParquet already exists at %s — skipping. Pass force=True to re-prepare.",
-            resolved_parquet,
+            parquet_path,
         )
-        return resolved_parquet
+        return parquet_path
 
-    resolved_parquet.parent.mkdir(parents=True, exist_ok=True)
-    resolved_csv: pathlib.Path = pathlib.Path(csv_path)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Preparing CSV → GeoParquet: %s", source.path)
 
-    log.info("Preparing CSV → GeoParquet: %s", resolved_csv)
-
-    # Implement the other Geometry types here
-    match geometry_type:
+    match source.geometry_type:
         case "point":
-            log.info("  Geometry: point from (%r, %r) | CRS: %s", x_col, y_col, crs)
+            log.info(
+                "  Geometry: point from (%r, %r) | CRS: %s",
+                source.x_col,
+                source.y_col,
+                source.crs,
+            )
         case _:
             raise NotImplementedError(
-                f"geometry_type={geometry_type!r} is not yet supported. "
+                f"geometry_type={source.geometry_type!r} is not yet supported. "
                 "Currently only 'point' is implemented."
             )
 
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
+    if threads is not None:
+        con.execute(f"SET threads = {threads};")
 
-    # Count rows first so we can report it before the (potentially slow) sort+write.
     _count_row = con.sql(
-        f"SELECT COUNT(*) FROM read_csv('{resolved_csv}', auto_detect=true, nullstr=['NULL', ''])"
+        f"SELECT COUNT(*) FROM read_csv('{source.path}', auto_detect=true, nullstr=['NULL', ''])"
     ).fetchone()
     row_count: int = _count_row[0] if _count_row else 0
     log.info(
-        "  Rows: %s | Hilbert sort + write → %s ...", f"{row_count:,}", resolved_parquet
+        "  Rows: %s | Hilbert sort + write → %s ...", f"{row_count:,}", parquet_path
     )
 
-    # Build point geometries from X/Y columns, sort by Hilbert index, add bbox struct.
     # A subquery materialises the geometry column so ST_Hilbert and the bbox struct
     # can reference it by name without repeating the ST_Point(...) expression.
     t0 = time.perf_counter()
@@ -314,19 +256,19 @@ def prepare_from_csv(
                 }} AS bbox
             FROM (
                 SELECT
-                    * EXCLUDE ("{x_col}", "{y_col}"),
-                    ST_Point("{x_col}", "{y_col}") AS geometry
-                FROM read_csv('{resolved_csv}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
+                    * EXCLUDE ("{source.x_col}", "{source.y_col}"),
+                    ST_Point("{source.x_col}", "{source.y_col}") AS geometry
+                FROM read_csv('{source.path}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
             )
             ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
-        ) TO '{resolved_parquet}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {row_group_size})
+        ) TO '{parquet_path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
     """)
-    _patch_covering_metadata(resolved_parquet, row_group_size, crs=crs)
+    _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
     elapsed = time.perf_counter() - t0
 
-    pq_meta = pq.read_metadata(str(resolved_parquet))
-    file_mb = resolved_parquet.stat().st_size / 1024 / 1024
+    pq_meta = pq.read_metadata(str(parquet_path))
+    file_mb = parquet_path.stat().st_size / 1024 / 1024
     log.info(
         "  Done in %.1fs — %s rows | %d row groups | %.1f MB",
         elapsed,
@@ -334,39 +276,162 @@ def prepare_from_csv(
         pq_meta.num_row_groups,
         file_mb,
     )
-    return resolved_parquet
+    return parquet_path
 
 
-def prepare_usrns(
-    usrn_gpkg: str | pathlib.Path,
-    parquet_path: str | pathlib.Path,
-    force: bool = False,
+def _prepare_parquet(
+    source: ParquetSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
 ) -> pathlib.Path:
-    """Prepare the open USRNs GeoPackage as an optimised GeoParquet 1.1 file.
+    if not force and parquet_path.exists():
+        log.info(
+            "GeoParquet already exists at %s — skipping. Pass force=True to re-prepare.",
+            parquet_path,
+        )
+        return parquet_path
 
-    Convenience wrapper around :func:`prepare_dataset` pre-configured for the
-    OS Open USRN dataset (line geometries, ``row_group_size=20_000``).
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Preparing %s from %s", name, source.path)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    if threads is not None:
+        con.execute(f"SET threads = {threads};")
+
+    pq_src_meta = pq.read_metadata(str(source.path))
+    log.info(
+        "  Source: %s rows | %d row groups | Hilbert sort + write → %s ...",
+        f"{pq_src_meta.num_rows:,}",
+        pq_src_meta.num_row_groups,
+        parquet_path,
+    )
+
+    geom_col = source.geometry_col
+    if source.source_crs is not None:
+        # Native GEOMETRY column in a foreign CRS — reproject to target CRS.
+        # always_xy=true forces lon/lat (x/y) axis order, overriding PROJ 6+'s
+        # official axis order for EPSG:4326 (which is lat/lon). Without this,
+        # DuckDB interprets the first coordinate as latitude, swapping axes and
+        # producing completely wrong output coordinates.
+        geom_expr = f"ST_Transform({geom_col}, '{source.source_crs}', '{source.crs}', always_xy := true)"
+    elif geom_col == "geometry":
+        # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
+        geom_expr = "ST_GeomFromWKB(geometry)"
+    else:
+        # Native GEOMETRY column already in the target CRS (no reprojection needed).
+        geom_expr = geom_col
+
+    # Build the EXCLUDE list for the inner SELECT.
+    # For pipeline files (WKB geometry column) also drop the existing bbox so the
+    # outer query can rebuild it against the recomputed geometry.
+    # For external files, detect and drop all other geometry columns from the source
+    # so DuckDB only sees one geometry column in the output — otherwise it may pick
+    # a different column as the GeoParquet primary column and _patch_covering_metadata
+    # will patch the wrong entry, leaving our geometry with the wrong CRS in metadata.
+    if geom_col == "geometry" and source.source_crs is None:
+        exclude_cols = "geometry, bbox"
+    else:
+        src_describe = con.sql(
+            f"DESCRIBE SELECT * FROM read_parquet('{source.path}')"
+        ).fetchall()
+        src_col_names = {row[0] for row in src_describe}
+        extra_geom_cols = [
+            row[0]
+            for row in src_describe
+            if "GEOMETRY" in row[1].upper() and row[0] != geom_col
+        ]
+        cols_to_exclude = [geom_col] + extra_geom_cols
+        if "bbox" in src_col_names:
+            cols_to_exclude.append("bbox")
+        exclude_cols = ", ".join(f'"{c}"' for c in cols_to_exclude)
+        if extra_geom_cols:
+            log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
+
+    t0 = time.perf_counter()
+    con.execute(f"""
+        COPY (
+            SELECT
+                * EXCLUDE geometry,
+                geometry,
+                {{
+                    'xmin': ST_XMin(geometry),
+                    'ymin': ST_YMin(geometry),
+                    'xmax': ST_XMax(geometry),
+                    'ymax': ST_YMax(geometry)
+                }} AS bbox
+            FROM (
+                SELECT
+                    * EXCLUDE ({exclude_cols}),
+                    {geom_expr} AS geometry
+                FROM read_parquet('{source.path}')
+            )
+            ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
+        ) TO '{parquet_path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
+    """)
+    _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
+    elapsed = time.perf_counter() - t0
+
+    pq_meta = pq.read_metadata(str(parquet_path))
+    file_mb = parquet_path.stat().st_size / 1024 / 1024
+    log.info(
+        "  Done in %.1fs — %s rows | %d row groups | %.1f MB",
+        elapsed,
+        f"{pq_meta.num_rows:,}",
+        pq_meta.num_row_groups,
+        file_mb,
+    )
+    return parquet_path
+
+
+def prepare(
+    config: DatasetConfig,
+    force: bool = False,
+    threads: int | None = None,
+) -> pathlib.Path:
+    """Read a spatial source and write an optimised GeoParquet 1.1 file.
+
+    Dispatches to the correct reader based on ``config.source`` type:
+
+    - ``OgrSource`` — any GDAL-readable vector format (GeoPackage, Shapefile, …)
+    - ``CsvSource`` — CSV with explicit x/y coordinate columns
+    - ``ParquetSource`` — existing GeoParquet to re-sort and re-compress
+
+    A ``config.source`` must always be provided.
+
+    The output is always Hilbert-sorted, ZSTD-compressed GeoParquet 1.1 with
+    bbox covering columns for SedonaDB row-group pruning.
 
     Parameters
     ----------
-    usrn_gpkg:
-        Path to the OS Open USRN GeoPackage.
-    parquet_path:
-        Destination path for the GeoParquet output.
+    config:
+        Dataset configuration. The ``source`` field drives dispatch; all other
+        fields describe the output (name, parquet_path, columns).
     force:
-        Re-prepare even if the output file already exists.
+        If ``True``, re-prepare even if ``config.parquet_path`` already exists.
+    threads:
+        Number of DuckDB threads to use. ``None`` lets DuckDB use all available
+        cores (default). Set to a lower value to reduce CPU pressure.
 
     Returns
     -------
     pathlib.Path
-        Path to the written GeoParquet file.
+        Path to the written (or already-existing) GeoParquet file.
     """
-    config: DatasetConfig = DatasetConfig(
-        name="usrns",
-        source_path=pathlib.Path(usrn_gpkg),
-        parquet_path=pathlib.Path(parquet_path),
-        columns=[],
-        geometry_column="geometry",
-        row_group_size=20_000,
-    )
-    return prepare_dataset(config, force=force)
+    if config.source is None:
+        raise ValueError(
+            "DatasetConfig.source must be set. "
+            "Use DatasetConfig(source=OgrSource(...)), CsvSource(...), or ParquetSource(...)."
+        )
+    match config.source:
+        case OgrSource() as src:
+            return _prepare_ogr(src, config.parquet_path, config.name, force, threads)
+        case CsvSource() as src:
+            return _prepare_csv(src, config.parquet_path, config.name, force, threads)
+        case ParquetSource() as src:
+            return _prepare_parquet(
+                src, config.parquet_path, config.name, force, threads
+            )

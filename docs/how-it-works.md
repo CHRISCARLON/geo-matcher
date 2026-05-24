@@ -1,94 +1,39 @@
 # How it works
 
-## Pre-spatial phase (prepare)
+## Prepare phase
 
-Each source file is converted to an optimised GeoParquet 1.1 file in `output_data/`. Run once, then query as many times as you like.
+Source files are converted to optimised GeoParquet 1.1 in `output_data/`. Run once.
 
-**DuckDB pipeline** — For GeoPackage/Shapefile sources, `ST_Read()` reads the file natively. For CSV sources, `read_csv()` ingests the file and `ST_Point()` builds point geometries from the X/Y columns. DuckDB then sorts, computes the bbox struct, and writes the Parquet file in a single `COPY ... TO ... (FORMAT PARQUET)` statement. A lightweight PyArrow post-processing step patches the GeoParquet 1.1 metadata (covering key, CRS PROJJSON) into the file footer.
+**DuckDB pipeline** — `ST_Read()` ingests GeoPackage/shapefile sources; `read_csv()` + `ST_Point()` builds point geometries from CSV coordinate columns. DuckDB sorts, computes the bbox struct, and writes the Parquet file in a single `COPY TO PARQUET` statement. A PyArrow post-processing step patches the GeoParquet 1.1 covering metadata into the file footer.
 
-**Spatial sort** — Geometries are sorted by a Hilbert curve key computed from each feature's centroid within the British National Grid extent (EPSG:27700) using `ST_Hilbert(geom, BOX_2D)`. Sorting by this key clusters spatially adjacent features into consecutive row groups, maximising SedonaDB's ability to skip row groups during spatial joins.
+**Hilbert sort** — Geometries are sorted by a Hilbert curve key computed from each feature's centroid within the BNG extent (`ST_Hilbert(geom, BOX_2D)`). This clusters spatially adjacent features into consecutive row groups, maximising row-group pruning during joins.
 
-**Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups across 1.76M rows); polygon datasets default to `10,000`. More row groups means more opportunities for SedonaDB to skip irrelevant data.
+**bbox covering columns** — A `bbox` struct column (`xmin/ymin/xmax/ymax`) is written to every row. Parquet records min/max statistics for these floats in the file footer at the row-group level. The GeoParquet 1.1 `covering` key in the geo metadata points at these columns so both DuckDB and SedonaDB can skip row groups without reading any geometry bytes.
 
-**GeoParquet 1.1 bbox covering columns** — A `bbox` struct column (`xmin`, `ymin`, `xmax`, `ymax`) is added to every row. Parquet writes min/max statistics on these floats into the file footer at the row group level. The geo metadata is patched with a `covering` key:
-
-```json
-"covering": {
-  "bbox": {
-    "xmin": ["bbox", "xmin"],
-    "ymin": ["bbox", "ymin"],
-    "xmax": ["bbox", "xmax"],
-    "ymax": ["bbox", "ymax"]
-  }
-}
-```
-
-SedonaDB reads this and calls `access_plan.skip(i)` for any row group whose bbox doesn't overlap the query region — before reading a single geometry byte. For a Leeds query, 858/979 USRN row groups are skipped (88% pruning, ~162 MB → 20 MB scanned).
-
-Two parquet optimisations are in play:
-
-**Predicate pushdown** — The bbox covering columns enable row group skipping. SedonaDB checks the `xmin/ymin/xmax/ymax` min/max statistics in the file footer for each row group and skips any group whose bbox doesn't overlap the query. No WKB bytes are read for skipped row groups.
-
-**Projection pushdown** — Because parquet is columnar, selecting only `usrn`, `street_type`, `geometry` and the chosen RHS columns means the reader fetches only those column chunks from disk. Every column not selected is never touched.
-
-**ZSTD compression** — All columns compressed with ZSTD; low-cardinality string columns use `RLE_DICTIONARY` encoding automatically.
+**Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups for 1.76M rows); other datasets default to `10,000`. More row groups means more pruning opportunities.
 
 ---
 
-## Spatial phase (match)
+## Match phase
 
-**Two-phase spatial join (R-tree + refinement)**
+**Why bbox struct predicates, not `ST_Intersects`** — `ST_Intersects` is a geometry computation; DataFusion cannot push it to parquet row-group statistics. Scalar `bbox.xmin <= X` predicates ARE pushed to parquet column min/max statistics, skipping entire row groups before a single geometry byte is read.
 
-SedonaDB executes each join in two phases:
+**Filtered joins (bbox / city)** — Both the USRN and RHS parquets are registered as Sedona/DataFusion views. A single SQL query runs with bbox struct predicates on both `u.bbox.*` and `s.bbox.*` pushed down to parquet column statistics on both sides.
 
-1. **Index phase** — An R-tree built with Hilbert curve ordering finds candidate geometry pairs from their bounding rectangles, without touching WKB bytes.
-2. **Refinement phase** — The exact spatial predicate (`ST_Intersects` or `ST_DWithin`) is evaluated only on candidates.
+**National joins (no bbox)** — The RHS parquet is registered as a persistent Sedona view once. USRN row groups are split into batches via PyArrow. For each batch: the USRN rows are loaded into memory, the batch's spatial envelope is derived from the parquet row-group statistics, and that envelope is passed as the SQL `{spatial_filter}`. DataFusion prunes the persistent RHS scan to matching row groups at query time — no RHS data is ever loaded into Python. Each USRN appears in exactly one batch, so there are no duplicate (usrn, rhs) pairs.
 
-**Build/probe side assignment**
+**Join types:**
 
-Sedona automatically assigns the smaller table to the build side (R-tree index) and the larger to the probe side, based on cardinality estimates (`should_swap_join_order` in `physical_planner.rs`). For stops (434K) vs USRNs (1.76M): stops = build, USRNs = probe.
-
-**Speculative execution mode**
-
-Sedona's default `execution_mode` is `Speculative(N)`. It samples the first N probe-side geometries at runtime and picks the best refinement strategy:
-
-- `prepare_build` — lazily creates GEOS `PreparedGeometry` objects for build-side geometries on first use, caching them for reuse across all probe comparisons. Worth it for complex polygons.
-- `prepare_probe` — prepares probe-side geometries instead. Better when the probe side has complex geometry.
-- `prepare_none` — no prepared geometries. Optimal for simple geometry types like points.
-
-In practice, Speculative sometimes chooses `prepare_none` (`execution_mode=0`) for point datasets (e.g. Naptan Nodes).
-
-**Geometry modes**
-
-The `--geometry` flag controls whether geometry is returned and which geometry it is. The default is `none` (attribute-only — fastest, no geometry serialisation overhead):
-
-| Mode | SQL expression | Notes |
+| Mode | Predicate | Use for |
 |---|---|---|
-| `none` (default) | — | No geometry column in output |
-| `usrn` | `ST_AsWKB(u.geometry)` / `ST_Intersection(u.geometry, bbox)` | Full USRN linestring; clipped to bbox if supplied |
-| `clip` (intersect only) | `ST_Intersection(u.geometry, s.geometry)` | Segment of the USRN inside the RHS polygon; also clipped to bbox if supplied. A USRN crossing three polygons produces three rows each with only the segment inside that polygon |
-| `rhs` | `ST_AsWKB(s.geometry)` | Full unclipped RHS feature geometry — required for DTF export |
+| `intersect` | `ST_Intersects(u.geometry, s.geometry)` | Polygons, lines |
+| `nearest` | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
+| `line` | `ST_DWithin` + intersection-preference post-filter when `--rhs-id-col` is set | Linestrings |
+
+**Geometry modes** — `--geometry none` (default) is attribute-only and fastest. `usrn` returns the USRN linestring; `clip` returns `ST_Intersection(usrn, rhs_polygon)`; `rhs` returns the matched RHS feature geometry (required for DTF export).
 
 ---
 
 ## DTF export phase
 
-The DTF GeoParquet output uses the same DuckDB pipeline as the prepare phase. `_build_dtf_table` constructs a pure PyArrow table with the type 70 fixed fields, RHS attribute columns, and a WKB `geometry` column — no GeoDataFrame involved. That table is registered directly in DuckDB memory (no temp file).
-
-DuckDB then computes the inline `bbox` struct, Hilbert-sorts the rows, and writes the GeoParquet file via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1 with the covering key and CRS PROJJSON.
-
-**DuckDB ↔ PyArrow zero-copy registration**
-
-Both the sort and write steps use `con.register("name", arrow_table)` to hand an in-memory PyArrow table to DuckDB without copying or serialising it. DuckDB reads the Arrow columnar buffers in place and the registered name becomes a virtual table in any subsequent SQL:
-
-```python
-con = duckdb.connect()
-con.execute("LOAD spatial;")
-con.register("_dtf_src", arrow_table)   # pa.Table — no copy, no file
-
-con.sql("SELECT ST_Hilbert(ST_GeomFromWKB(rhs_geometry), ...) FROM _dtf_src")
-```
-
-The geometry column is stored as `pa.binary()` (raw WKB bytes). DuckDB sees it as a `BLOB`, so `ST_GeomFromWKB()` deserialises it into DuckDB's internal `GEOMETRY` type on the fly. This means spatial functions (`ST_Hilbert`, `ST_XMin`, etc.) work directly on data that lives in Python memory, with no round-trip to disk.
-
-This is DuckDB's "replacement scan" feature — registered Python objects (Arrow tables, Pandas DataFrames, NumPy arrays) are substituted into the query plan as virtual tables. It works because DuckDB and PyArrow share the Arrow columnar memory layout.
+`_build_dtf_table` constructs a PyArrow table with type 70 fixed fields, RHS attribute columns, and a WKB geometry column. That table is registered directly in DuckDB memory via `con.register()` — no temp file, no copy (DuckDB reads Arrow columnar buffers in place via its replacement scan feature). DuckDB then computes inline bbox struct, Hilbert-sorts, and writes GeoParquet via `COPY TO PARQUET`. The same `_patch_covering_metadata` step upgrades the file to GeoParquet 1.1.

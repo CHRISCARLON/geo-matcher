@@ -16,7 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from usrn_matcher import DatasetConfig, DTFConfig, UsrnMatcher
+from usrn_matcher import CsvSource, DatasetConfig, DTFConfig, OgrSource, UsrnMatcher
 from usrn_matcher.bboxes import LEEDS
 from usrn_matcher.dtf import (
     to_dtf_csv,
@@ -24,7 +24,7 @@ from usrn_matcher.dtf import (
     to_dtf_geoparquet,
     to_dtf_gpkg,
 )
-from usrn_matcher.prepare import prepare_dataset, prepare_from_csv, prepare_usrns
+from usrn_matcher.prepare import prepare
 
 pytestmark = pytest.mark.integration
 
@@ -59,7 +59,13 @@ def cache_dir(tmp_path_factory) -> pathlib.Path:
 def usrn_parquet(cache_dir) -> pathlib.Path:
     _skip_if_missing(USRN_GPKG)
     out = cache_dir / "usrns_27700.parquet"
-    prepare_usrns(USRN_GPKG, out)
+    prepare(
+        DatasetConfig(
+            name="usrns",
+            source=OgrSource(path=USRN_GPKG, row_group_size=20_000),
+            parquet_path=out,
+        )
+    )
     return out
 
 
@@ -68,10 +74,10 @@ def soil_parquet(cache_dir) -> pathlib.Path:
     _skip_if_missing(SOIL_GPKG)
     cfg = DatasetConfig(
         name="soil",
-        source_path=SOIL_GPKG,
+        source=OgrSource(path=SOIL_GPKG),
         parquet_path=cache_dir / "soil_27700.parquet",
     )
-    prepare_dataset(cfg)
+    prepare(cfg)
     return cfg.parquet_path
 
 
@@ -79,11 +85,12 @@ def soil_parquet(cache_dir) -> pathlib.Path:
 def stops_parquet(cache_dir) -> pathlib.Path:
     _skip_if_missing(STOPS_CSV)
     out = cache_dir / "stops_27700.parquet"
-    prepare_from_csv(
-        csv_path=STOPS_CSV,
-        parquet_path=out,
-        x_col="Easting",
-        y_col="Northing",
+    prepare(
+        DatasetConfig(
+            name="stops",
+            source=CsvSource(path=STOPS_CSV, x_col="Easting", y_col="Northing"),
+            parquet_path=out,
+        )
     )
     return out
 
@@ -126,7 +133,14 @@ def test_prepare_usrns_writes_geoparquet(usrn_parquet):
 @pytest.mark.integration
 def test_prepare_usrns_is_idempotent(usrn_parquet):
     """Second call with force=False must skip and return the same path."""
-    result = prepare_usrns(USRN_GPKG, usrn_parquet, force=False)
+    result = prepare(
+        DatasetConfig(
+            name="usrns",
+            source=OgrSource(path=USRN_GPKG, row_group_size=20_000),
+            parquet_path=usrn_parquet,
+        ),
+        force=False,
+    )
     assert result == usrn_parquet
 
 
@@ -240,29 +254,31 @@ def test_nearest_join_include_rhs_geometry(stops_matcher):
 
 
 # ---------------------------------------------------------------------------
-# Batched execution (usrn_batches > 1)
+# n_chunks has no effect on bbox joins (always FilteredMode)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-def test_intersect_batched_matches_unbatched(soil_matcher):
-    single = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
-    batched = soil_matcher.match_dispatch("intersect", bbox=LEEDS, usrn_batches=4)
-    assert len(batched) == len(single)
-    assert sorted(batched.column("usrn").to_pylist()) == sorted(
-        single.column("usrn").to_pylist()
+def test_intersect_small_chunk_matches_default(soil_matcher):
+    """n_chunks is ignored for bbox joins — both calls produce identical results."""
+    default = soil_matcher.match_dispatch("intersect", bbox=LEEDS)
+    small_chunk = soil_matcher.match_dispatch("intersect", bbox=LEEDS, n_chunks=4)
+    assert len(small_chunk) == len(default)
+    assert sorted(small_chunk.column("usrn").to_pylist()) == sorted(
+        default.column("usrn").to_pylist()
     )
 
 
 @pytest.mark.integration
-def test_nearest_batched_matches_unbatched(stops_matcher):
-    single = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
-    batched = stops_matcher.match_dispatch(
-        "nearest", bbox=LEEDS, distance_m=50, usrn_batches=4
+def test_nearest_small_chunk_matches_default(stops_matcher):
+    """n_chunks is ignored for bbox joins — both calls produce identical results."""
+    default = stops_matcher.match_dispatch("nearest", bbox=LEEDS, distance_m=50)
+    small_chunk = stops_matcher.match_dispatch(
+        "nearest", bbox=LEEDS, distance_m=50, n_chunks=4
     )
-    assert len(batched) == len(single)
-    assert sorted(batched.column("usrn").to_pylist()) == sorted(
-        single.column("usrn").to_pylist()
+    assert len(small_chunk) == len(default)
+    assert sorted(small_chunk.column("usrn").to_pylist()) == sorted(
+        default.column("usrn").to_pylist()
     )
 
 
@@ -390,7 +406,13 @@ def test_cli_prepare_and_match(tmp_path, monkeypatch):
     matched_dir.mkdir()
 
     # -- prepare USRNs --
-    prepare_usrns(USRN_GPKG, cache_dir / "usrns_27700.parquet")
+    prepare(
+        DatasetConfig(
+            name="usrns",
+            source=OgrSource(path=USRN_GPKG, row_group_size=20_000),
+            parquet_path=cache_dir / "usrns_27700.parquet",
+        )
+    )
 
     # -- prepare RHS via CLI --
     monkeypatch.setattr(
@@ -467,7 +489,13 @@ def test_cli_prepare_csv_and_match_nearest(tmp_path, monkeypatch):
     UsrnMatcher.cli()
 
     # also need USRNs prepared for the match step
-    prepare_usrns(USRN_GPKG, cache_dir / "usrns_27700.parquet")
+    prepare(
+        DatasetConfig(
+            name="usrns",
+            source=OgrSource(path=USRN_GPKG, row_group_size=20_000),
+            parquet_path=cache_dir / "usrns_27700.parquet",
+        )
+    )
 
     # -- match nearest --
     bbox = [str(x) for x in LEEDS]

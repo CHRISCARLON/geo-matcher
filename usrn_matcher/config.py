@@ -1,9 +1,54 @@
 import pathlib
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TypeAlias
 
 BBox: TypeAlias = Sequence[float]
+
+
+@dataclass(frozen=True)
+class OgrSource:
+    """Any GDAL-readable vector format (GeoPackage, Shapefile, etc.)."""
+
+    path: pathlib.Path
+    crs: str = "EPSG:27700"
+    row_group_size: int = 10_000
+
+
+@dataclass(frozen=True)
+class CsvSource:
+    """CSV file with explicit x/y coordinate columns."""
+
+    path: pathlib.Path
+    x_col: str = "Easting"
+    y_col: str = "Northing"
+    geometry_type: str = "point"
+    crs: str = "EPSG:27700"
+    row_group_size: int = 10_000
+
+
+@dataclass(frozen=True)
+class ParquetSource:
+    """Existing GeoParquet (or any geometry-bearing Parquet) to re-sort and re-compress.
+
+    For files produced by this pipeline the geometry column is always named
+    ``"geometry"`` and stored as WKB — the defaults handle that automatically.
+
+    For external Parquet files where the geometry column has a different name or
+    is stored as a native GEOMETRY type (e.g. ``GEOMETRY('OGC:CRS84')``), set
+    ``geometry_col`` to the source column name and ``source_crs`` to the CRS of
+    that column; the prepare step will transform to ``crs`` (EPSG:27700).
+    """
+
+    path: pathlib.Path
+    crs: str = "EPSG:27700"
+    row_group_size: int = 10_000
+    geometry_col: str = "geometry"
+    source_crs: str | None = None
+
+
+AnySource: TypeAlias = OgrSource | CsvSource | ParquetSource
 
 DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
 DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")
@@ -22,8 +67,13 @@ class DatasetConfig:
         must not start with a digit). E.g. ``"soil"``, ``"highways"``,
         ``"flood_risk"``.
     source_path:
-        Path to the source file (GeoPackage, Shapefile, or anything geopandas
-        can read with pyogrio).
+        Path to the source file. Mutually optional with ``source`` — provide
+        one or the other. Kept for backward compatibility; prefer ``source``.
+    source:
+        Typed source descriptor (``OgrSource``, ``CsvSource``, or
+        ``ParquetSource``). When provided, ``source_path`` is derived from
+        ``source.path`` if not given explicitly. The ``prepare()`` function
+        dispatches on this type to choose the correct reader.
     parquet_path:
         Where the prepared GeoParquet file is written/cached. Defaults to
         ``output_data/{name}_27700.parquet``.
@@ -32,20 +82,20 @@ class DatasetConfig:
         means all columns (excluding ``geometry`` and the internal ``bbox``
         covering column) are selected automatically.
     geometry_column:
-        Name of the geometry column in the source file. Set to ``"SHAPE"`` for
-        datasets that use a non-standard name. The column is renamed to
-        ``"geometry"`` during preparation.
+        Name of the geometry column in the source file. Kept for backward
+        compatibility — the prepare pipeline auto-detects this via DuckDB.
     row_group_size:
-        Row group size when writing GeoParquet. Smaller values give finer
-        spatial pruning but a larger file footer. ``10_000`` suits polygon
-        datasets; ``20_000`` suits line datasets with many rows.
+        Row group size when writing GeoParquet. Kept for backward compatibility
+        — prefer setting this on the ``source`` struct instead.
     crs:
         Expected CRS as an EPSG string. This is an assertion — reprojection is
-        NOT performed. Defaults to ``"EPSG:27700"`` (British National Grid).
+        NOT performed. Kept for backward compatibility — prefer setting this on
+        the ``source`` struct. Defaults to ``"EPSG:27700"`` (British National Grid).
     """
 
     name: str
     source_path: pathlib.Path
+    source: AnySource | None
     parquet_path: pathlib.Path
     columns: list[str]
     geometry_column: str
@@ -55,20 +105,26 @@ class DatasetConfig:
     def __init__(
         self,
         name: str,
-        source_path: str | pathlib.Path,
+        source_path: str | pathlib.Path | None = None,
         parquet_path: str | pathlib.Path | None = None,
         columns: list[str] | None = None,
         geometry_column: str = "geometry",
         row_group_size: int = 10_000,
         crs: str = "EPSG:27700",
+        source: AnySource | None = None,
     ) -> None:
+        if source_path is None and source is None:
+            raise ValueError("Provide either source_path or source.")
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
             raise ValueError(
                 f"DatasetConfig.name {name!r} must be a valid SQL identifier "
                 "(letters, digits, underscores; must not start with a digit)."
             )
+        self.source = source
+        self.source_path = pathlib.Path(
+            source_path if source_path is not None else source.path  # type: ignore[union-attr]
+        )
         self.name = name
-        self.source_path = pathlib.Path(source_path)
         self.parquet_path = (
             pathlib.Path(parquet_path)
             if parquet_path is not None
@@ -83,6 +139,7 @@ class DatasetConfig:
         return (
             f"DatasetConfig("
             f"name={self.name!r}, "
+            f"source={self.source!r}, "
             f"source_path={self.source_path!r}, "
             f"parquet_path={self.parquet_path!r}, "
             f"columns={self.columns!r}, "
@@ -96,6 +153,7 @@ class DatasetConfig:
             return NotImplemented
         return (
             self.name == other.name
+            and self.source == other.source
             and self.source_path == other.source_path
             and self.parquet_path == other.parquet_path
             and self.columns == other.columns
