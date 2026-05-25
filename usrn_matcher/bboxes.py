@@ -23,6 +23,12 @@ MANCHESTER_CITY_CENTRE: list[int] = [
     388000,
     402000,
 ]  # Manchester city centre
+MANCHESTER_PICCADILLY: list[int] = [
+    383300,
+    397000,
+    384300,
+    397800,
+]  # ~1km² test area around Piccadilly Gardens
 BIRMINGHAM: list[int] = [396000, 272000, 420000, 296000]  # Birmingham
 LIVERPOOL: list[int] = [333000, 382000, 350000, 399000]  # Liverpool
 SHEFFIELD: list[int] = [426000, 379000, 451000, 410000]  # Sheffield

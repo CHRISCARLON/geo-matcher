@@ -134,6 +134,9 @@ def _bbox_col_indices(pf: pq.ParquetFile) -> dict[str, int]:
     path_to_idx = {
         first_rg.column(i).path_in_schema: i for i in range(first_rg.num_columns)
     }
+    log.debug("_bbox_col_indices")
+    log.debug(first_rg)
+    log.debug(path_to_idx)
     return {f: path_to_idx[f"bbox.{f}"] for f in ("xmin", "ymin", "xmax", "ymax")}
 
 
@@ -142,6 +145,8 @@ def _slice_envelope(
 ) -> BBox:
     """Derive the spatial envelope of a set of row groups from their column statistics."""
     rgs = [pf.metadata.row_group(i) for i in rg_slice]
+    log.debug("_slice_envelope")
+    log.debug(rgs)
     return (
         min(rg.column(bbox_idx["xmin"]).statistics.min for rg in rgs),
         min(rg.column(bbox_idx["ymin"]).statistics.min for rg in rgs),
@@ -403,7 +408,7 @@ def _national_single_phase(
             query = query_template.format(spatial_filter=spatial_filter)
             if explain and i == 0:
                 log_plan(sd, query)
-            result = cast(pa.Table, sd.sql(query).to_arrow_table())
+            result = _normalise_arrow(cast(pa.Table, sd.sql(query).to_arrow_table()))
             if len(result):
                 if writer is None:
                     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1217,8 +1222,8 @@ def _bbox_pruner(bbox: BBox) -> str:
     Called by ``execute_join`` as the ``filter_fn`` for intersect-style joins.
     """
     xmin, ymin, xmax, ymax = bbox
-    wkt = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
-    bbox_geom = f"ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700)"
+    polygon_wkt = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
+    bbox_geom = f"ST_SetSRID(ST_GeomFromWKT('{polygon_wkt}'), 27700)"
     return (
         f"AND ST_Intersects(u.geometry, {bbox_geom})"
         f" AND ST_Intersects(s.geometry, {bbox_geom})"
