@@ -184,6 +184,7 @@ def _normalise_arrow(table: pa.Table) -> pa.Table:
 # ---------------------------------------------------------------------------
 
 
+# TODO: bring into a single dispatch method again
 def execute_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -340,7 +341,7 @@ def execute_line_join(
 
 
 # ---------------------------------------------------------------------------
-# NationalMode executors (stream RHS chunks to output_path)
+# Phased executors
 # ---------------------------------------------------------------------------
 
 
@@ -385,9 +386,9 @@ def _national_single_phase(
 
     writer: pq.ParquetWriter | None = None
     try:
-        for i, rhs_slice in enumerate(slices):
-            chunk = rhs_pf.read_row_groups(rhs_slice)
-            envelope = _slice_envelope(rhs_pf, rhs_slice, bbox_idx)
+        for i, phase2_rhs_slice in enumerate(slices):
+            chunk = rhs_pf.read_row_groups(phase2_rhs_slice)
+            envelope = _slice_envelope(rhs_pf, phase2_rhs_slice, bbox_idx)
 
             non_geom = ", ".join(
                 f'"{c}"' for c in chunk.schema.names if c != "geometry"
@@ -418,7 +419,7 @@ def _national_single_phase(
                     "Chunk %d/%d (%d rhs rgs): %d matches",
                     i + 1,
                     len(slices),
-                    len(rhs_slice),
+                    len(phase2_rhs_slice),
                     len(result),
                 )
     finally:
@@ -473,13 +474,16 @@ def _national_three_phase(
 
     writer: pq.ParquetWriter | None = None
     try:
-        for i, rhs_slice in enumerate(slices):
+        for i, phase2_rhs_slice in enumerate(slices):
             log.debug(
-                "── Chunk %d/%d (row groups %s) ──", i + 1, len(slices), rhs_slice
+                "── Chunk %d/%d (row groups %s) ──",
+                i + 1,
+                len(slices),
+                phase2_rhs_slice,
             )
 
-            chunk = rhs_pf.read_row_groups(rhs_slice)
-            envelope = _slice_envelope(rhs_pf, rhs_slice, bbox_idx)
+            chunk = rhs_pf.read_row_groups(phase2_rhs_slice)
+            envelope = _slice_envelope(rhs_pf, phase2_rhs_slice, bbox_idx)
             xmin, ymin, xmax, ymax = envelope
 
             non_geom = ", ".join(
@@ -623,7 +627,7 @@ def _national_three_phase(
                 "Chunk %d/%d (%d rhs rgs): %d intersect + %d proximity + %d nearest",
                 i + 1,
                 len(slices),
-                len(rhs_slice),
+                len(phase2_rhs_slice),
                 n_intersect,
                 n_proximity,
                 n_nearest,
@@ -631,6 +635,233 @@ def _national_three_phase(
     finally:
         if writer:
             writer.close()
+
+
+def _filtered_three_phase(
+    sd: SedonaContext,
+    usrn_parquet: pathlib.Path,
+    rhs_parquet: pathlib.Path,
+    rhs_view: str,
+    intersect_template: str,
+    phase2_template: str,
+    phase3_template: str,
+    id_col: str,
+    max_d: float,
+    bbox: BBox,
+    explain: bool,
+    overlap_threshold: float,
+    usrn_line_parquet: pathlib.Path,
+) -> pa.Table:
+    """Three-phase FilteredMode executor for ``line`` joins — two USRN files, city bbox.
+
+    Phase 1 — ``ST_Intersects`` against ``usrns`` with exact bbox prune; all
+    touching pairs kept; ``_compute_overlap`` adds ``overlap_length_pct`` and
+    ``match_phase=1``.
+
+    Phase 2 — ``ST_Intersects`` against ``usrns_line`` with (buffered corridors) for
+    unmatched RHS features only. The unmatched set is computed in Python (set
+    lookup). Unmatched rows are chunked (5 000 rows) so each sub-query has a tight USRN
+    spatial filter. ``_overlap_post_filter`` keeps the best-corridor USRN(s) per
+    RHS feature and appends ``match_phase=2``.
+
+    Phase 3 — ``ST_DWithin`` against ``usrns`` for features still unmatched after
+    Phase 2. ``_phase3_nearest_dedup`` picks the single closest USRN per feature
+    and appends ``match_phase=3``.
+    """
+
+    # Accumulated results — one list per phase
+    phase1_parts: list[pa.Table] = []
+    phase2_parts: list[pa.Table] = []
+    phase3_parts: list[pa.Table] = []
+
+    # Read files in as views
+    sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
+    sd.read_parquet(str(usrn_line_parquet)).to_view("usrns_line", overwrite=True)
+    sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
+
+    # Phase 1: exact ST_Intersects with standard bbox prune (no expansion)
+    phase1_filter = _bbox_pruner(bbox)
+    log.debug("Phase 1 template (before filter):\n%s", intersect_template)
+
+    intersect_query = intersect_template.format(spatial_filter=phase1_filter)
+    log.debug("Phase 1 query (after filter):\n%s", intersect_query)
+
+    if explain:
+        log_plan(sd, intersect_query)
+    intersect_result = _compute_overlap(
+        _normalise_arrow(cast(pa.Table, sd.sql(intersect_query).to_arrow_table())),
+        max_d,
+    )
+    log.info("Phase 1: %d intersect matches", len(intersect_result))
+
+    # If there's stuff to collect put it in phase1 list
+    if len(intersect_result):
+        phase1_parts.append(intersect_result)
+
+    # Phase 2: load expanded-bbox RHS slice into Python, drop Phase 1 matched IDs from data,
+    # Reload in the same data as phase 1 but slightly expanded bbox
+    xmin, ymin, xmax, ymax = bbox
+    ex = max_d
+    phase2_rhs_slice: pa.Table = pq.read_table(
+        str(rhs_parquet),
+        filters=(
+            (pc.field("bbox", "xmax") >= xmin - ex)
+            & (pc.field("bbox", "xmin") <= xmax + ex)
+            & (pc.field("bbox", "ymax") >= ymin - ex)
+            & (pc.field("bbox", "ymin") <= ymax + ex)
+        ),
+    )
+    log.info("Phase 2 RHS slice: %d rows loaded", len(phase2_rhs_slice))
+
+    if phase1_parts:
+        # Remove phase 1 matches from phase 2 slice
+        matched_ids: set = set(intersect_result.column(id_col).to_pylist())
+        log.debug(f"Matched IDs from Phase 1: {matched_ids}")
+        phase2_rhs_slice = phase2_rhs_slice.filter(
+            pa.array(
+                [
+                    rhs_id not in matched_ids
+                    for rhs_id in phase2_rhs_slice.column(id_col).to_pylist()
+                ]
+            )
+        )
+        log.info(
+            "Phase 2 unmatched RHS rows after dropping intersect matches: %d",
+            len(phase2_rhs_slice),
+        )
+
+    if len(phase2_rhs_slice):
+        # Chunk the unmatched phase 2 RHS so each sub-query sees only the USRN row groups
+        # that overlap that small area — avoids scanning whole area again.
+        _ROWS_PER_CHUNK = 5_000
+        n_chunks = max(
+            1, (len(phase2_rhs_slice) + _ROWS_PER_CHUNK - 1) // _ROWS_PER_CHUNK
+        )
+        non_geom = ", ".join(
+            f'"{c}"' for c in phase2_rhs_slice.schema.names if c != "geometry"
+        )
+        log.info(
+            "Phase 2 ST_Intersects (buffered): %d unmatched rows → %d chunks",
+            len(phase2_rhs_slice),
+            n_chunks,
+        )
+
+        for i in range(n_chunks):
+            sub = phase2_rhs_slice.slice(i * _ROWS_PER_CHUNK, _ROWS_PER_CHUNK)
+            if not len(sub):
+                continue
+
+            # Derive sub-chunk spatial envelope from the bbox struct column
+            bbox_col = sub.column("bbox")
+            xmin_c = pc.min(pc.struct_field(bbox_col, "xmin")).as_py()
+            ymin_c = pc.min(pc.struct_field(bbox_col, "ymin")).as_py()
+            xmax_c = pc.max(pc.struct_field(bbox_col, "xmax")).as_py()
+            ymax_c = pc.max(pc.struct_field(bbox_col, "ymax")).as_py()
+
+            sd.create_data_frame(sub).to_view("rhs_raw", overwrite=True)
+            sd.sql(
+                f"SELECT {non_geom},"
+                f" ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM rhs_raw"
+            ).to_view(rhs_view, overwrite=True)
+
+            # Exact sub-chunk envelope — buffered geometry already covers the corridor
+            wkt = (
+                f"POLYGON(({xmin_c} {ymin_c},{xmax_c} {ymin_c},"
+                f"{xmax_c} {ymax_c},{xmin_c} {ymax_c},{xmin_c} {ymin_c}))"
+            )
+            usrn_filter = f"AND ST_Intersects(u.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
+            phase2_query = phase2_template.format(spatial_filter=usrn_filter)
+            if explain and i == 0:
+                log_plan(sd, phase2_query)
+
+            phase2_result = _normalise_arrow(
+                cast(pa.Table, sd.sql(phase2_query).to_arrow_table())
+            )
+            log.debug(
+                "Phase 2 chunk %d/%d (%d rows): %d candidates",
+                i + 1,
+                n_chunks,
+                len(sub),
+                len(phase2_result),
+            )
+            if len(phase2_result):
+                filtered = _overlap_post_filter(
+                    phase2_result, id_col, max_d, overlap_threshold
+                )
+                if len(filtered):
+                    phase2_parts.append(filtered)
+
+    if phase2_parts:
+        phase2_table = pa.concat_tables(phase2_parts)
+        log.info("Phase 2 after overlap filter: %d matches total", len(phase2_table))
+        # Remove phase 2 matches from phase 3 slice
+        phase2_matched_ids: set = set(phase2_table.column(id_col).to_pylist())
+        phase3_rhs_slice = phase2_rhs_slice.filter(
+            pa.array(
+                [
+                    rhs_id not in phase2_matched_ids
+                    for rhs_id in phase2_rhs_slice.column(id_col).to_pylist()
+                ]
+            )
+        )
+    else:
+        # If phase 2 matched nothing then reuse the entire phase 2 slice
+        # for phase 3
+        phase3_rhs_slice = phase2_rhs_slice
+
+    # Phase 3: ST_DWithin nearest USRN for features still unmatched after Phase 2
+    # Do the same 5,000 row chunks
+    # Usually won't be needed
+    if len(phase3_rhs_slice):
+        log.info(
+            "Phase 3 — ST_DWithin nearest on %d still-unmatched RHS rows...",
+            len(phase3_rhs_slice),
+        )
+        _ROWS_PER_CHUNK_P3 = 5_000
+        n_chunks_p3 = max(
+            1, (len(phase3_rhs_slice) + _ROWS_PER_CHUNK_P3 - 1) // _ROWS_PER_CHUNK_P3
+        )
+        non_geom_p3 = ", ".join(
+            f'"{c}"' for c in phase3_rhs_slice.schema.names if c != "geometry"
+        )
+        for j in range(n_chunks_p3):
+            sub = phase3_rhs_slice.slice(j * _ROWS_PER_CHUNK_P3, _ROWS_PER_CHUNK_P3)
+            if not len(sub):
+                continue
+            bbox_col = sub.column("bbox")
+            xmin_c = pc.min(pc.struct_field(bbox_col, "xmin")).as_py()
+            ymin_c = pc.min(pc.struct_field(bbox_col, "ymin")).as_py()
+            xmax_c = pc.max(pc.struct_field(bbox_col, "xmax")).as_py()
+            ymax_c = pc.max(pc.struct_field(bbox_col, "ymax")).as_py()
+
+            sd.create_data_frame(sub).to_view("rhs_raw", overwrite=True)
+            sd.sql(
+                f"SELECT {non_geom_p3},"
+                f" ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM rhs_raw"
+            ).to_view(rhs_view, overwrite=True)
+
+            wkt = (
+                f"POLYGON(({xmin_c} {ymin_c},{xmax_c} {ymin_c},"
+                f"{xmax_c} {ymax_c},{xmin_c} {ymax_c},{xmin_c} {ymin_c}))"
+            )
+            usrn_filter = f"AND ST_Intersects(u.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
+            phase3_query = phase3_template.format(spatial_filter=usrn_filter)
+            if explain and j == 0:
+                log_plan(sd, phase3_query)
+            phase3_raw = _normalise_arrow(
+                cast(pa.Table, sd.sql(phase3_query).to_arrow_table())
+            )
+            if len(phase3_raw):
+                deduped = _phase3_nearest_dedup(phase3_raw, id_col)
+                if len(deduped):
+                    phase3_parts.append(deduped)
+
+        if phase3_parts:
+            phase3_table = pa.concat_tables(phase3_parts)
+            log.info("Phase 3 nearest: %d matches", len(phase3_table))
+
+    all_parts = phase1_parts + phase2_parts + phase3_parts
+    return pa.concat_tables(all_parts) if all_parts else pa.table({})
 
 
 # ---------------------------------------------------------------------------
@@ -856,216 +1087,6 @@ def run_point_join(
     )
 
 
-def _filtered_three_phase(
-    sd: SedonaContext,
-    usrn_parquet: pathlib.Path,
-    rhs_parquet: pathlib.Path,
-    rhs_view: str,
-    intersect_template: str,
-    phase2_template: str,
-    phase3_template: str,
-    id_col: str,
-    max_d: float,
-    bbox: BBox,
-    explain: bool,
-    overlap_threshold: float,
-    usrn_line_parquet: pathlib.Path,
-) -> pa.Table:
-    """Three-phase FilteredMode executor for ``line`` joins — two USRN files, city bbox.
-
-    Phase 1 — ``ST_Intersects`` against ``usrns`` with exact bbox prune; all
-    touching pairs kept; ``_compute_overlap`` adds ``overlap_length_pct`` and
-    ``match_phase=1``.
-
-    Phase 2 — ``ST_Intersects`` against ``usrns_line`` (buffered corridors) for
-    unmatched RHS features only. The unmatched set is computed in Python (set
-    lookup) to avoid a massive NOT IN in SQL (DataFusion evaluates it as O(n×m)).
-    Unmatched rows are chunked (5 000 rows) so each sub-query has a tight USRN
-    spatial filter. ``_overlap_post_filter`` keeps the best-corridor USRN(s) per
-    RHS feature and appends ``match_phase=2``.
-
-    Phase 3 — ``ST_DWithin`` against ``usrns`` for features still unmatched after
-    Phase 2. ``_phase3_nearest_dedup`` picks the single closest USRN per feature
-    and appends ``match_phase=3``.
-    """
-    sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
-    sd.read_parquet(str(usrn_line_parquet)).to_view("usrns_line", overwrite=True)
-    sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
-
-    # Phase 1: exact ST_Intersects with standard bbox prune (no expansion)
-    phase1_filter = _bbox_pruner(bbox)
-    intersect_query = intersect_template.format(spatial_filter=phase1_filter)
-    if explain:
-        log_plan(sd, intersect_query)
-    intersect_result = _compute_overlap(
-        _normalise_arrow(cast(pa.Table, sd.sql(intersect_query).to_arrow_table())),
-        max_d,
-    )
-    log.info("Filtered two-phase Phase 1: %d intersect matches", len(intersect_result))
-
-    # Phase 2: load expanded-bbox RHS slice into Python, drop matched IDs,
-    # re-register as the view — no NOT IN in SQL.
-    xmin, ymin, xmax, ymax = bbox
-    ex = max_d
-    rhs_slice: pa.Table = pq.read_table(
-        str(rhs_parquet),
-        filters=(
-            (pc.field("bbox", "xmax") >= xmin - ex)
-            & (pc.field("bbox", "xmin") <= xmax + ex)
-            & (pc.field("bbox", "ymax") >= ymin - ex)
-            & (pc.field("bbox", "ymin") <= ymax + ex)
-        ),
-    )
-    log.info("Phase 2 RHS slice: %d rows loaded", len(rhs_slice))
-
-    if len(intersect_result):
-        matched_ids: set = set(intersect_result.column(id_col).to_pylist())
-        rhs_slice = rhs_slice.filter(
-            pa.array(
-                [v not in matched_ids for v in rhs_slice.column(id_col).to_pylist()]
-            )
-        )
-        log.info(
-            "Phase 2 unmatched RHS rows after dropping intersect matches: %d",
-            len(rhs_slice),
-        )
-
-    parts: list[pa.Table] = [intersect_result] if len(intersect_result) else []
-    rhs_phase3: pa.Table = rhs_slice  # default: all unmatched-by-Phase-1 go to Phase 3
-
-    if len(rhs_slice):
-        # Chunk the unmatched RHS so each DWithin sub-query sees only the USRN
-        # row groups that overlap that small area — avoids scanning the whole
-        # city USRN parquet for every pair at large search radii.
-        _ROWS_PER_CHUNK = 5_000
-        n_chunks = max(1, (len(rhs_slice) + _ROWS_PER_CHUNK - 1) // _ROWS_PER_CHUNK)
-        non_geom = ", ".join(
-            f'"{c}"' for c in rhs_slice.schema.names if c != "geometry"
-        )
-        log.info(
-            "Phase 2 ST_Intersects (buffered): %d unmatched rows → %d chunks",
-            len(rhs_slice),
-            n_chunks,
-        )
-
-        phase2_parts: list[pa.Table] = []
-        for i in range(n_chunks):
-            sub = rhs_slice.slice(i * _ROWS_PER_CHUNK, _ROWS_PER_CHUNK)
-            if not len(sub):
-                continue
-
-            # Derive sub-chunk spatial envelope from the bbox struct column
-            bbox_col = sub.column("bbox")
-            xmin_c = pc.min(pc.struct_field(bbox_col, "xmin")).as_py()
-            ymin_c = pc.min(pc.struct_field(bbox_col, "ymin")).as_py()
-            xmax_c = pc.max(pc.struct_field(bbox_col, "xmax")).as_py()
-            ymax_c = pc.max(pc.struct_field(bbox_col, "ymax")).as_py()
-
-            sd.create_data_frame(sub).to_view("rhs_raw", overwrite=True)
-            sd.sql(
-                f"SELECT {non_geom},"
-                f" ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM rhs_raw"
-            ).to_view(rhs_view, overwrite=True)
-
-            # Exact sub-chunk envelope — buffered geometry already covers the corridor
-            wkt = (
-                f"POLYGON(({xmin_c} {ymin_c},{xmax_c} {ymin_c},"
-                f"{xmax_c} {ymax_c},{xmin_c} {ymax_c},{xmin_c} {ymin_c}))"
-            )
-            usrn_filter = f"AND ST_Intersects(u.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
-            phase2_query = phase2_template.format(spatial_filter=usrn_filter)
-            if explain and i == 0:
-                log_plan(sd, phase2_query)
-
-            phase2_result = _normalise_arrow(
-                cast(pa.Table, sd.sql(phase2_query).to_arrow_table())
-            )
-            log.debug(
-                "Phase 2 chunk %d/%d (%d rows): %d candidates",
-                i + 1,
-                n_chunks,
-                len(sub),
-                len(phase2_result),
-            )
-            if len(phase2_result):
-                filtered = _overlap_post_filter(
-                    phase2_result, id_col, max_d, overlap_threshold
-                )
-                if len(filtered):
-                    phase2_parts.append(filtered)
-
-        if phase2_parts:
-            phase2_table = pa.concat_tables(phase2_parts)
-            log.info(
-                "Phase 2 after overlap filter: %d matches total", len(phase2_table)
-            )
-            parts.append(phase2_table)
-            phase2_matched_ids: set = set(phase2_table.column(id_col).to_pylist())
-            rhs_phase3 = rhs_slice.filter(
-                pa.array(
-                    [
-                        v not in phase2_matched_ids
-                        for v in rhs_slice.column(id_col).to_pylist()
-                    ]
-                )
-            )
-        else:
-            rhs_phase3 = rhs_slice
-
-    # Phase 3: ST_DWithin nearest USRN for features still unmatched after Phase 2
-    if len(rhs_phase3):
-        log.info(
-            "Phase 3 — ST_DWithin nearest on %d still-unmatched RHS rows...",
-            len(rhs_phase3),
-        )
-        _ROWS_PER_CHUNK_P3 = 5_000
-        n_chunks_p3 = max(
-            1, (len(rhs_phase3) + _ROWS_PER_CHUNK_P3 - 1) // _ROWS_PER_CHUNK_P3
-        )
-        non_geom_p3 = ", ".join(
-            f'"{c}"' for c in rhs_phase3.schema.names if c != "geometry"
-        )
-        phase3_parts: list[pa.Table] = []
-        for j in range(n_chunks_p3):
-            sub = rhs_phase3.slice(j * _ROWS_PER_CHUNK_P3, _ROWS_PER_CHUNK_P3)
-            if not len(sub):
-                continue
-            bbox_col = sub.column("bbox")
-            xmin_c = pc.min(pc.struct_field(bbox_col, "xmin")).as_py()
-            ymin_c = pc.min(pc.struct_field(bbox_col, "ymin")).as_py()
-            xmax_c = pc.max(pc.struct_field(bbox_col, "xmax")).as_py()
-            ymax_c = pc.max(pc.struct_field(bbox_col, "ymax")).as_py()
-
-            sd.create_data_frame(sub).to_view("rhs_raw", overwrite=True)
-            sd.sql(
-                f"SELECT {non_geom_p3},"
-                f" ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM rhs_raw"
-            ).to_view(rhs_view, overwrite=True)
-
-            wkt = (
-                f"POLYGON(({xmin_c} {ymin_c},{xmax_c} {ymin_c},"
-                f"{xmax_c} {ymax_c},{xmin_c} {ymax_c},{xmin_c} {ymin_c}))"
-            )
-            usrn_filter = f"AND ST_Intersects(u.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
-            phase3_query = phase3_template.format(spatial_filter=usrn_filter)
-            if explain and j == 0:
-                log_plan(sd, phase3_query)
-            phase3_raw = _normalise_arrow(
-                cast(pa.Table, sd.sql(phase3_query).to_arrow_table())
-            )
-            if len(phase3_raw):
-                deduped = _phase3_nearest_dedup(phase3_raw, id_col)
-                if len(deduped):
-                    phase3_parts.append(deduped)
-
-        if phase3_parts:
-            phase3_table = pa.concat_tables(phase3_parts)
-            log.info("Phase 3 nearest: %d matches", len(phase3_table))
-            parts.append(phase3_table)
-
-    return pa.concat_tables(parts) if parts else pa.table({})
-
-
 @register("line")
 def run_line_join(
     sd: SedonaContext,
@@ -1111,8 +1132,7 @@ def run_line_join(
     match mode:
         case FilteredMode(bbox=bbox):
             log.info(
-                "Bbox filter three-phase (USRNs exact, RHS expanded by %.0fm): "
-                "xmin=%s ymin=%s xmax=%s ymax=%s",
+                "Bbox filter three-phase (USRNs exact, RHS expanded by %.0fm): xmin=%s ymin=%s xmax=%s ymax=%s",
                 distance_m,
                 *bbox,
             )
