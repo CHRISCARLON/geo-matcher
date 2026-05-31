@@ -129,7 +129,7 @@ def test_prepare_geometry_renamed(tiny_gpkg, tmp_path):
 
 
 def test_prepare_wrong_crs_raises(tiny_gdf, tmp_path):
-    """AssertionError raised when the source CRS doesn't match OgrSource.crs."""
+    """ValueError raised when the source CRS doesn't match OgrSource.crs."""
     wrong_crs_gdf = tiny_gdf.to_crs("EPSG:4326")
     src_gpkg = tmp_path / "wrong_crs.gpkg"
     wrong_crs_gdf.to_file(str(src_gpkg), driver="GPKG")
@@ -139,7 +139,7 @@ def test_prepare_wrong_crs_raises(tiny_gdf, tmp_path):
         source=OgrSource(path=src_gpkg, crs="EPSG:27700"),
         parquet_path=out,
     )
-    with pytest.raises(AssertionError, match="EPSG:27700"):
+    with pytest.raises(ValueError, match="EPSG:27700"):
         prepare(cfg, force=True)
 
 

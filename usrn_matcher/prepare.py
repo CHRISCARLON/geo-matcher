@@ -18,8 +18,18 @@ log: logging.Logger = get_logger()
 # EPSG:27700 (British National Grid) extent used as the Hilbert sort envelope.
 # ST_Hilbert maps each geometry's centroid to a Hilbert curve index within this bbox,
 # so spatially nearby features get consecutive indices and land in the same row groups.
-# Shared by prepare_dataset / prepare_from_csv (file write) and _build_dtf_table (in-memory sort).
+# Shared by every _prepare_* writer (_prepare_ogr / _prepare_csv / _prepare_parquet /
+# _prepare_usrn_line) as the ORDER BY envelope.
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
+
+
+def _sql_str(value: object) -> str:
+    """Escape a value for safe interpolation inside a single-quoted SQL string literal.
+
+    DuckDB paths/CRS strings are inlined into SQL (no parameter binding in ``COPY``
+    statements), so a value containing ``'`` would otherwise break or inject the query.
+    """
+    return str(value).replace("'", "''")
 
 
 class _CoveringColumn(TypedDict):
@@ -71,13 +81,16 @@ def _patch_covering_metadata(
     - Adds the ``covering`` key pointing at the ``bbox`` struct column
       (which DuckDB already wrote into the file via SQL)
     - Optionally patches the CRS PROJJSON into the geometry column metadata
-      (always needed for DuckDB-written files; ``write_geoparquet`` gets CRS from
-      geopandas and does not need to pass ``crs`` here)
+      (always needed for DuckDB-written files; ``write_geoparquet``.
     - Normalises ``Utf8View`` → ``Utf8`` for downstream compatibility
     - Rewrites the file in-place with ZSTD compression
     """
+    # Read the data in here
     table = pq.read_table(str(path))
+
+    # Create the geo metadata structure
     geo_meta: _GeoMeta = json.loads(table.schema.metadata[b"geo"])
+
     if primary_column is not None:
         geo_meta["primary_column"] = primary_column
     geom_col: str = geo_meta.get("primary_column", "geometry")
@@ -108,7 +121,7 @@ def _patch_covering_metadata(
         )
 
 
-def _get_src_geometry_col(con: Any, source_path: str) -> str:
+def _get_src_geometry_col(con: duckdb.DuckDBPyConnection, source_path: str) -> str:
     """Return the geometry column name as exposed by DuckDB's ``st_read``.
 
     This looks directly for "GEOMETRY".
@@ -118,13 +131,18 @@ def _get_src_geometry_col(con: Any, source_path: str) -> str:
     regardless of the original column name).  This helper queries the schema
     so the caller can rename it to ``"geometry"`` in the ``SELECT``.
     """
-    rows = con.sql(f"DESCRIBE SELECT * FROM st_read('{source_path}')").fetchall()
+    rows = con.sql(
+        f"DESCRIBE SELECT * FROM st_read('{_sql_str(source_path)}')"
+    ).fetchall()
     for row in rows:
         col_name: str = row[0]
         col_type: str = row[1]
         if "GEOMETRY" in col_type.upper():
             return col_name
-    raise ValueError(f"No GEOMETRY column found in {source_path!r}")
+    found = ", ".join(f"{row[0]} ({row[1]})" for row in rows)
+    raise ValueError(
+        f"No GEOMETRY column found in {source_path!r}. Columns found: {found}"
+    )
 
 
 def _prepare_ogr(
@@ -145,9 +163,10 @@ def _prepare_ogr(
     log.info("Preparing %s from %s", name, source.path)
 
     info = pyogrio.read_info(str(source.path))
-    assert info["crs"] == source.crs, (
-        f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
-    )
+    if info["crs"] != source.crs:
+        raise ValueError(
+            f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
+        )
     feature_count: int = info.get("features", -1)
     log.info(
         "  CRS: %s | features: %s | geometry: %s",
@@ -167,7 +186,7 @@ def _prepare_ogr(
 
     t0 = time.perf_counter()
     # SPATIALLY SORT THE GEOPARQUET FILE
-    con.execute(f"""
+    copy_sql = f"""
         COPY (
             SELECT
                 * EXCLUDE "{src_geom}",
@@ -178,11 +197,13 @@ def _prepare_ogr(
                     'xmax': ST_XMax("{src_geom}"),
                     'ymax': ST_YMax("{src_geom}")
                 }} AS bbox
-            FROM st_read('{source.path}')
+            FROM st_read('{_sql_str(source.path)}')
             ORDER BY ST_Hilbert("{src_geom}", {_BNG_BOX})
-        ) TO '{parquet_path}'
+        ) TO '{_sql_str(parquet_path)}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
-    """)
+    """
+    log.debug("  COPY SQL:%s", copy_sql)
+    con.execute(copy_sql)
 
     # NEED TO RE-READ IN THE PARQUET FILE TO PATCH THE COVERING DATA
     _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
@@ -220,14 +241,14 @@ def _prepare_csv(
     match source.geometry_type:
         case "point":
             log.info(
-                "  Geometry: point from (%r, %r) | CRS: %s",
+                "  Source geometry column: ST_Point(%r, %r) → output column: 'geometry' | CRS: %s",
                 source.x_col,
                 source.y_col,
                 source.crs,
             )
         case _:
             raise NotImplementedError(
-                f"geometry_type={source.geometry_type!r} is not yet supported. "
+                f"geometry_type={source.geometry_type!r} is not yet supported for CSV files. "
                 "Currently only 'point' is implemented."
             )
 
@@ -237,17 +258,16 @@ def _prepare_csv(
         con.execute(f"SET threads = {threads};")
 
     _count_row = con.sql(
-        f"SELECT COUNT(*) FROM read_csv('{source.path}', auto_detect=true, nullstr=['NULL', ''])"
+        f"SELECT COUNT(*) FROM read_csv('{_sql_str(source.path)}', auto_detect=true, nullstr=['NULL', ''])"
     ).fetchone()
     row_count: int = _count_row[0] if _count_row else 0
-    log.info(
-        "  Rows: %s | Hilbert sort + write → %s ...", f"{row_count:,}", parquet_path
-    )
+    log.info("  Rows: %s", f"{row_count:,}")
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
 
     # A subquery materialises the geometry column so ST_Hilbert and the bbox struct
     # can reference it by name without repeating the ST_Point(...) expression.
     t0 = time.perf_counter()
-    con.execute(f"""
+    copy_sql = f"""
         COPY (
             SELECT
                 *,
@@ -261,12 +281,14 @@ def _prepare_csv(
                 SELECT
                     * EXCLUDE ("{source.x_col}", "{source.y_col}"),
                     ST_Point("{source.x_col}", "{source.y_col}") AS geometry
-                FROM read_csv('{source.path}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
+                FROM read_csv('{_sql_str(source.path)}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
             )
             ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
-        ) TO '{parquet_path}'
+        ) TO '{_sql_str(parquet_path)}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
-    """)
+    """
+    log.debug("  COPY SQL:%s", copy_sql)
+    con.execute(copy_sql)
     _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
     elapsed = time.perf_counter() - t0
 
@@ -306,10 +328,9 @@ def _prepare_parquet(
 
     pq_src_meta = pq.read_metadata(str(source.path))
     log.info(
-        "  Source: %s rows | %d row groups | Hilbert sort + write → %s ...",
+        "  Source: %s rows | %d row groups",
         f"{pq_src_meta.num_rows:,}",
         pq_src_meta.num_row_groups,
-        parquet_path,
     )
 
     geom_col = source.geometry_col
@@ -319,7 +340,7 @@ def _prepare_parquet(
         # official axis order for EPSG:4326 (which is lat/lon). Without this,
         # DuckDB interprets the first coordinate as latitude, swapping axes and
         # producing completely wrong output coordinates.
-        geom_expr = f"ST_Transform({geom_col}, '{source.source_crs}', '{source.crs}', always_xy := true)"
+        geom_expr = f"ST_Transform({geom_col}, '{_sql_str(source.source_crs)}', '{_sql_str(source.crs)}', always_xy := true)"
     elif geom_col == "geometry":
         # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
         geom_expr = "ST_GeomFromWKB(geometry)"
@@ -338,7 +359,7 @@ def _prepare_parquet(
         exclude_cols = "geometry, bbox"
     else:
         src_describe = con.sql(
-            f"DESCRIBE SELECT * FROM read_parquet('{source.path}')"
+            f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
         ).fetchall()
         src_col_names = {row[0] for row in src_describe}
         extra_geom_cols = [
@@ -353,8 +374,11 @@ def _prepare_parquet(
         if extra_geom_cols:
             log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
 
+    log.info("  Source geometry column: %r → output column: 'geometry'", geom_col)
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
+
     t0 = time.perf_counter()
-    con.execute(f"""
+    copy_sql = f"""
         COPY (
             SELECT
                 * EXCLUDE geometry,
@@ -369,12 +393,14 @@ def _prepare_parquet(
                 SELECT
                     * EXCLUDE ({exclude_cols}),
                     {geom_expr} AS geometry
-                FROM read_parquet('{source.path}')
+                FROM read_parquet('{_sql_str(source.path)}')
             )
             ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
-        ) TO '{parquet_path}'
+        ) TO '{_sql_str(parquet_path)}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
-    """)
+    """
+    log.debug("  COPY SQL:%s", copy_sql)
+    con.execute(copy_sql)
     _patch_covering_metadata(parquet_path, source.row_group_size, crs=source.crs)
     elapsed = time.perf_counter() - t0
 
@@ -412,17 +438,21 @@ def _prepare_usrn_line(
         con.execute(f"SET threads = {threads};")
 
     pq_src = pq.read_metadata(str(source.path))
+    log.info("Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path)
     log.info(
-        "Preparing %s (buffer=%.0fm) from %s (%s rows / %d row groups)",
-        name,
-        source.buffer_m,
-        source.path,
+        "  Source: %s rows | %d row groups",
         f"{pq_src.num_rows:,}",
         pq_src.num_row_groups,
     )
+    log.info(
+        "  Source geometry column: 'geometry' → output column: 'geometry' "
+        "(buffered %.0fm; original line kept as 'geometry_line')",
+        source.buffer_m,
+    )
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
 
     t0 = time.perf_counter()
-    con.execute(f"""
+    copy_sql = f"""
         COPY (
             SELECT
                 usrn,
@@ -435,11 +465,13 @@ def _prepare_usrn_line(
                     'xmax': ST_XMax(ST_Buffer(geometry, {source.buffer_m})),
                     'ymax': ST_YMax(ST_Buffer(geometry, {source.buffer_m}))
                 }} AS bbox
-            FROM read_parquet('{source.path}')
+            FROM read_parquet('{_sql_str(source.path)}')
             ORDER BY ST_Hilbert(geometry, {_BNG_BOX})
-        ) TO '{parquet_path}'
+        ) TO '{_sql_str(parquet_path)}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {source.row_group_size})
-    """)
+    """
+    log.debug("  COPY SQL:%s", copy_sql)
+    con.execute(copy_sql)
     _patch_covering_metadata(
         parquet_path, source.row_group_size, crs="EPSG:27700", primary_column="geometry"
     )

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Chris Carlon", email = "chriscarlon@icloud.com" }]
-keywords = ["usrn", "geospatial", "geoparquet", "sedona", "spatial-join", "british-national-grid"]
+keywords = ["usrn", "geospatial", "geoparquet", "sedona", "spatial-join", "british-national-grid", "duckdb"]
 dependencies = [
     "apache-sedona[db]==1.8.1",
     "duckdb==1.5.2",
@@ -23,8 +23,8 @@ Repository = "https://github.com/cmcarlon/usrn-matcher"
 [dependency-groups]
 linting = ["ruff>=0.4"]
 testing = [
-    "pytest>=9.0.2",
-    "pytest-cov>=5.0.0",
+    "pytest==9.0.2",
+    "pytest-cov==5.0.0",
 ]
 typechecking = ["mypy==1.9.0"]
 dev = [

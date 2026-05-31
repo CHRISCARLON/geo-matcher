@@ -13,7 +13,7 @@ class OgrSource:
 
     path: pathlib.Path
     crs: str = "EPSG:27700"
-    row_group_size: int = 10_000
+    row_group_size: int = 20_000
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class CsvSource:
     y_col: str = "Northing"
     geometry_type: str = "point"
     crs: str = "EPSG:27700"
-    row_group_size: int = 10_000
+    row_group_size: int = 20_000
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class ParquetSource:
 
     path: pathlib.Path
     crs: str = "EPSG:27700"
-    row_group_size: int = 10_000
+    row_group_size: int = 20_000
     geometry_col: str = "geometry"
     source_crs: str | None = None
 
@@ -60,7 +60,7 @@ class UsrnLineSource:
 
     path: pathlib.Path
     buffer_m: float
-    row_group_size: int = 10_000
+    row_group_size: int = 20_000
 
 
 AnySource: TypeAlias = OgrSource | CsvSource | ParquetSource | UsrnLineSource

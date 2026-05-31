@@ -127,7 +127,7 @@ match-gas-pipe-sample:
 		--rhs-id-col       asset_id \
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
-		--city             MANCHESTER_PICCADILLY \
+		--city             MANCHESTER \
 		--output           csv \
 		--explain
 

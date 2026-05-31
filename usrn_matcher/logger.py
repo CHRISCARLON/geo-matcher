@@ -4,7 +4,8 @@ import sys
 
 
 def _get_log_level() -> int:
-    level_name = os.getenv("USRN_MATCHER_DEBUG_LEVEL", "DEBUG").upper()
+    """Set the logging level"""
+    level_name = os.getenv("USRN_MATCHER_DEBUG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, None)
 
     if not isinstance(level, int):
@@ -17,6 +18,7 @@ def _get_log_level() -> int:
 
 
 def get_logger(name: str = "usrn_matcher") -> logging.Logger:
+    """Create logger"""
     logger: logging.Logger = logging.getLogger(name)
     if logger.handlers:
         return logger
