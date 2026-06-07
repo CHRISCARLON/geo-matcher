@@ -89,13 +89,23 @@ class JoinFn(Protocol):
     ) -> pa.Table: ...
 
 
+# The registry dictionary that get_join reads from
 _registry: dict[str, JoinFn] = {}
 _J = TypeVar("_J", bound=JoinFn)
 
 
 def register(name: str) -> Callable[[_J], _J]:
     """Register a join function under *name*"""
+    # Basic validation on the name input
+    # Must be string/can't be null
+    if not name:
+        raise ValueError("registry name cannot be empty")
 
+    if isinstance(name, int):
+        raise TypeError("registry name must be a string")
+
+    # The inner function that registers the function name against
+    # what is in @register("insert_word")
     def decorator(fn: _J) -> _J:
         _registry[name] = fn
         return fn

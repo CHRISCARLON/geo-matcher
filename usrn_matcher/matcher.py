@@ -43,15 +43,17 @@ class UsrnMatcher:
     """Spatially join USRNs to any polygon, point, or linestring dataset using SedonaDB."""
 
     _OUTPUT_FORMATS: ClassVar[dict[str, str]] = {
-        "parquet": "to_parquet",
-        "csv": "to_csv",
-        "sample": "to_csv",
+        "parquet": "_to_parquet",
+        "csv": "_to_csv",
+        "sample": "_to_csv",
     }
 
     _usrn_parquet: pathlib.Path
     _rhs_config: DatasetConfig
     _sd: "SedonaContext | None"
-    _threads: int | None
+    _threads: (
+        int | None
+    )  # This limits the amount of CPU the SeondaSession has access to
 
     def __init__(
         self,
@@ -67,7 +69,7 @@ class UsrnMatcher:
 
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
-            sd = sedona.db.connect()
+            sd: SedonaContext = sedona.db.connect()
             configure_sedona_session(sd, target_partitions=self._threads or 4)
             self._sd = sd
         assert self._sd is not None
@@ -86,8 +88,10 @@ class UsrnMatcher:
         overlap_threshold: float = 0.10,
         usrn_line_parquet: pathlib.Path | None = None,
     ) -> pa.Table:
-        """Dispatch to the registered JoinFn."""
+        """Dispatch the match to the registered Join Function."""
         try:
+            # This will be one of the registered JoinFns
+            # from join.py such as run_line_join
             fn: JoinFn = get_join(mode)
         except KeyError:
             raise ValueError(
@@ -98,11 +102,11 @@ class UsrnMatcher:
             if bbox is not None
             else NationalMode(n_chunks=n_chunks)
         )
-        sd = self._connect()
+        sd: SedonaContext = self._connect()
         result: pa.Table = fn(
             sd,
-            self._usrn_parquet,
-            self._rhs_config,
+            usrn_parquet=self._usrn_parquet,
+            rhs_config=self._rhs_config,
             mode=analysis_mode,
             explain=explain,
             distance_m=distance_m,
@@ -122,7 +126,7 @@ class UsrnMatcher:
             log.info("Result row count: %d", len(result))
         return result
 
-    def file_dispatch(
+    def output_writer(
         self,
         table: pa.Table,
         output: str,
@@ -130,38 +134,55 @@ class UsrnMatcher:
         stem: str,
         sample: int = 100_000,
     ) -> None:
-        """Write match results to the requested output format."""
+        """Write finished match results to the requested output format."""
         if output not in self._OUTPUT_FORMATS:
             raise ValueError(
                 f"Unknown output format {output!r}. Available: {sorted(self._OUTPUT_FORMATS)}"
             )
         match output:
             case "parquet":
-                self.to_parquet(table, matched_dir / f"{stem}.parquet")
+                self._to_parquet(table, matched_dir / f"{stem}.parquet")
             case "csv":
-                self.to_csv(table, matched_dir / f"{stem}.csv")
+                self._to_csv(table, matched_dir / f"{stem}.csv")
             case "sample":
-                self.to_csv(table, matched_dir / f"{stem}_sample.csv", sample=sample)
+                self._to_csv(table, matched_dir / f"{stem}_sample.csv", sample=sample)
 
-    def to_parquet(self, table: pa.Table, path: str | pathlib.Path) -> None:
+    def _to_parquet(self, table: pa.Table, path: str | pathlib.Path) -> None:
         """Write match results as Parquet (attribute-only, no geometry column)."""
         resolved_path: pathlib.Path = pathlib.Path(path)
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, str(resolved_path))
         log.info("Written %s", resolved_path)
 
-    def to_csv(
+    def _to_csv(
         self,
         table: pa.Table,
         path: str | pathlib.Path,
         sample: int | None = None,
     ) -> None:
-        """Write matched results as CSV."""
+        """Write matched results as CSV.
+
+        If sample arg defined then a sample is the ouput
+        based on the defined range.
+        """
         resolved_path: pathlib.Path = pathlib.Path(path)
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
+        slice_offset: int | None = None
+        slice_length: int | None = None
+
+        # Ouput as sample if a range is defined
         if sample is not None:
-            table = table.slice(0, sample)
+            slice_offset = 0
+            slice_length = sample
+            table = table.slice(slice_offset, slice_length)
+            log.info(
+                "CSV sample slice for %s: table.slice(%d, %d) -> %d rows",
+                resolved_path,
+                slice_offset,
+                slice_length,
+                len(table),
+            )
 
         # pyarrow CSV writer doesn't support string_view — cast to utf8
         new_schema: pa.Schema = pa.schema(
@@ -186,7 +207,7 @@ class UsrnMatcher:
         sub.required = True
 
         # ------------------------------------------------------------------ #
-        # init                                                                 #
+        # init                                                               #
         # ------------------------------------------------------------------ #
         sub.add_parser(
             "init",
@@ -194,7 +215,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare-usrns                                                        #
+        # prepare-usrns                                                      #
         # ------------------------------------------------------------------ #
         p_prepare_usrns = sub.add_parser(
             "prepare-usrns",
@@ -226,7 +247,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare-usrns-line                                                   #
+        # prepare-usrns-line                                                 #
         # ------------------------------------------------------------------ #
         p_prepare_usrns_line = sub.add_parser(
             "prepare-usrns-line",
@@ -272,7 +293,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare                                                              #
+        # prepare                                                            #
         # ------------------------------------------------------------------ #
         p_prepare = sub.add_parser(
             "prepare-gpkg",
@@ -323,7 +344,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare-csv                                                          #
+        # prepare-csv                                                        #
         # ------------------------------------------------------------------ #
         p_prepare_csv = sub.add_parser(
             "prepare-csv",
@@ -392,7 +413,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # prepare-parquet                                                       #
+        # prepare-parquet                                                    #
         # ------------------------------------------------------------------ #
         p_prepare_parquet = sub.add_parser(
             "prepare-parquet",
@@ -462,7 +483,7 @@ class UsrnMatcher:
         )
 
         # ------------------------------------------------------------------ #
-        # match                                                                #
+        # match                                                              #
         # ------------------------------------------------------------------ #
         p_match = sub.add_parser(
             "match",
@@ -763,7 +784,7 @@ class UsrnMatcher:
             if streaming:
                 log.info("Streaming output written to %s", output_path)
             else:
-                matcher.file_dispatch(
+                matcher.output_writer(
                     table,
                     output=args.output,
                     matched_dir=matched_dir,

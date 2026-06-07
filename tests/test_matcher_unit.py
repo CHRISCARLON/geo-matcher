@@ -1,4 +1,4 @@
-"""Unit tests for UsrnMatcher dispatch methods."""
+"""Unit tests for UsrnMatcher match dispatch and output writing."""
 
 import pyarrow as pa
 import pytest
@@ -27,9 +27,9 @@ def test_match_dispatch_unknown_mode_raises(matcher):
         matcher.match_dispatch(mode="fuzzy")
 
 
-def test_file_dispatch_unknown_format_raises(matcher, tmp_path):
+def test_output_writer_unknown_format_raises(matcher, tmp_path):
     with pytest.raises(ValueError, match="Unknown output format"):
-        matcher.file_dispatch(pa.table({}), "xlsx", tmp_path, "stem")
+        matcher.output_writer(pa.table({}), "xlsx", tmp_path, "stem")
 
 
 def test_registry_contains_expected_modes():

@@ -93,6 +93,8 @@ usrn-matcher match --rhs-name soil --output parquet
 ## Python API
 
 ```python
+import pathlib
+
 from usrn_matcher import DatasetConfig, OgrSource, CsvSource, UsrnMatcher
 from usrn_matcher.prepare import prepare
 from usrn_matcher.bboxes import LEEDS
@@ -123,7 +125,17 @@ matcher = UsrnMatcher(
 )
 
 table = matcher.match_dispatch("point", bbox=LEEDS, distance_m=25)
-matcher.to_csv(table, "matched_data/usrn_stops_attribution.csv")
+matcher.output_writer(
+    table,
+    output="csv",
+    matched_dir=pathlib.Path("matched_data"),
+    stem="usrn_stops_attribution",
+)
 ```
 
 `match_dispatch` returns a `pyarrow.Table` with attribute columns only (no geometry).
+
+`output_writer(table, output, matched_dir, stem)` is the single entry point for writing
+results: it picks the writer from an output-format string (`"csv"`, `"parquet"`, or
+`"sample"`) and writes to `matched_dir / f"{stem}.<ext>"` — the same dispatch the CLI
+`--output` flag uses.
