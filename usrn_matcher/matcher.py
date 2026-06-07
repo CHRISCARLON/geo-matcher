@@ -27,7 +27,7 @@ from .join import (
     JoinFn,
     NationalMode,
     _registry,
-    configure_session,
+    configure_sedona_session,
     get_join,
 )
 from .logger import get_logger
@@ -68,7 +68,7 @@ class UsrnMatcher:
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
             sd = sedona.db.connect()
-            configure_session(sd, target_partitions=self._threads or 4)
+            configure_sedona_session(sd, target_partitions=self._threads or 4)
             self._sd = sd
         assert self._sd is not None
         return self._sd

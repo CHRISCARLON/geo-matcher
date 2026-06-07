@@ -114,7 +114,7 @@ def get_join(name: str) -> JoinFn:
 # ---------------------------------------------------------------------------
 
 
-def configure_session(sd: SedonaContext, target_partitions: int = 4) -> None:
+def configure_sedona_session(sd: SedonaContext, target_partitions: int = 4) -> None:
     """Apply DataFusion/Sedona tuning once after sedonadb.connect().
 
     target_partitions: caps RoundRobinBatch fan-out — prevents CPU saturation on national joins.
@@ -236,7 +236,7 @@ def _log_line_match_summary(total_features: int, p1: int, p2: int, p3: int) -> N
 # ---------------------------------------------------------------------------
 
 
-# TODO: bring into a single dispatch method again
+# TODO: bring into a single dispatch method again
 def execute_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -251,7 +251,7 @@ def execute_join(
 ) -> pa.Table:
     """Single-phase dispatcher for ``polygon`` and ``point`` joins.
 
-    FilteredMode: both parquets registered as Sedona views; query run directly — logic
+    FilteredMode: both parquets registered as Sedona views; query is ran directly — logic
     inlined here, no helper function.
 
     NationalMode: delegates to ``_national_single_phase`` which chunks the RHS and streams
@@ -262,8 +262,10 @@ def execute_join(
 
     match mode:
         case FilteredMode(bbox=bbox):
+            # Create the views here
             sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
             sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
+
             usrn_meta = pq.read_metadata(str(usrn_parquet))
             log.info(
                 "USRN: %d rows / %d row groups",
