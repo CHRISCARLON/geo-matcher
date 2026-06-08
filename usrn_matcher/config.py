@@ -2,9 +2,16 @@ import pathlib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TypeAlias
 
 BBox: TypeAlias = Sequence[float]
+
+
+class GeometryType(StrEnum):
+    POINT = "point"
+    LINE = "line"
+    POLYGON = "polygon"
 
 
 @dataclass(frozen=True)
@@ -23,7 +30,7 @@ class CsvSource:
     path: pathlib.Path
     x_col: str = "Easting"
     y_col: str = "Northing"
-    geometry_type: str = "point"
+    geometry_type: str = GeometryType.POINT
     crs: str = "EPSG:27700"
     row_group_size: int = 20_000
 
