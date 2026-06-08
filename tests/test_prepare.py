@@ -51,12 +51,14 @@ def prepared_parquet(tiny_gpkg, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_geoparquet_version(prepared_parquet):
+def test_geoparquet_metadata_patch(prepared_parquet):
+    """GeoParquet metadata is patched to version 1.1.0."""
     geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
     assert geo["version"] == "1.1.0"
 
 
 def test_covering_metadata(prepared_parquet):
+    """GeoParquet metadata includes the bbox covering struct."""
     geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
     covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
     assert covering == {
@@ -68,6 +70,7 @@ def test_covering_metadata(prepared_parquet):
 
 
 def test_compression_zstd(prepared_parquet):
+    """All columns are ZSTD-compressed."""
     rg = pq.ParquetFile(prepared_parquet).metadata.row_group(0)
     for i in range(rg.num_columns):
         col = rg.column(i)
@@ -77,6 +80,7 @@ def test_compression_zstd(prepared_parquet):
 
 
 def test_crs_in_metadata(prepared_parquet):
+    """CRS is present in the geometry column metadata."""
     geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
     assert crs_meta is not None, "CRS should be present in geometry column metadata"
@@ -238,6 +242,7 @@ def test_prepare_csv_skips_when_exists(tiny_csv, tmp_path):
 
 def test_prepare_csv_writes_parquet(tiny_csv, tmp_path):
     out = tmp_path / "csv_out.parquet"
+    """prepare() writes a non-empty parquet file from a CSV source."""
     cfg = DatasetConfig(
         name="tiny", source=CsvSource(path=tiny_csv, row_group_size=5), parquet_path=out
     )
@@ -247,6 +252,7 @@ def test_prepare_csv_writes_parquet(tiny_csv, tmp_path):
 
 
 def test_prepare_csv_geoparquet_version(tiny_csv, tmp_path):
+    """CSV output has GeoParquet 1.1.0 version."""
     out = tmp_path / "csv_version.parquet"
     cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
     prepare(cfg)
@@ -255,6 +261,7 @@ def test_prepare_csv_geoparquet_version(tiny_csv, tmp_path):
 
 
 def test_prepare_csv_covering_metadata(tiny_csv, tmp_path):
+    """CSV output has the GeoParquet 1.1 bbox covering key."""
     out = tmp_path / "csv_covering.parquet"
     cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
     prepare(cfg)
@@ -269,6 +276,7 @@ def test_prepare_csv_covering_metadata(tiny_csv, tmp_path):
 
 
 def test_prepare_csv_crs_in_metadata(tiny_csv, tmp_path):
+    """CSV output patches the CRS into the geometry column metadata."""
     out = tmp_path / "csv_crs.parquet"
     cfg = DatasetConfig(
         name="tiny", source=CsvSource(path=tiny_csv, crs="EPSG:27700"), parquet_path=out
@@ -281,6 +289,7 @@ def test_prepare_csv_crs_in_metadata(tiny_csv, tmp_path):
 
 
 def test_prepare_csv_compression_zstd(tiny_csv, tmp_path):
+    """CSV output is ZSTD-compressed across all columns."""
     out = tmp_path / "csv_zstd.parquet"
     cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
     prepare(cfg)
@@ -308,6 +317,7 @@ def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
 
 
 def test_prepare_csv_unsupported_geometry_type_raises(tiny_csv, tmp_path):
+    """Unsupported geometry types raise NotImplementedError."""
     out = tmp_path / "csv_bad.parquet"
     cfg = DatasetConfig(
         name="tiny",

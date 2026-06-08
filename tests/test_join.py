@@ -20,6 +20,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_bbox_pruner_produces_where_clause():
+    """_bbox_pruner builds an ST_Intersects clause for both sides."""
     clause = _bbox_pruner([100.0, 200.0, 300.0, 400.0])
     assert "ST_Intersects(u.geometry" in clause
     assert "ST_Intersects(s.geometry" in clause
@@ -33,6 +34,7 @@ def test_bbox_pruner_produces_where_clause():
 
 
 def test_col_fragment_explicit_columns():
+    """Explicit columns are emitted as quoted, s-prefixed fields."""
     cfg: DatasetConfig = DatasetConfig(
         name="soil", source_path="x.gpkg", columns=["MUSID", "MAP_SYMBOL"]
     )
@@ -40,6 +42,7 @@ def test_col_fragment_explicit_columns():
 
 
 def test_col_fragment_explicit_columns_with_spaces():
+    """Column names containing spaces are quoted correctly."""
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", columns=["road class", "speed limit"]
     )
@@ -69,6 +72,7 @@ def rhs_parquet(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 def test_col_fragment_auto_excludes_geometry_and_bbox(rhs_parquet: pathlib.Path):
+    """Auto-discovery omits the geometry and bbox columns."""
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", parquet_path=rhs_parquet, columns=[]
     )
