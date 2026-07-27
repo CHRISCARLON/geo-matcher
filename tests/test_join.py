@@ -6,13 +6,39 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from usrn_matcher.config import DatasetConfig
+from usrn_matcher.config import DatasetConfig, GeometryType
 from usrn_matcher.join import (
     _bbox_pruner,
     _col_fragment,
+    _registry,
+    register,
 )
 
 pytestmark = pytest.mark.unit
+
+# ---------------------------------------------------------------------------
+# register
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["hexagon", "", "POINT", 1])
+def test_register_rejects_non_geometry_type(name):
+    """register() only accepts GeometryType members (or their string values)."""
+    with pytest.raises(ValueError, match="not a GeometryType"):
+        register(name)
+
+
+def test_register_accepts_string_value_and_normalises_key():
+    """A plain string value registers under the matching GeometryType member."""
+    original = dict(_registry)
+    try:
+        register("point")(lambda *a, **k: None)
+        key = next(k for k in _registry if k == GeometryType.POINT)
+        assert isinstance(key, GeometryType)
+    finally:
+        _registry.clear()
+        _registry.update(original)
+
 
 # ---------------------------------------------------------------------------
 # _bbox_pruner

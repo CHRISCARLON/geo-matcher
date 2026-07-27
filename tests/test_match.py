@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pytest
 
-from usrn_matcher import DatasetConfig, UsrnMatcher
+from usrn_matcher import DatasetConfig, GeometryType, UsrnMatcher
 from usrn_matcher.join import (
     FilteredMode,
     JoinFn,
@@ -24,9 +24,23 @@ def matcher(tmp_path) -> UsrnMatcher:
 
 
 def test_match_dispatch_unknown_mode_raises(matcher):
-    """match_dispatch() rejects an unregistered join mode."""
-    with pytest.raises(ValueError, match="Unknown join mode"):
+    """match_dispatch() rejects a mode that isn't a GeometryType."""
+    with pytest.raises(ValueError, match="Unknown join mode") as exc:
         matcher.match_dispatch(mode="fuzzy")
+    # The error lists the valid modes as plain values, not enum reprs
+    assert "'polygon'" in str(exc.value)
+    assert "GeometryType" not in str(exc.value)
+
+
+def test_registry_keys_are_geometry_types():
+    """Every registered join is keyed by a GeometryType member."""
+    assert _registry
+    assert all(isinstance(key, GeometryType) for key in _registry)
+
+
+def test_get_join_accepts_enum_member_and_string():
+    """A GeometryType member and its string value resolve to the same join."""
+    assert get_join(GeometryType.POINT) is get_join("point")
 
 
 def test_output_writer_unknown_format_raises(matcher, tmp_path):

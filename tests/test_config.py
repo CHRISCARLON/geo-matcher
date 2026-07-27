@@ -4,7 +4,7 @@ import pathlib
 
 import pytest
 
-from usrn_matcher.config import DatasetConfig
+from usrn_matcher.config import CsvSource, DatasetConfig, GeometryType
 
 pytestmark = pytest.mark.unit
 
@@ -28,3 +28,28 @@ def test_columns_default_empty():
     """columns defaults to an empty list."""
     cfg = DatasetConfig(name="x", source_path="x.gpkg")
     assert cfg.columns == []
+
+
+# ---------------------------------------------------------------------------
+# CsvSource.geometry_type
+# ---------------------------------------------------------------------------
+
+
+def test_csv_source_geometry_type_defaults_to_point():
+    """The default geometry_type is the GeometryType.POINT member."""
+    src = CsvSource(path=pathlib.Path("a.csv"))
+    assert src.geometry_type is GeometryType.POINT
+
+
+@pytest.mark.parametrize("value", ["point", "line", "polygon"])
+def test_csv_source_geometry_type_coerces_string(value):
+    """A plain string is normalised to the matching GeometryType member."""
+    src = CsvSource(path=pathlib.Path("a.csv"), geometry_type=value)
+    assert isinstance(src.geometry_type, GeometryType)
+    assert src.geometry_type == value
+
+
+def test_csv_source_rejects_unknown_geometry_type():
+    """An unknown geometry_type is rejected at construction time."""
+    with pytest.raises(ValueError, match="not a valid GeometryType"):
+        CsvSource(path=pathlib.Path("a.csv"), geometry_type="hexagon")
