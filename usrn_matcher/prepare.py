@@ -10,7 +10,14 @@ import pyarrow.parquet as pq
 import pyogrio
 from pyproj import CRS as ProjCRS
 
-from .config import CsvSource, DatasetConfig, OgrSource, ParquetSource, UsrnLineSource
+from .config import (
+    CsvSource,
+    DatasetConfig,
+    GeometryType,
+    OgrSource,
+    ParquetSource,
+    UsrnLineSource,
+)
 from .logger import get_logger
 
 log: logging.Logger = get_logger()
@@ -239,17 +246,17 @@ def _prepare_csv(
     log.info("Preparing CSV → GeoParquet: %s", source.path)
 
     match source.geometry_type:
-        case "point":
+        case GeometryType.POINT:
             log.info(
                 "  Source geometry column: ST_Point(%r, %r) → output column: 'geometry' | CRS: %s",
                 source.x_col,
                 source.y_col,
                 source.crs,
             )
-        case _:
+        case GeometryType.LINE | GeometryType.POLYGON:
             raise NotImplementedError(
-                f"geometry_type={source.geometry_type!r} is not yet supported for CSV files. "
-                "Currently only 'point' is implemented."
+                f"geometry_type={source.geometry_type.value!r} is not yet supported for "
+                "CSV files. Currently only 'point' is implemented."
             )
 
     con = duckdb.connect()

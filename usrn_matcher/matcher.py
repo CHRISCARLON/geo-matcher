@@ -17,6 +17,7 @@ from .config import (
     BBox,
     CsvSource,
     DatasetConfig,
+    GeometryType,
     OgrSource,
     ParquetSource,
     UsrnLineSource,
@@ -77,7 +78,7 @@ class UsrnMatcher:
 
     def match_dispatch(
         self,
-        mode: str,
+        mode: GeometryType | str,
         bbox: BBox | None = None,
         explain: bool = False,
         n_chunks: int = 50,
@@ -90,15 +91,19 @@ class UsrnMatcher:
     ) -> pa.Table:
         """Dispatch the match to the registered Join Function.
 
+        *mode* is the RHS geometry type — it must be a GeometryType (or its
+        string value) with a join registered against it.
+
         The Analysis mode is driven by whether or not a bbox is provided.
         """
         try:
             # This will be one of the registered JoinFns
             # from join.py such as run_line_join
-            fn: JoinFn = get_join(mode)
-        except KeyError:
+            geometry_type: GeometryType = GeometryType(mode)
+            fn: JoinFn = get_join(geometry_type)
+        except (ValueError, KeyError):
             raise ValueError(
-                f"Unknown join mode {mode!r}. Available: {sorted(_registry)}"
+                f"Unknown join mode {mode!r}. Available: {[g.value for g in _registry]}"
             ) from None
         analysis_mode: AnalysisMode = (
             FilteredMode(bbox=bbox)
@@ -400,9 +405,12 @@ class UsrnMatcher:
         )
         p_prepare_csv.add_argument(
             "--geometry-type",
-            default="point",
-            metavar="TYPE",
-            help="How to build geometries from the CSV (default: point).",
+            choices=[g.value for g in GeometryType],
+            default=GeometryType.POINT.value,
+            help=(
+                "How to build geometries from the CSV (default: point). "
+                "Only 'point' is implemented so far."
+            ),
         )
         p_prepare_csv.add_argument(
             "--force",
@@ -537,8 +545,8 @@ class UsrnMatcher:
         )
         p_match.add_argument(
             "--mode",
-            choices=list(_registry),
-            default="polygon",
+            choices=[g.value for g in _registry],
+            default=GeometryType.POLYGON.value,
             help=(
                 "Join strategy: 'polygon' for area/polygon datasets (default); "
                 "'point' for point datasets — assigns each point to its closest USRN; "
@@ -750,7 +758,7 @@ class UsrnMatcher:
             )
             if bbox is None and args.batches < 2:
                 parser.error("--batches must be >= 2 for national (no-bbox) joins")
-            if args.mode == "line" and args.usrn_line_parquet is None:
+            if args.mode == GeometryType.LINE and args.usrn_line_parquet is None:
                 parser.error(
                     "--mode line requires --usrn-line-parquet (run 'prepare-usrns-line --buffer-m N' first)"
                 )

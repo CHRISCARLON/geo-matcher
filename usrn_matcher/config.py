@@ -30,9 +30,15 @@ class CsvSource:
     path: pathlib.Path
     x_col: str = "Easting"
     y_col: str = "Northing"
-    geometry_type: str = GeometryType.POINT
+    geometry_type: GeometryType = GeometryType.POINT
     crs: str = "EPSG:27700"
     row_group_size: int = 20_000
+
+    def __post_init__(self) -> None:
+        # Normalise a plain string ("point") into the enum member so downstream
+        # match statements can rely on GeometryType members. object.__setattr__
+        # because the dataclass is frozen.
+        object.__setattr__(self, "geometry_type", GeometryType(self.geometry_type))
 
 
 @dataclass(frozen=True)

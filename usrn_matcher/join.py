@@ -11,7 +11,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from sedonadb.context import SedonaContext
 
-from .config import BBox, DatasetConfig
+from .config import BBox, DatasetConfig, GeometryType
 from .explain import log_plan
 from .logger import get_logger
 
@@ -89,34 +89,47 @@ class JoinFn(Protocol):
     ) -> pa.Table: ...
 
 
-# The registry dictionary that get_join reads from
-_registry: dict[str, JoinFn] = {}
+# The registry dictionary that get_join reads from — keyed by GeometryType so the
+# registered join strategies can never drift from the enum.
+_registry: dict[GeometryType, JoinFn] = {}
 _J = TypeVar("_J", bound=JoinFn)
 
 
-def register(name: str) -> Callable[[_J], _J]:
-    """Register a join function under *name*"""
-    # Basic validation on the name input
-    # Must be string/can't be null
-    if not name:
-        raise ValueError("registry name cannot be empty")
+def register(name: GeometryType | str) -> Callable[[_J], _J]:
+    """Register a join function under the *name* geometry type.
 
-    if isinstance(name, int):
-        raise TypeError("registry name must be a string")
+    Raises at import time if *name* is not a GeometryType, so a typo in a
+    @register decorator can never produce an unreachable join.
+    """
+    try:
+        geometry_type: GeometryType = GeometryType(name)
+    except ValueError:
+        raise ValueError(
+            f"Cannot register join {name!r}: not a GeometryType. "
+            f"Available: {[g.value for g in GeometryType]}"
+        ) from None
 
-    # The inner function that registers the function name against
-    # what is in @register("insert_word")
+    # The inner function that registers the function against
+    # what is in @register(GeometryType.POINT)
     def decorator(fn: _J) -> _J:
-        _registry[name] = fn
+        _registry[geometry_type] = fn
         return fn
 
     return decorator
 
 
-def get_join(name: str) -> JoinFn:
+def get_join(name: GeometryType | str) -> JoinFn:
+    """Look up the join registered for a geometry type.
+
+    Accepts either a GeometryType member or its plain-string value — StrEnum
+    members hash and compare equal to their values.
+    """
     if name not in _registry:
-        raise KeyError(f"No join registered for '{name}'. Available: {list(_registry)}")
-    return _registry[name]
+        raise KeyError(
+            f"No join registered for '{name}'. "
+            f"Available: {[g.value for g in _registry]}"
+        )
+    return _registry[GeometryType(name)]
 
 
 # ---------------------------------------------------------------------------
@@ -1153,7 +1166,7 @@ def _phase3_nearest_dedup(table: pa.Table, id_col: str) -> pa.Table:
 # ---------------------------------------------------------------------------
 
 
-@register("polygon")
+@register(GeometryType.POLYGON)
 def run_polygon_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -1202,7 +1215,7 @@ def run_polygon_join(
     )
 
 
-@register("point")
+@register(GeometryType.POINT)
 def run_point_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -1261,7 +1274,7 @@ def run_point_join(
     )
 
 
-@register("line")
+@register(GeometryType.LINE)
 def run_line_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
