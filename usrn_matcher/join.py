@@ -247,6 +247,7 @@ def _log_line_match_summary(total_features: int, p1: int, p2: int, p3: int) -> N
 
 
 # TODO: bring into a single dispatch method again
+# We need to bring the line joins into this too
 def execute_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -1383,7 +1384,7 @@ def run_line_join(
 
 
 # ---------------------------------------------------------------------------
-# SQL fragment helpers
+# SQL fragment helpers / Spatial predicates
 # ---------------------------------------------------------------------------
 
 
