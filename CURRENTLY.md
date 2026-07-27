@@ -1,4 +1,3 @@
-# Currently
+# Current Focus
 
-- Account for non standard geometry named columns
-- Prepare parquet from csv to allow for more than just point geometries
+- Allow config objects to have an Enum GeometryType object that dictates how files are prepared and how joins are done.

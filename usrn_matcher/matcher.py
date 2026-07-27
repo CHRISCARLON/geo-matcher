@@ -88,7 +88,10 @@ class UsrnMatcher:
         overlap_threshold: float = 0.10,
         usrn_line_parquet: pathlib.Path | None = None,
     ) -> pa.Table:
-        """Dispatch the match to the registered Join Function."""
+        """Dispatch the match to the registered Join Function.
+
+        The Analysis mode is driven by whether or not a bbox is provided.
+        """
         try:
             # This will be one of the registered JoinFns
             # from join.py such as run_line_join
@@ -197,7 +200,9 @@ class UsrnMatcher:
     @classmethod
     def cli(cls) -> None:
         """Entry point for the ``usrn-matcher`` command-line tool."""
-        city_names: list[str] = [k for k in vars(_bboxes) if not k.startswith("_")]
+        city_names: list[str] = [
+            city for city in vars(_bboxes) if not city.startswith("_")
+        ]
 
         parser = argparse.ArgumentParser(
             prog="usrn-matcher",
