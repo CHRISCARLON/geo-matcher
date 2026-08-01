@@ -57,10 +57,10 @@ usrn-matcher prepare-usrns-line \
   --buffer-m  10 \
   --cache-dir output_data
 
-# Three-phase line join
+# Four-phase line join
 usrn-matcher match \
   --rhs-name          my_lines \                               # prepared dataset name
-  --mode              line \                                   # three-phase line strategy
+  --mode              line \                                   # four-phase line strategy
   --distance          10 \                                     # Phase 1+2 buffer width in metres
   --phase3-distance   15 \                                     # Phase 3 nearest-fallback radius (catches features just outside the buffer)
   --rhs-id-col        asset_id \                               # unique ID column to track matched features between phases

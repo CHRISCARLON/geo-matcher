@@ -584,8 +584,10 @@ class UsrnMatcher:
             metavar="N",
             help=(
                 "Number of RHS chunks for national (no-bbox) joins (default: 50). "
-                "The RHS parquet is split into this many in-memory slices; only one "
-                "chunk's data is in memory at a time. Ignored when --bbox or --city is supplied."
+                "The RHS parquet is split into this many in-memory chunks of row "
+                "groups; only one chunk's data is in memory at a time. Ignored when "
+                "--bbox or --city is supplied. (Line joins further split each chunk "
+                "into 5,000-row batches for Phases 3 and 4.)"
             ),
         )
         p_match.add_argument(
