@@ -1049,33 +1049,21 @@ def _filtered_line_join(
     phase2_parts: list[pa.Table] = []
     phase3_parts: list[pa.Table] = []
 
-    # Read files in as views
     sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
     sd.read_parquet(str(usrn_line_parquet)).to_view("usrns_line", overwrite=True)
-    sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
 
-    # Phase 1: exact ST_Intersects with standard bbox prune (no expansion)
-    intersect_query = intersect_template.format(
-        spatial_filter=_bbox_pruner(bbox),
-        corridor_filter=_usrn_spatial_filter(bbox, distance_m, alias="ul"),
-    )
-    log.debug("Phase 1 query:\n%s", intersect_query)
-
-    if explain:
-        log_plan(sd, intersect_query)
-    intersect_result = _phase1_score_overlap(
-        _normalise_arrow(cast(pa.Table, sd.sql(intersect_query).to_arrow_table())),
-        distance_m,
-    )
-    log.info("Phase 1 (intersect): %d matches", len(intersect_result))
-
-    # If there's stuff to collect put it in phase1 list
-    if len(intersect_result):
-        phase1_parts.append(intersect_result)
-
-    # Load the same data as Phase 1 but with a slightly expanded bbox, so a feature just
-    # outside the city bounds can still reach a corridor inside them. Phases 2, 3 and 4
-    # all work from this set.
+    # Load the RHS once, with the bbox expanded so a feature just outside the city
+    # bounds can still reach a corridor inside them. All four phases work from this set.
+    #
+    # It is registered as an in-memory table rather than a parquet view on purpose.
+    # Handing Sedona `read_parquet(rhs).to_view(...)` and letting the WHERE clause prune
+    # gives the planner no post-filter cardinality, and combined with Phase 1's
+    # `usrns_line` equijoin it picks a join order that does not terminate in any
+    # reasonable time: on gas_pipe (2.27M rows) a 56 km² bbox ran >100s against 0.4s
+    # for the identical query over an in-memory table, for byte-identical output.
+    # Small RHS files hide it — ngn_mains (113k rows) finishes either way. This also
+    # makes the filtered path consistent with the national one, which has always
+    # materialised each chunk before querying it.
     xmin, ymin, xmax, ymax = bbox
     ex = distance_m
     all_features: pa.Table = pq.read_table(
@@ -1090,12 +1078,36 @@ def _filtered_line_join(
     log.info("RHS features in scope: %d rows (expanded bbox)", len(all_features))
     # The "started with" denominator for the match-rate summary.
     total_features = len(all_features)
+    if len(all_features):
+        _register_rhs_view(sd, all_features, rhs_view)
+
+    # Phase 1: exact ST_Intersects with standard bbox prune (no expansion). The RHS is
+    # the expanded-bbox table, so _bbox_pruner's `s` predicate still does the work of
+    # narrowing it back to the exact bbox — Phase 1's result is unchanged by the switch.
+    intersect_result: pa.Table = pa.table({})
+    if len(all_features):
+        intersect_query = intersect_template.format(
+            spatial_filter=_bbox_pruner(bbox),
+            corridor_filter=_usrn_spatial_filter(bbox, distance_m, alias="ul"),
+        )
+        log.debug("Phase 1 query:\n%s", intersect_query)
+
+        if explain:
+            log_plan(sd, intersect_query)
+        intersect_result = _phase1_score_overlap(
+            _normalise_arrow(cast(pa.Table, sd.sql(intersect_query).to_arrow_table())),
+            distance_m,
+        )
+    log.info("Phase 1 (intersect): %d matches", len(intersect_result))
+
+    # If there's stuff to collect put it in phase1 list
+    if len(intersect_result):
+        phase1_parts.append(intersect_result)
 
     if len(all_features):
         # One query over every feature. No envelope expansion — the filter prunes on
         # usrns_line.geometry, the buffered corridor, which already reaches buffer_m
         # past its centreline.
-        _register_rhs_view(sd, all_features, rhs_view)
         phase2_query = phase2_template.format(
             spatial_filter=_usrn_spatial_filter(_table_envelope(all_features))
         )

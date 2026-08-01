@@ -137,7 +137,7 @@ match-gas-pipe-sample:
 		--rhs-id-col       asset_id \
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
-		--city             MANCHESTER \
+		--city             MANCHESTER_CITY_CENTRE \
 		--output           csv \
 		--explain
 
@@ -162,7 +162,7 @@ match-ngn-mains-sample:
 		--rhs-id-col       ASSET_ID \
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
-		--city             LEEDS \
+		--city             NEWCASTLE \
 		--output           csv \
 		--explain
 
