@@ -4,11 +4,12 @@
 .PHONY: \
 	init \
 	prepare-usrns prepare-usrns-line \
-	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-all \
+	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-ngn-mains prepare-all \
 	match-soil-national match-soil-national-explain \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
 	match-gas-pipe-sample match-gas-pipe-national \
+	match-ngn-mains-sample match-ngn-mains-national \
 	clean-output clean-matched
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -19,7 +20,9 @@ init:
 # ── Prepare USRNs ─────────────────────────────────────────────────────────────
 
 prepare-usrns:
-	usrn-matcher prepare-usrns --force
+	usrn-matcher prepare-usrns \
+		--usrn-gpkg input_data/osopenusrn_202607.gpkg \
+		--force
 
 prepare-usrns-line:
 	usrn-matcher prepare-usrns-line \
@@ -60,6 +63,13 @@ prepare-gas-pipe:
 		--geometry-col geo_shape \
 		--source-crs   EPSG:4326 \
 		--threads      2 \
+		--force
+
+prepare-ngn-mains:
+	usrn-matcher prepare-gpkg \
+		--rhs-name  ngn_mains \
+		--rhs-gpkg  input_data/ngn_mains.gpkg \
+		--threads   4 \
 		--force
 
 prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
@@ -138,6 +148,31 @@ match-gas-pipe-national:
 		--distance         10 \
 		--phase3-distance  15 \
 		--rhs-id-col       asset_id \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--output           parquet \
+		--explain
+
+match-ngn-mains-sample:
+	usrn-matcher match \
+		--rhs-name         ngn_mains \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       ASSET_ID \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--city             LEEDS \
+		--output           csv \
+		--explain
+
+match-ngn-mains-national:
+	usrn-matcher match \
+		--rhs-name         ngn_mains \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       ASSET_ID \
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
 		--output           parquet \

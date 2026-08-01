@@ -88,6 +88,7 @@ class UsrnMatcher:
         output_path: pathlib.Path | None = None,
         overlap_threshold: float = 0.10,
         usrn_line_parquet: pathlib.Path | None = None,
+        phase4_tolerance_m: float = 5.0,
     ) -> pa.Table:
         """Dispatch the match to the registered Join Function.
 
@@ -123,6 +124,7 @@ class UsrnMatcher:
             output_path=output_path,
             overlap_threshold=overlap_threshold,
             usrn_line_parquet=usrn_line_parquet,
+            phase4_tolerance_m=phase4_tolerance_m,
         )
         if output_path is not None and output_path.exists():
             log.info(
@@ -582,8 +584,10 @@ class UsrnMatcher:
             metavar="N",
             help=(
                 "Number of RHS chunks for national (no-bbox) joins (default: 50). "
-                "The RHS parquet is split into this many in-memory slices; only one "
-                "chunk's data is in memory at a time. Ignored when --bbox or --city is supplied."
+                "The RHS parquet is split into this many in-memory chunks of row "
+                "groups; only one chunk's data is in memory at a time. Ignored when "
+                "--bbox or --city is supplied. (Line joins further split each chunk "
+                "into 5,000-row batches for Phases 3 and 4.)"
             ),
         )
         p_match.add_argument(
@@ -604,6 +608,18 @@ class UsrnMatcher:
                 "Minimum overlap fraction for --mode line Phase 2 corridor matches (default: 0.10). "
                 "At least this fraction of the RHS line must fall inside the USRN buffer "
                 "corridor to be kept. Features below the threshold are dropped entirely."
+            ),
+        )
+        p_match.add_argument(
+            "--phase4-tolerance",
+            type=float,
+            default=5.0,
+            metavar="METRES",
+            help=(
+                "Connection tolerance in metres for --mode line Phase 4 (default: 5). "
+                "A feature still unmatched after Phase 3 inherits the USRN of an "
+                "already-matched feature it physically touches within this distance. "
+                "Set to 0 to disable Phase 4."
             ),
         )
         p_match.add_argument(
@@ -788,6 +804,7 @@ class UsrnMatcher:
                 rhs_id_col=args.rhs_id_col,
                 output_path=output_path,
                 overlap_threshold=args.overlap_threshold,
+                phase4_tolerance_m=args.phase4_tolerance,
                 usrn_line_parquet=(
                     pathlib.Path(args.usrn_line_parquet)
                     if args.usrn_line_parquet is not None
