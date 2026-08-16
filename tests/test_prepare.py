@@ -2,6 +2,7 @@
 
 import csv
 import json
+import pathlib
 
 import geopandas as gpd
 import pyarrow.parquet as pq
@@ -316,13 +317,112 @@ def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
     assert "Northing" not in schema.names
 
 
-def test_prepare_csv_unsupported_geometry_type_raises(tiny_csv, tmp_path):
-    """Unsupported geometry types raise NotImplementedError."""
-    out = tmp_path / "csv_bad.parquet"
+@pytest.mark.parametrize("geometry_type", ["line", "polygon"])
+def test_prepare_csv_wkt_col_required_raises(geometry_type):
+    """geometry_type='line'/'polygon' without wkt_col is rejected at construction time,
+    before prepare() is ever called."""
+    with pytest.raises(ValueError, match="wkt_col"):
+        CsvSource(path=pathlib.Path("does_not_matter.csv"), geometry_type=geometry_type)
+
+
+# ---------------------------------------------------------------------------
+# CsvSource LINE/POLYGON (WKT) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_line_csv(tmp_path):
+    """5-row CSV with a WKT column of LINESTRING/MULTILINESTRING text."""
+    p = tmp_path / "tiny_line.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "wkt"])
+        writer.writeheader()
+        for i in range(4):
+            writer.writerow({"id": i, "wkt": f"LINESTRING({i} {i}, {i + 1} {i + 1})"})
+        writer.writerow({"id": 4, "wkt": "MULTILINESTRING((0 0, 1 1), (2 2, 3 3))"})
+    return p
+
+
+@pytest.fixture
+def tiny_polygon_csv(tmp_path):
+    """5-row CSV with a WKT column of POLYGON/MULTIPOLYGON text."""
+    p = tmp_path / "tiny_polygon.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "wkt"])
+        writer.writeheader()
+        for i in range(4):
+            writer.writerow(
+                {
+                    "id": i,
+                    "wkt": (
+                        f"POLYGON(({i} {i}, {i + 1} {i}, {i + 1} {i + 1}, "
+                        f"{i} {i + 1}, {i} {i}))"
+                    ),
+                }
+            )
+        writer.writerow(
+            {
+                "id": 4,
+                "wkt": (
+                    "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), "
+                    "((2 2, 3 2, 3 3, 2 3, 2 2)))"
+                ),
+            }
+        )
+    return p
+
+
+def test_prepare_csv_line_with_wkt_col(tiny_line_csv, tmp_path):
+    """CSV line geometries build via ST_GeomFromText and drop wkt_col from the output."""
+    out = tmp_path / "csv_line.parquet"
     cfg = DatasetConfig(
-        name="tiny",
-        source=CsvSource(path=tiny_csv, geometry_type="polygon"),
+        name="tiny_line",
+        source=CsvSource(path=tiny_line_csv, geometry_type="line", wkt_col="wkt"),
         parquet_path=out,
     )
-    with pytest.raises(NotImplementedError):
-        prepare(cfg)
+    result = prepare(cfg)
+    assert result == out
+    schema = pq.read_schema(str(out))
+    assert "geometry" in schema.names
+    assert "wkt" not in schema.names
+
+
+def test_prepare_csv_polygon_with_wkt_col(tiny_polygon_csv, tmp_path):
+    """CSV polygon geometries build via ST_GeomFromText and drop wkt_col from the output."""
+    out = tmp_path / "csv_polygon.parquet"
+    cfg = DatasetConfig(
+        name="tiny_polygon",
+        source=CsvSource(path=tiny_polygon_csv, geometry_type="polygon", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    result = prepare(cfg)
+    assert result == out
+    schema = pq.read_schema(str(out))
+    assert "geometry" in schema.names
+    assert "wkt" not in schema.names
+
+
+def test_prepare_csv_line_multilinestring_roundtrips(tiny_line_csv, tmp_path):
+    """LINESTRING and MULTILINESTRING WKT both survive the ST_GeomFromText → WKB round-trip."""
+    out = tmp_path / "csv_multiline.parquet"
+    cfg = DatasetConfig(
+        name="tiny_line",
+        source=CsvSource(path=tiny_line_csv, geometry_type="line", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    prepare(cfg)
+    gdf = gpd.read_parquet(out)
+    assert set(gdf.geometry.geom_type) == {"LineString", "MultiLineString"}
+
+
+def test_prepare_csv_polygon_multipolygon_roundtrips(tiny_polygon_csv, tmp_path):
+    """POLYGON and MULTIPOLYGON WKT both survive the ST_GeomFromText → WKB round-trip."""
+    out = tmp_path / "csv_multipolygon.parquet"
+    cfg = DatasetConfig(
+        name="tiny_polygon",
+        source=CsvSource(path=tiny_polygon_csv, geometry_type="polygon", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    prepare(cfg)
+    gdf = gpd.read_parquet(out)
+    assert set(gdf.geometry.geom_type) == {"Polygon", "MultiPolygon"}

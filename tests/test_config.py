@@ -44,7 +44,8 @@ def test_csv_source_geometry_type_defaults_to_point():
 @pytest.mark.parametrize("value", ["point", "line", "polygon"])
 def test_csv_source_geometry_type_coerces_string(value):
     """A plain string is normalised to the matching GeometryType member."""
-    src = CsvSource(path=pathlib.Path("a.csv"), geometry_type=value)
+    kwargs = {"wkt_col": "wkt"} if value in ("line", "polygon") else {}
+    src = CsvSource(path=pathlib.Path("a.csv"), geometry_type=value, **kwargs)
     assert isinstance(src.geometry_type, GeometryType)
     assert src.geometry_type == value
 
@@ -53,3 +54,30 @@ def test_csv_source_rejects_unknown_geometry_type():
     """An unknown geometry_type is rejected at construction time."""
     with pytest.raises(ValueError, match="not a valid GeometryType"):
         CsvSource(path=pathlib.Path("a.csv"), geometry_type="hexagon")
+
+
+# ---------------------------------------------------------------------------
+# CsvSource.wkt_col
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("geometry_type", ["line", "polygon"])
+def test_csv_source_wkt_col_required_for_line_and_polygon(geometry_type):
+    """LINE/POLYGON geometry_type without wkt_col is rejected at construction time."""
+    with pytest.raises(ValueError, match="wkt_col"):
+        CsvSource(path=pathlib.Path("a.csv"), geometry_type=geometry_type)
+
+
+def test_csv_source_wkt_col_not_required_for_point():
+    """POINT (the default) does not require wkt_col."""
+    src = CsvSource(path=pathlib.Path("a.csv"), geometry_type="point")
+    assert src.wkt_col is None
+
+
+@pytest.mark.parametrize("geometry_type", ["line", "polygon"])
+def test_csv_source_wkt_col_accepted_for_line_and_polygon(geometry_type):
+    """wkt_col is stored as given when geometry_type is line/polygon."""
+    src = CsvSource(
+        path=pathlib.Path("a.csv"), geometry_type=geometry_type, wkt_col="wkt"
+    )
+    assert src.wkt_col == "wkt"

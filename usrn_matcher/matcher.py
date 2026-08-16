@@ -387,6 +387,16 @@ class UsrnMatcher:
             help="Column holding the Y / Northing coordinate (default: Northing).",
         )
         p_prepare_csv.add_argument(
+            "--wkt-col",
+            default=None,
+            metavar="COL",
+            help=(
+                "Column holding WKT geometry text (e.g. 'LINESTRING(...)' or "
+                "'POLYGON(...)'). Required when --geometry-type is 'line' or "
+                "'polygon'; unused for 'point'."
+            ),
+        )
+        p_prepare_csv.add_argument(
             "--crs",
             default="EPSG:27700",
             metavar="CRS",
@@ -411,7 +421,9 @@ class UsrnMatcher:
             default=GeometryType.POINT.value,
             help=(
                 "How to build geometries from the CSV (default: point). "
-                "Only 'point' is implemented so far."
+                "'point' uses --x-col/--y-col; 'line' and 'polygon' require "
+                "--wkt-col holding WKT text (LINESTRING/MULTILINESTRING or "
+                "POLYGON/MULTIPOLYGON)."
             ),
         )
         p_prepare_csv.add_argument(
@@ -730,6 +742,7 @@ class UsrnMatcher:
                     x_col=args.x_col,
                     y_col=args.y_col,
                     geometry_type=args.geometry_type,
+                    wkt_col=args.wkt_col,
                     crs=args.crs,
                     row_group_size=args.row_group_size,
                 ),

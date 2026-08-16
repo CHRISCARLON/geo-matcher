@@ -47,6 +47,20 @@ usrn-matcher prepare-csv \
   --y-col Northing
 ```
 
+**RHS from CSV with WKT geometry text (line/polygon):**
+
+```bash
+usrn-matcher prepare-csv \
+  --name          gas_pipes \
+  --geometry-type line \
+  --wkt-col       wkt
+```
+
+`--wkt-col` holds plain WKT text (`LINESTRING(...)`, `MULTILINESTRING(...)`,
+`POLYGON(...)` or `MULTIPOLYGON(...)`) and is required whenever `--geometry-type` is
+`line` or `polygon`. If a WKT value contains commas (most do), make sure your CSV
+quotes that field — most spreadsheet/export tools do this automatically.
+
 **RHS from an existing Parquet (re-optimise / reproject):**
 
 ```bash

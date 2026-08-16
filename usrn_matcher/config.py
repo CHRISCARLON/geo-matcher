@@ -25,12 +25,13 @@ class OgrSource:
 
 @dataclass(frozen=True)
 class CsvSource:
-    """CSV file with explicit x/y coordinate columns."""
+    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries."""
 
     path: pathlib.Path
     x_col: str = "Easting"
     y_col: str = "Northing"
     geometry_type: GeometryType = GeometryType.POINT
+    wkt_col: str | None = None
     crs: str = "EPSG:27700"
     row_group_size: int = 20_000
 
@@ -39,6 +40,16 @@ class CsvSource:
         # match statements can rely on GeometryType members. object.__setattr__
         # because the dataclass is frozen.
         object.__setattr__(self, "geometry_type", GeometryType(self.geometry_type))
+
+        if (
+            self.geometry_type in (GeometryType.LINE, GeometryType.POLYGON)
+            and self.wkt_col is None
+        ):
+            raise ValueError(
+                f"CsvSource.wkt_col is required when geometry_type={self.geometry_type.value!r} "
+                "— LINE/POLYGON geometries are built from a WKT text column "
+                "(POINT is the only geometry_type built from x_col/y_col)."
+            )
 
 
 @dataclass(frozen=True)
