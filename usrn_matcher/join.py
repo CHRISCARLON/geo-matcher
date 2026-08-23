@@ -165,6 +165,20 @@ def configure_sedona_session(sd: SedonaContext, target_partitions: int = 4) -> N
     ).execute()
 
 
+@functools.lru_cache(maxsize=1)
+def _duck() -> duckdb.DuckDBPyConnection:
+    """Shared DuckDB connection for the overlap/dedup post-processors.
+
+    The spatial extension is installed and loaded exactly once per process here.
+    The post-processors re-``register("t", table)`` on each call (which rebinds the
+    view), so reusing this connection avoids paying ``LOAD spatial`` per batch —
+    in a national line join that is dozens-to-hundreds of avoided loads.
+    """
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    return con
+
+
 # ---------------------------------------------------------------------------
 # Arrow, chunking and view helpers
 # ---------------------------------------------------------------------------
@@ -260,20 +274,6 @@ def _distinct_ids(parts: list[pa.Table], id_col: str) -> set:
     return ids
 
 
-@functools.lru_cache(maxsize=1)
-def _duck() -> duckdb.DuckDBPyConnection:
-    """Shared DuckDB connection for the overlap/dedup post-processors.
-
-    The spatial extension is installed and loaded exactly once per process here.
-    The post-processors re-``register("t", table)`` on each call (which rebinds the
-    view), so reusing this connection avoids paying ``LOAD spatial`` per batch —
-    in a national line join that is dozens-to-hundreds of avoided loads.
-    """
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
-    return con
-
-
 def _register_rhs_view(sd: SedonaContext, table: pa.Table, rhs_view: str) -> None:
     """Register an in-memory RHS table as *rhs_view* with a decoded geometry column.
 
@@ -338,10 +338,6 @@ def _register_neighbours_view(
 #   Phase 3  _nearest_dedup          — closest USRN per feature
 #   Phase 4  _nearest_dedup(phase=4) — closest matched neighbour's USRN
 # ---------------------------------------------------------------------------
-
-
-# OVERLAP_EXPR_CORRIDOR (the overlap-scoring expression shared by Phases 1 and 2) is
-# defined in join_sql.py — imported above — alongside the other SQL fragment builders.
 
 
 def _phase1_score_overlap(table: pa.Table, distance_m: float) -> pa.Table:
