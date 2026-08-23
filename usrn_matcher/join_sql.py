@@ -84,11 +84,13 @@ def bbox_nearest_filters(bbox: BBox, distance_m: float) -> str:
     via GeoParquet 1.1 covering metadata (row_groups_spatial_pruned path).
     """
 
-    def _pred(alias: str, expand_m: float) -> str:
+    def _spatial_predicate(alias: str, expand_m: float) -> str:
         wkt = _bbox_to_wkt(bbox, expand_m)
         return f"ST_Intersects({alias}.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), {_SRID}))"
 
-    return f"AND {_pred('u', 0.0)} AND {_pred('s', distance_m)}"
+    return (
+        f"AND {_spatial_predicate('u', 0.0)} AND {_spatial_predicate('s', distance_m)}"
+    )
 
 
 def fill_spatial_filter(template: str, **fragments: str) -> str:

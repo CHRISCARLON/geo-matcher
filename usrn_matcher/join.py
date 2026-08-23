@@ -1441,7 +1441,7 @@ def run_point_join(
         rhs_view,
         query,
         mode,
-        filter_fn=lambda tile: bbox_nearest_filters(tile, distance_m),
+        filter_fn=lambda bbox: bbox_nearest_filters(bbox, distance_m),
         explain=explain,
         output_path=output_path,
         usrn_expand_m=distance_m,
