@@ -13,6 +13,15 @@ from sedonadb.context import SedonaContext
 
 from .config import BBox, DatasetConfig, GeometryType
 from .explain import log_plan
+from .join_sql import (
+    OVERLAP_EXPR_CORRIDOR,
+    bbox_nearest_filters,
+    bbox_pruner,
+    col_fragment,
+    fill_spatial_filter,
+    sql_ident,
+    usrn_spatial_filter,
+)
 from .logger import get_logger
 
 log: logging.Logger = get_logger()
@@ -154,94 +163,6 @@ def configure_sedona_session(sd: SedonaContext, target_partitions: int = 4) -> N
     sd.sql(
         "SET sedona.spatial_join.concurrent_build_side_collection TO false"
     ).execute()
-
-
-# ---------------------------------------------------------------------------
-# SQL fragments and spatial filters
-# ---------------------------------------------------------------------------
-
-
-def _bbox_to_wkt(bbox: BBox, expand_m: float = 0.0) -> str:
-    """Return a closed POLYGON WKT for *bbox*, grown by *expand_m* metres on every side."""
-    xmin, ymin, xmax, ymax = bbox
-    x0, y0, x1, y1 = xmin - expand_m, ymin - expand_m, xmax + expand_m, ymax + expand_m
-    return f"POLYGON(({x0} {y0},{x1} {y0},{x1} {y1},{x0} {y1},{x0} {y0}))"
-
-
-def _usrn_spatial_filter(bbox: BBox, expand_m: float = 0.0, alias: str = "u") -> str:
-    """Return the ``AND ST_Intersects(...)`` fragment that prunes a USRN-side scan.
-
-    *alias* selects which relation to prune — ``u`` for the centreline table, ``ul``
-    for the buffered corridor table that Phase 1 joins for overlap scoring.
-    """
-    wkt = _bbox_to_wkt(bbox, expand_m)
-    return (
-        f"AND ST_Intersects({alias}.geometry, "
-        f"ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
-    )
-
-
-def _bbox_pruner(bbox: BBox) -> str:
-    """Return AND conditions that prune both parquet scans to the given EPSG:27700 bbox.
-
-    Uses ST_Intersects against a fixed bbox polygon so Sedona can skip row groups
-    via GeoParquet 1.1 covering metadata (row_groups_spatial_pruned path).
-
-    Used as ``execute_join``'s ``filter_fn`` for intersect-style joins, and called
-    directly by ``_filtered_line_join`` for the Phase 1 prune.
-    """
-    xmin, ymin, xmax, ymax = bbox
-    polygon_wkt = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
-    bbox_geom = f"ST_SetSRID(ST_GeomFromWKT('{polygon_wkt}'), 27700)"
-    return (
-        f"AND ST_Intersects(u.geometry, {bbox_geom})"
-        f" AND ST_Intersects(s.geometry, {bbox_geom})"
-    )
-
-
-def _bbox_nearest_filters(bbox: BBox, distance_m: float) -> str:
-    """Return AND conditions that prune both sides of a nearest/line join.
-
-    USRNs (``u``) are filtered to the exact bbox; RHS (``s``) is expanded by
-    ``distance_m`` so features just outside the boundary can still match.
-
-    Uses ST_Intersects against fixed bbox polygons so Sedona can skip row groups
-    via GeoParquet 1.1 covering metadata (row_groups_spatial_pruned path).
-    """
-    xmin, ymin, xmax, ymax = bbox
-
-    def _pred(alias: str, x0: float, y0: float, x1: float, y1: float) -> str:
-        wkt = f"POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))"
-        return f"ST_Intersects({alias}.geometry, ST_SetSRID(ST_GeomFromWKT('{wkt}'), 27700))"
-
-    return (
-        f"AND {_pred('u', xmin, ymin, xmax, ymax)}"
-        f" AND {_pred('s', xmin - distance_m, ymin - distance_m, xmax + distance_m, ymax + distance_m)}"
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _read_auto_cols(parquet_path: str) -> tuple[str, ...]:
-    """Return non-geometry column names from a parquet footer — cached per path."""
-    schema = pq.read_schema(parquet_path)
-    return tuple(name for name in schema.names if name not in ("geometry", "bbox"))
-
-
-def _col_fragment(rhs_config: DatasetConfig) -> str:
-    """Return the SELECT fragment for RHS columns (prefixed with a leading comma).
-
-    If ``rhs_config.columns`` is non-empty the listed columns are used as-is.
-    Otherwise all columns except ``geometry`` and the internal ``bbox`` covering
-    column are discovered from the parquet file footer.
-    """
-    if rhs_config.columns:
-        return ", " + ", ".join(f's."{c}"' for c in rhs_config.columns)
-    # rhs_df.schema is a PySedonaSchema (not iterable like PyArrow) so read
-    # column names directly from the parquet file footer instead.
-    # Result is cached per path — only one I/O hit per process.
-    return ", " + ", ".join(
-        f's."{c}"' for c in _read_auto_cols(str(rhs_config.parquet_path))
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -419,30 +340,8 @@ def _register_neighbours_view(
 # ---------------------------------------------------------------------------
 
 
-# Overlap scoring for Phases 1 and 2. ``_u_geom`` is the pre-buffered corridor polygon
-# from ``usrns_line.geometry`` in both cases, so it is intersected directly.
-#
-# Phase 1 matches against raw centrelines, so it joins ``usrns_line`` on ``usrn`` purely
-# to fetch that corridor. Buffering the centreline per row here instead — which is what
-# this used to do — cost 97-99% of Phase 1's wall time (78s of an 82s chunk on
-# gas_pipe), because ST_Buffer scales with vertex count. The corridor is already on
-# disk; reading it is ~20-57x faster and produces bit-identical scores.
-#
-# This does couple the score to the corridor file's buffer width rather than to
-# ``--distance``: if ``prepare-usrns-line --buffer-m`` differs from the match-time
-# ``--distance``, Phase 1's overlap is measured against the file's width. Phase 2 has
-# always behaved that way, so the two phases are now consistent.
-_OVERLAP_EXPR_CORRIDOR = """
-    COALESCE(
-        ST_Length(
-            ST_Intersection(
-                ST_GeomFromWKB(_u_geom),
-                ST_GeomFromWKB(_s_geom)
-            )
-        ) / NULLIF(GREATEST(ST_Length(ST_GeomFromWKB(_s_geom)), {denom}), 0),
-        0.0
-    )
-"""
+# OVERLAP_EXPR_CORRIDOR (the overlap-scoring expression shared by Phases 1 and 2) is
+# defined in join_sql.py — imported above — alongside the other SQL fragment builders.
 
 
 def _phase1_score_overlap(table: pa.Table, distance_m: float) -> pa.Table:
@@ -454,7 +353,7 @@ def _phase1_score_overlap(table: pa.Table, distance_m: float) -> pa.Table:
     """
     con = _duck()
     con.register("t", table)
-    expr = _OVERLAP_EXPR_CORRIDOR.format(denom=2 * distance_m)
+    expr = OVERLAP_EXPR_CORRIDOR.format(denom=2 * distance_m)
     result = con.execute(f"""
         SELECT * EXCLUDE (_u_geom, _s_geom),
             {expr} AS overlap_length_pct
@@ -493,7 +392,7 @@ def _phase2_select_corridors(
     """
     con = _duck()
     con.register("t", table)
-    expr = _OVERLAP_EXPR_CORRIDOR.format(denom=2 * distance_m)
+    expr = OVERLAP_EXPR_CORRIDOR.format(denom=2 * distance_m)
     if exclude_pairs is not None and len(exclude_pairs):
         con.register("_excl", exclude_pairs)
         candidates = f"""
@@ -616,8 +515,9 @@ def _run_in_batches(
             continue
 
         _register_rhs_view(sd, batch, rhs_view)
-        query = template.format(
-            spatial_filter=_usrn_spatial_filter(_table_envelope(batch), expand_m)
+        query = fill_spatial_filter(
+            template,
+            spatial_filter=usrn_spatial_filter(_table_envelope(batch), expand_m),
         )
         if explain and batch_i == 0:
             log_plan(sd, query)
@@ -736,6 +636,40 @@ def _log_line_match_summary(
     )
 
 
+def _assert_corridor_file_current(
+    usrn_parquet: pathlib.Path, usrn_line_parquet: pathlib.Path
+) -> None:
+    """Raise if the corridor file was not built from this USRN file.
+
+    ``prepare-usrns-line`` buffers every row of ``usrns_27700.parquet`` 1:1, so the two
+    files must have identical row counts. Re-running ``prepare-usrns`` against a newer
+    OS Open USRN release without rebuilding the corridor file breaks that — and the
+    failure is silent and wrong rather than loud: Phase 1 inner-joins ``usrns_line`` to
+    fetch each USRN's corridor for scoring, so a USRN with no corridor row produces no
+    Phase 1 match at all. Those pairs resurface through Phase 2 carrying
+    ``is_intersection = false`` and ``match_phase = 2`` — a false statement about a pair
+    that genuinely crosses a centreline — and a crossing with low corridor overlap is
+    dropped outright by Phase 2's threshold. The filename encodes buffer width, not
+    vintage, so a stale file is indistinguishable from a fresh one on disk.
+
+    Row counts come from the parquet footers — metadata only, no geometry is read. A
+    differing USRN release always changes the row count, so this catches the realistic
+    case without paying to compare the two USRN sets.
+    """
+    usrn_rows = pq.read_metadata(str(usrn_parquet)).num_rows
+    corridor_rows = pq.read_metadata(str(usrn_line_parquet)).num_rows
+    if usrn_rows != corridor_rows:
+        raise ValueError(
+            f"Corridor file is stale: {usrn_line_parquet.name} has {corridor_rows:,} rows "
+            f"but {usrn_parquet.name} has {usrn_rows:,}. They must match — "
+            "prepare-usrns-line buffers every USRN 1:1.\n"
+            "Phase 1 would silently lose every match for a USRN missing from the "
+            "corridor file, reporting those pairs as match_phase=2 with "
+            "is_intersection=false. Rebuild it:\n"
+            "  usrn-matcher prepare-usrns-line --buffer-m N --force"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Mode executors
 # ---------------------------------------------------------------------------
@@ -781,8 +715,9 @@ def _national_single_phase(
 
             _register_rhs_view(sd, chunk, rhs_view)
 
-            query = query_template.format(
-                spatial_filter=_usrn_spatial_filter(envelope, usrn_expand_m)
+            query = fill_spatial_filter(
+                query_template,
+                spatial_filter=usrn_spatial_filter(envelope, usrn_expand_m),
             )
             if explain and i == 0:
                 log_plan(sd, query)
@@ -802,6 +737,43 @@ def _national_single_phase(
     finally:
         if writer:
             writer.close()
+
+
+def _filtered_single_phase(
+    sd: SedonaContext,
+    usrn_parquet: pathlib.Path,
+    rhs_parquet: pathlib.Path,
+    rhs_view: str,
+    query: str,
+    bbox: BBox,
+    filter_fn: Callable[[BBox], str],
+    explain: bool,
+) -> pa.Table:
+    """Single-phase FilteredMode executor — one query against a city/custom bbox.
+
+    Used by ``polygon`` and ``point`` joins. Mirrors ``_national_single_phase``
+    structurally: unlike NationalMode there's no chunking, so both parquets are
+    registered as full Sedona views and the query runs once.
+    """
+    sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
+    sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
+
+    usrn_meta = pq.read_metadata(str(usrn_parquet))
+    rhs_meta = pq.read_metadata(str(rhs_parquet))
+    log.info(
+        "USRN: %d rows / %d row groups", usrn_meta.num_rows, usrn_meta.num_row_groups
+    )
+    log.info(
+        "RHS (%s): %d rows / %d row groups",
+        rhs_view,
+        rhs_meta.num_rows,
+        rhs_meta.num_row_groups,
+    )
+    formatted = fill_spatial_filter(query, spatial_filter=filter_fn(bbox))
+    if explain:
+        log_plan(sd, formatted)
+    log.info("Filtered join (usrns × %s)...", rhs_view)
+    return cast(pa.Table, sd.sql(formatted).to_arrow_table())
 
 
 def _national_line_join(
@@ -888,9 +860,10 @@ def _national_line_join(
             log.debug("  Phase 1 (intersect) on %d rows...", len(chunk))
             # Corridor side expanded by distance_m: a buffer reaches that far beyond its
             # centreline, so an unexpanded envelope would prune corridors the join needs.
-            intersect_query = intersect_template.format(
-                spatial_filter=_usrn_spatial_filter(envelope),
-                corridor_filter=_usrn_spatial_filter(envelope, distance_m, alias="ul"),
+            intersect_query = fill_spatial_filter(
+                intersect_template,
+                spatial_filter=usrn_spatial_filter(envelope),
+                corridor_filter=usrn_spatial_filter(envelope, distance_m, alias="ul"),
             )
             if explain and i == 0:
                 log_plan(sd, intersect_query)
@@ -909,8 +882,8 @@ def _national_line_join(
             # expansion — the filter prunes on usrns_line.geometry, the buffered
             # corridor, which already reaches buffer_m past its centreline.
             log.debug("  Phase 2 (corridor) on %d rows...", len(chunk))
-            phase2_query = phase2_template.format(
-                spatial_filter=_usrn_spatial_filter(envelope)
+            phase2_query = fill_spatial_filter(
+                phase2_template, spatial_filter=usrn_spatial_filter(envelope)
             )
             if explain and i == 0:
                 log_plan(sd, phase2_query)
@@ -1086,13 +1059,14 @@ def _filtered_line_join(
         _register_rhs_view(sd, all_features, rhs_view)
 
     # Phase 1: exact ST_Intersects with standard bbox prune (no expansion). The RHS is
-    # the expanded-bbox table, so _bbox_pruner's `s` predicate still does the work of
+    # the expanded-bbox table, so bbox_pruner's `s` predicate still does the work of
     # narrowing it back to the exact bbox — Phase 1's result is unchanged by the switch.
     intersect_result: pa.Table = pa.table({})
     if len(all_features):
-        intersect_query = intersect_template.format(
-            spatial_filter=_bbox_pruner(bbox),
-            corridor_filter=_usrn_spatial_filter(bbox, distance_m, alias="ul"),
+        intersect_query = fill_spatial_filter(
+            intersect_template,
+            spatial_filter=bbox_pruner(bbox),
+            corridor_filter=usrn_spatial_filter(bbox, distance_m, alias="ul"),
         )
         log.debug("Phase 1 query:\n%s", intersect_query)
 
@@ -1112,8 +1086,9 @@ def _filtered_line_join(
         # One query over every feature. No envelope expansion — the filter prunes on
         # usrns_line.geometry, the buffered corridor, which already reaches buffer_m
         # past its centreline.
-        phase2_query = phase2_template.format(
-            spatial_filter=_usrn_spatial_filter(_table_envelope(all_features))
+        phase2_query = fill_spatial_filter(
+            phase2_template,
+            spatial_filter=usrn_spatial_filter(_table_envelope(all_features)),
         )
         if explain:
             log_plan(sd, phase2_query)
@@ -1191,8 +1166,10 @@ def _filtered_line_join(
 # ---------------------------------------------------------------------------
 
 
-# TODO: bring into a single dispatch method again
-# We need to bring the line joins into this too
+# TODO: line joins still have their own dispatch pair (_filtered_line_join /
+# _national_line_join) rather than sharing this dispatcher — unifying single-phase
+# and four-phase dispatch remains a bigger change than the FilteredMode/NationalMode
+# symmetry fix below.
 def execute_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
@@ -1209,39 +1186,17 @@ def execute_join(
 
     Line joins go through ``execute_line_join`` instead.
 
-    FilteredMode: both parquets registered as Sedona views; query is ran directly — logic
-    inlined here, no helper function.
+    FilteredMode: delegates to ``_filtered_single_phase`` — one query against the bbox.
 
     NationalMode: delegates to ``_national_single_phase`` which chunks the RHS and streams
     results. ``usrn_expand_m`` expands the USRN spatial filter per chunk (= ``distance_m``
     for point joins so USRNs just outside the raw chunk envelope remain reachable).
     """
-    rhs_meta = pq.read_metadata(str(rhs_parquet))
-
     match mode:
         case FilteredMode(bbox=bbox):
-            # Create the views here
-            sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
-            sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
-
-            usrn_meta = pq.read_metadata(str(usrn_parquet))
-            log.info(
-                "USRN: %d rows / %d row groups",
-                usrn_meta.num_rows,
-                usrn_meta.num_row_groups,
+            return _filtered_single_phase(
+                sd, usrn_parquet, rhs_parquet, rhs_view, query, bbox, filter_fn, explain
             )
-            log.info(
-                "RHS (%s): %d rows / %d row groups",
-                rhs_view,
-                rhs_meta.num_rows,
-                rhs_meta.num_row_groups,
-            )
-            spatial_filter = filter_fn(bbox)
-            formatted = query.format(spatial_filter=spatial_filter)
-            if explain:
-                log_plan(sd, formatted)
-            log.info("Filtered join (usrns × %s)...", rhs_view)
-            return cast(pa.Table, sd.sql(formatted).to_arrow_table())
 
         case NationalMode(n_chunks=n_chunks):
             if output_path is not None:
@@ -1271,40 +1226,6 @@ def execute_join(
                     n_chunks=n_chunks,
                 )
                 return pq.read_table(str(_path)) if _path.exists() else pa.table({})
-
-
-def _assert_corridor_file_current(
-    usrn_parquet: pathlib.Path, usrn_line_parquet: pathlib.Path
-) -> None:
-    """Raise if the corridor file was not built from this USRN file.
-
-    ``prepare-usrns-line`` buffers every row of ``usrns_27700.parquet`` 1:1, so the two
-    files must have identical row counts. Re-running ``prepare-usrns`` against a newer
-    OS Open USRN release without rebuilding the corridor file breaks that — and the
-    failure is silent and wrong rather than loud: Phase 1 inner-joins ``usrns_line`` to
-    fetch each USRN's corridor for scoring, so a USRN with no corridor row produces no
-    Phase 1 match at all. Those pairs resurface through Phase 2 carrying
-    ``is_intersection = false`` and ``match_phase = 2`` — a false statement about a pair
-    that genuinely crosses a centreline — and a crossing with low corridor overlap is
-    dropped outright by Phase 2's threshold. The filename encodes buffer width, not
-    vintage, so a stale file is indistinguishable from a fresh one on disk.
-
-    Row counts come from the parquet footers — metadata only, no geometry is read. A
-    differing USRN release always changes the row count, so this catches the realistic
-    case without paying to compare the two USRN sets.
-    """
-    usrn_rows = pq.read_metadata(str(usrn_parquet)).num_rows
-    corridor_rows = pq.read_metadata(str(usrn_line_parquet)).num_rows
-    if usrn_rows != corridor_rows:
-        raise ValueError(
-            f"Corridor file is stale: {usrn_line_parquet.name} has {corridor_rows:,} rows "
-            f"but {usrn_parquet.name} has {usrn_rows:,}. They must match — "
-            "prepare-usrns-line buffers every USRN 1:1.\n"
-            "Phase 1 would silently lose every match for a USRN missing from the "
-            "corridor file, reporting those pairs as match_phase=2 with "
-            "is_intersection=false. Rebuild it:\n"
-            "  usrn-matcher prepare-usrns-line --buffer-m N --force"
-        )
 
 
 def execute_line_join(
@@ -1443,13 +1364,13 @@ def run_polygon_join(
         case NationalMode():
             log.info("No bbox supplied — running full national join.")
 
-    col_fragment: str = _col_fragment(rhs_config)
+    cols_fragment: str = col_fragment(rhs_config)
 
     query: str = f"""
         SELECT
             u.usrn,
             u.street_type
-            {col_fragment}
+            {cols_fragment}
         FROM usrns AS u
         JOIN {rhs_view} AS s
           ON ST_Intersects(u.geometry, s.geometry)
@@ -1465,7 +1386,7 @@ def run_polygon_join(
         rhs_view,
         query,
         mode,
-        filter_fn=_bbox_pruner,
+        filter_fn=bbox_pruner,
         explain=explain,
         output_path=output_path,
         usrn_expand_m=0.0,
@@ -1501,13 +1422,13 @@ def run_point_join(
         case NationalMode():
             log.info("No bbox supplied — matching all points.")
 
-    col_fragment: str = _col_fragment(rhs_config)
+    cols_fragment: str = col_fragment(rhs_config)
 
     query: str = f"""
         SELECT
             u.usrn,
             u.street_type
-            {col_fragment},
+            {cols_fragment},
             ST_Distance(u.geometry, s.geometry) AS distance_m
         FROM usrns AS u
         JOIN {rhs_view} AS s
@@ -1524,7 +1445,7 @@ def run_point_join(
         rhs_view,
         query,
         mode,
-        filter_fn=lambda tile: _bbox_nearest_filters(tile, distance_m),
+        filter_fn=lambda tile: bbox_nearest_filters(tile, distance_m),
         explain=explain,
         output_path=output_path,
         usrn_expand_m=distance_m,
@@ -1548,7 +1469,7 @@ def run_line_join(
     phase4_tolerance_m: float = 5.0,
     **_kwargs: Any,
 ) -> pa.Table:
-    """Match each linestring in the RHS dataset to USRNs — always four-phase, two USRN files.
+    """Match each linestring in the RHS dataset to USRNs — always four-phase, two USRN files always needed.
 
     Phase 1 uses ``usrns_27700.parquet`` (centrelines) with ``ST_Intersects`` —
     touching pairs are definitive matches (``match_phase=1``).
@@ -1573,12 +1494,18 @@ def run_line_join(
         raise ValueError(
             "run_line_join requires --rhs-id-col to track matched RHS features between phases."
         )
+    # Validated once here, at the point rhs_id_col first enters the pipeline — every
+    # downstream phase (_phase2_select_corridors, _nearest_dedup, _register_neighbours_view)
+    # threads the same already-validated value through rather than re-checking it.
+    rhs_id_col = sql_ident(rhs_id_col, context="--rhs-id-col")
     if usrn_line_parquet is None:
         raise ValueError(
             "run_line_join requires --usrn-line-parquet. "
             "Run 'usrn-matcher prepare-usrns-line --buffer-m N' first."
         )
+
     rhs_view: str = rhs_config.name
+    log.debug(f"Right handside dataset name is: {rhs_view}")
 
     match mode:
         case FilteredMode(bbox=bbox):
@@ -1590,16 +1517,18 @@ def run_line_join(
         case NationalMode():
             log.info("No bbox supplied — matching all lines (four-phase).")
 
-    col_fragment: str = _col_fragment(rhs_config)
+    # These are the non geometry columns from the RHS dataset
+    # We build this once for all join phases
+    cols_fragment: str = col_fragment(rhs_config)
 
     # The match itself is against the raw centreline (u.geometry). ``usrns_line`` is
     # joined on usrn only to fetch that USRN's pre-buffered corridor for the overlap
-    # score — see _OVERLAP_EXPR_CORRIDOR for why this beats buffering per row.
+    # score — see OVERLAP_EXPR_CORRIDOR for why this beats buffering per row.
     intersect_template: str = f"""
             SELECT
                 u.usrn,
                 u.street_type
-                {col_fragment},
+                {cols_fragment},
                 ST_Distance(u.geometry, s.geometry) AS distance_m,
                 TRUE AS is_intersection,
                 ST_AsWKB(ul.geometry) AS _u_geom,
@@ -1620,7 +1549,7 @@ def run_line_join(
             SELECT
                 u.usrn,
                 u.street_type
-                {col_fragment},
+                {cols_fragment},
                 ST_Distance(u.geometry_line, s.geometry) AS distance_m,
                 FALSE AS is_intersection,
                 ST_AsWKB(u.geometry) AS _u_geom,
@@ -1638,7 +1567,7 @@ def run_line_join(
             SELECT
                 u.usrn,
                 u.street_type
-                {col_fragment},
+                {cols_fragment},
                 ST_Distance(u.geometry, s.geometry) AS distance_m,
                 FALSE AS is_intersection,
                 CAST(0.0 AS DOUBLE) AS overlap_length_pct
@@ -1658,7 +1587,7 @@ def run_line_join(
             SELECT
                 n.usrn,
                 n.street_type
-                {col_fragment},
+                {cols_fragment},
                 ST_Distance(u.geometry, s.geometry) AS distance_m,
                 FALSE AS is_intersection,
                 CAST(0.0 AS DOUBLE) AS overlap_length_pct
