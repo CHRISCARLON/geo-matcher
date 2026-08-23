@@ -1,10 +1,10 @@
-"""Tests for DatasetConfig."""
+"""Unit tests for DatasetConfig."""
 
 import pathlib
 
 import pytest
 
-from usrn_matcher.config import CsvSource, DatasetConfig, GeometryType
+from usrn_matcher.config import CsvSource, DatasetConfig, GeometryType, UsrnSource
 
 pytestmark = pytest.mark.unit
 
@@ -81,3 +81,26 @@ def test_csv_source_wkt_col_accepted_for_line_and_polygon(geometry_type):
         path=pathlib.Path("a.csv"), geometry_type=geometry_type, wkt_col="wkt"
     )
     assert src.wkt_col == "wkt"
+
+
+# ---------------------------------------------------------------------------
+# UsrnSource
+# ---------------------------------------------------------------------------
+
+
+def test_usrn_source_buffer_m_defaults_to_none():
+    """buffer_m defaults to None (plain centreline mode)."""
+    src = UsrnSource(path=pathlib.Path("osopenusrn.gpkg"))
+    assert src.buffer_m is None
+
+
+def test_usrn_source_crs_defaults_to_epsg_27700():
+    """crs defaults to 'EPSG:27700', matching every other source struct."""
+    src = UsrnSource(path=pathlib.Path("osopenusrn.gpkg"))
+    assert src.crs == "EPSG:27700"
+
+
+def test_usrn_source_buffer_m_stored_when_set():
+    """Setting buffer_m stores it correctly (buffered corridor mode)."""
+    src = UsrnSource(path=pathlib.Path("usrns_27700.parquet"), buffer_m=10.0)
+    assert src.buffer_m == 10.0

@@ -875,7 +875,11 @@ def _national_line_join(
             phase2_parts: list[pa.Table] = []
             phase3_parts: list[pa.Table] = []
 
+            # Get the chunk
             chunk = rhs_pf.read_row_groups(chunk_rgs)
+
+            # Calculate its bbox
+            # So we can spatially filter
             envelope = _row_group_envelope(rhs_pf, chunk_rgs, bbox_idx)
 
             _register_rhs_view(sd, chunk, rhs_view)

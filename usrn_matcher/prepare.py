@@ -16,7 +16,7 @@ from .config import (
     GeometryType,
     OgrSource,
     ParquetSource,
-    UsrnLineSource,
+    UsrnSource,
 )
 from .logger import get_logger
 
@@ -294,7 +294,12 @@ def _csv_geometry_sql(source: CsvSource) -> tuple[str, str]:
     ``exclude_cols_sql`` names the raw source column(s) consumed to build it, ready to
     drop from the output via ``* EXCLUDE (...)``.
     """
-    match source.geometry_type:
+    # CsvSource.__post_init__ already normalises geometry_type to a real GeometryType
+    # member at construction time; re-wrapping here just re-narrows the static type
+    # (the field itself is typed GeometryType | str to accept plain strings from the
+    # CLI).
+    geometry_type: GeometryType = GeometryType(source.geometry_type)
+    match geometry_type:
         case GeometryType.POINT:
             return (
                 f'ST_Point("{source.x_col}", "{source.y_col}")',
@@ -430,13 +435,25 @@ def _prepare_parquet(
     return parquet_path
 
 
-def _prepare_usrn_line(
-    source: UsrnLineSource,
+def _prepare_usrn_buffer(
+    source: UsrnSource,
     parquet_path: pathlib.Path,
     name: str,
     force: bool,
     threads: int | None = None,
 ) -> pathlib.Path:
+    """Buffer an already-prepared USRN centreline GeoParquet for line join Phase 2.
+
+    Private helper — only reachable with ``source.buffer_m`` set. Call
+    ``_prepare_usrn`` instead, which dispatches correctly based on ``source.buffer_m``.
+    """
+    if source.buffer_m is None:
+        raise ValueError(
+            "_prepare_usrn_buffer requires UsrnSource.buffer_m to be set; got None. "
+            "Call _prepare_usrn(source, ...) instead — it dispatches to the plain "
+            "OGR path when buffer_m is None."
+        )
+
     if _should_skip(parquet_path, force):
         return parquet_path
 
@@ -473,11 +490,35 @@ def _prepare_usrn_line(
         core_select_sql,
         parquet_path,
         source.row_group_size,
-        crs="EPSG:27700",
+        crs=source.crs,
         primary_column="geometry",
     )
     _log_prepared(parquet_path, elapsed)
     return parquet_path
+
+
+def _prepare_usrn(
+    source: UsrnSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    """Dispatch a UsrnSource to plain (centreline) or buffered (corridor) preparation.
+
+    ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable USRN source;
+    delegates to ``_prepare_ogr`` via a transient ``OgrSource`` built from the
+    ``path``/``crs``/``row_group_size`` fields shared by both structs.
+
+    ``source.buffer_m`` set — ``source.path`` is an already-prepared USRN centreline
+    GeoParquet; delegates to ``_prepare_usrn_buffer`` to build the buffered corridor.
+    """
+    if source.buffer_m is None:
+        ogr_source = OgrSource(
+            path=source.path, crs=source.crs, row_group_size=source.row_group_size
+        )
+        return _prepare_ogr(ogr_source, parquet_path, name, force, threads)
+    return _prepare_usrn_buffer(source, parquet_path, name, force, threads)
 
 
 def prepare(
@@ -492,7 +533,8 @@ def prepare(
     - ``OgrSource`` — any GDAL-readable vector format (GeoPackage, Shapefile, …)
     - ``CsvSource`` — CSV with explicit x/y coordinate columns, or a WKT text column
     - ``ParquetSource`` — existing GeoParquet to re-sort and re-compress
-    - ``UsrnLineSource`` — buffer USRN centrelines for line join Phase 2
+    - ``UsrnSource`` — USRN prep: plain centrelines (``buffer_m=None``) or
+      buffered corridors for line-join Phase 2 (``buffer_m=<float>``)
 
     A ``config.source`` must always be provided.
 
@@ -529,7 +571,5 @@ def prepare(
             return _prepare_parquet(
                 src, config.parquet_path, config.name, force, threads
             )
-        case UsrnLineSource() as src:
-            return _prepare_usrn_line(
-                src, config.parquet_path, config.name, force, threads
-            )
+        case UsrnSource() as src:
+            return _prepare_usrn(src, config.parquet_path, config.name, force, threads)

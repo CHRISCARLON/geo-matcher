@@ -1,4 +1,4 @@
-"""Tests for the prepare module: prepare() with source type structs."""
+"""Unit tests for the prepare module: prepare() with source type structs."""
 
 import csv
 import json
@@ -10,7 +10,7 @@ import pytest
 from shapely.geometry import box
 
 import usrn_matcher.prepare as prepare_module
-from usrn_matcher import CsvSource, DatasetConfig, OgrSource
+from usrn_matcher import CsvSource, DatasetConfig, OgrSource, UsrnSource
 from usrn_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
@@ -55,6 +55,7 @@ def prepared_parquet(tiny_gpkg, tmp_path):
 def test_geoparquet_metadata_patch(prepared_parquet):
     """GeoParquet metadata is patched to version 1.1.0."""
     geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
+    print(json.dumps(geo, indent=2))
     assert geo["version"] == "1.1.0"
 
 
@@ -75,6 +76,9 @@ def test_compression_zstd(prepared_parquet):
     rg = pq.ParquetFile(prepared_parquet).metadata.row_group(0)
     for i in range(rg.num_columns):
         col = rg.column(i)
+
+        print(f"The compression is: {col.compression}")
+
         assert col.compression == "ZSTD", (
             f"{col.path_in_schema}: expected ZSTD, got {col.compression}"
         )
@@ -205,6 +209,107 @@ def test_prepare_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
         RuntimeError, match="Failed to patch GeoParquet covering metadata"
     ):
         prepare(cfg, force=True)
+
+
+# ---------------------------------------------------------------------------
+# UsrnSource tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_usrn_gdf():
+    """5-row synthetic USRN-shaped GeoDataFrame — usrn, street_type, LineString geometry."""
+    from shapely.geometry import LineString
+
+    geoms = [
+        LineString([(i * 1000, i * 1000), (i * 1000 + 500, i * 1000 + 500)])
+        for i in range(5)
+    ]
+    return gpd.GeoDataFrame(
+        {
+            "usrn": range(10000, 10005),
+            "street_type": ["Named Road"] * 5,
+            "geometry": geoms,
+        },
+        crs="EPSG:27700",
+    )
+
+
+@pytest.fixture
+def tiny_usrn_gpkg(tiny_usrn_gdf, tmp_path):
+    """Write tiny_usrn_gdf to a real GeoPackage — input for UsrnSource plain-mode tests."""
+    p = tmp_path / "tiny_usrn.gpkg"
+    tiny_usrn_gdf.to_file(str(p), driver="GPKG")
+    return p
+
+
+@pytest.fixture
+def tiny_usrn_parquet(tiny_usrn_gpkg, tmp_path):
+    """Prepared USRN centreline GeoParquet (UsrnSource plain mode) — input for buffered-mode tests."""
+    out = tmp_path / "tiny_usrns_27700.parquet"
+    cfg = DatasetConfig(
+        name="tiny_usrns", source=UsrnSource(path=tiny_usrn_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
+    return out
+
+
+def test_prepare_usrn_plain_mode_matches_ogr(tiny_usrn_gpkg, tmp_path):
+    """UsrnSource(buffer_m=None) behaves like _prepare_ogr — plain centreline GeoParquet."""
+    out = tmp_path / "usrn_plain_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_plain", source=UsrnSource(path=tiny_usrn_gpkg), parquet_path=out
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert "geometry" in schema.names
+    assert "geometry_line" not in schema.names  # plain mode never adds this column
+
+    geo = json.loads(schema.metadata[b"geo"])
+    assert geo["version"] == "1.1.0"
+    assert "27700" in str(geo["columns"]["geometry"].get("crs"))
+
+
+def test_prepare_usrn_buffered_mode_adds_geometry_line(tiny_usrn_parquet, tmp_path):
+    """UsrnSource(buffer_m=10.0) buffers `geometry`, keeps the original in `geometry_line`."""
+    out = tmp_path / "usrn_buffered_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_buffered",
+        source=UsrnSource(path=tiny_usrn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert "geometry" in schema.names
+    assert "geometry_line" in schema.names
+
+
+def test_prepare_usrn_buffered_mode_geometry_larger_than_line(
+    tiny_usrn_parquet, tmp_path
+):
+    """The buffered `geometry` column's bbox is strictly larger than `geometry_line`'s."""
+    import duckdb
+
+    out = tmp_path / "usrn_buffered_bbox_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_buffered_bbox",
+        source=UsrnSource(path=tiny_usrn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT
+            MIN(ST_XMin(geometry)), MAX(ST_XMax(geometry)),
+            MIN(ST_XMin(geometry_line)), MAX(ST_XMax(geometry_line))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None  # aggregate query always returns exactly one row
+    buf_xmin, buf_xmax, line_xmin, line_xmax = row
+
+    assert (buf_xmax - buf_xmin) > (line_xmax - line_xmin)
 
 
 # ---------------------------------------------------------------------------

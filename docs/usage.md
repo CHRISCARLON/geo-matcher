@@ -109,14 +109,14 @@ usrn-matcher match --rhs-name soil --output parquet
 ```python
 import pathlib
 
-from usrn_matcher import DatasetConfig, OgrSource, CsvSource, UsrnMatcher
+from usrn_matcher import DatasetConfig, UsrnSource, CsvSource, UsrnMatcher
 from usrn_matcher.prepare import prepare
 from usrn_matcher.bboxes import LEEDS
 
 # Prepare USRNs
 prepare(DatasetConfig(
     name="usrns",
-    source=OgrSource(path="input_data/osopenusrn.gpkg", row_group_size=20_000),
+    source=UsrnSource(path="input_data/osopenusrn.gpkg", row_group_size=20_000),
     parquet_path="output_data/usrns_27700.parquet",
 ))
 

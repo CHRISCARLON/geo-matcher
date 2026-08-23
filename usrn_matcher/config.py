@@ -30,7 +30,7 @@ class CsvSource:
     path: pathlib.Path
     x_col: str = "Easting"
     y_col: str = "Northing"
-    geometry_type: GeometryType = GeometryType.POINT
+    geometry_type: GeometryType | str = GeometryType.POINT
     wkt_col: str | None = None
     crs: str = "EPSG:27700"
     row_group_size: int = 20_000
@@ -38,15 +38,20 @@ class CsvSource:
     def __post_init__(self) -> None:
         # Normalise a plain string ("point") into the enum member so downstream
         # match statements can rely on GeometryType members. object.__setattr__
-        # because the dataclass is frozen.
-        object.__setattr__(self, "geometry_type", GeometryType(self.geometry_type))
+        # because the dataclass is frozen. geometry_type is kept as a local (rather
+        # than re-reading self.geometry_type below) because mypy doesn't narrow
+        # through object.__setattr__ — the field's declared type is
+        # `GeometryType | str`, so a later `self.geometry_type.value` would still
+        # be checked against `str`, which has no `.value`.
+        geometry_type: GeometryType = GeometryType(self.geometry_type)
+        object.__setattr__(self, "geometry_type", geometry_type)
 
         if (
-            self.geometry_type in (GeometryType.LINE, GeometryType.POLYGON)
+            geometry_type in (GeometryType.LINE, GeometryType.POLYGON)
             and self.wkt_col is None
         ):
             raise ValueError(
-                f"CsvSource.wkt_col is required when geometry_type={self.geometry_type.value!r} "
+                f"CsvSource.wkt_col is required when geometry_type={geometry_type.value!r} "
                 "— LINE/POLYGON geometries are built from a WKT text column "
                 "(POINT is the only geometry_type built from x_col/y_col)."
             )
@@ -73,21 +78,32 @@ class ParquetSource:
 
 
 @dataclass(frozen=True)
-class UsrnLineSource:
-    """Buffered USRN centreline GeoParquet for line join Phase 2.
+class UsrnSource:
+    """USRN preparation, in one of two modes selected by ``buffer_m``.
 
-    Reads an existing ``usrns_27700.parquet`` and produces a new file where
-    ``geometry`` is ``ST_Buffer(centreline, buffer_m)`` (the join predicate) and
-    ``geometry_line`` is the original centreline WKB (used for distance and
-    overlap calculations). ``buffer_m`` must be >= ``--distance`` at match time.
+    ``buffer_m=None`` (default) — ``path`` points at a raw OGR-readable USRN
+    source (e.g. the OS Open USRN GeoPackage). Produces a plain Hilbert-sorted
+    centreline GeoParquet — equivalent to preparing ``path`` via ``OgrSource``.
+
+    ``buffer_m=<float>`` — ``path`` points at an already-prepared USRN
+    centreline GeoParquet (e.g. the output of the ``buffer_m=None`` mode).
+    Produces a buffered corridor GeoParquet for line-join Phase 2, where
+    ``geometry`` is ``ST_Buffer(centreline, buffer_m)`` (the join predicate)
+    and ``geometry_line`` is the original centreline WKB (used for distance
+    and overlap calculations). ``buffer_m`` must be >= ``--distance`` at
+    match time.
     """
 
     path: pathlib.Path
-    buffer_m: float
+    crs: str = "EPSG:27700"
+    buffer_m: float | None = None
     row_group_size: int = 20_000
 
 
-AnySource: TypeAlias = OgrSource | CsvSource | ParquetSource | UsrnLineSource
+MatchSource: TypeAlias = OgrSource | CsvSource | ParquetSource
+"""The three formats usable as the RHS/match dataset."""
+
+AnySource: TypeAlias = MatchSource | UsrnSource
 
 DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
 DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")
@@ -109,8 +125,8 @@ class DatasetConfig:
         Path to the source file. Mutually optional with ``source`` — provide
         one or the other. Kept for backward compatibility; prefer ``source``.
     source:
-        Typed source descriptor (``OgrSource``, ``CsvSource``, or
-        ``ParquetSource``). When provided, ``source_path`` is derived from
+        Typed source descriptor (``OgrSource``, ``CsvSource``, ``ParquetSource``,
+        or ``UsrnSource``). When provided, ``source_path`` is derived from
         ``source.path`` if not given explicitly. The ``prepare()`` function
         dispatches on this type to choose the correct reader.
     parquet_path:
