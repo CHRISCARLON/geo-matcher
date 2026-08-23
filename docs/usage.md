@@ -47,6 +47,20 @@ usrn-matcher prepare-csv \
   --y-col Northing
 ```
 
+**RHS from CSV with WKT geometry text (line/polygon):**
+
+```bash
+usrn-matcher prepare-csv \
+  --name          gas_pipes \
+  --geometry-type line \
+  --wkt-col       wkt
+```
+
+`--wkt-col` holds plain WKT text (`LINESTRING(...)`, `MULTILINESTRING(...)`,
+`POLYGON(...)` or `MULTIPOLYGON(...)`) and is required whenever `--geometry-type` is
+`line` or `polygon`. If a WKT value contains commas (most do), make sure your CSV
+quotes that field — most spreadsheet/export tools do this automatically.
+
 **RHS from an existing Parquet (re-optimise / reproject):**
 
 ```bash
@@ -95,14 +109,14 @@ usrn-matcher match --rhs-name soil --output parquet
 ```python
 import pathlib
 
-from usrn_matcher import DatasetConfig, OgrSource, CsvSource, UsrnMatcher
+from usrn_matcher import DatasetConfig, UsrnSource, CsvSource, UsrnMatcher
 from usrn_matcher.prepare import prepare
 from usrn_matcher.bboxes import LEEDS
 
 # Prepare USRNs
 prepare(DatasetConfig(
     name="usrns",
-    source=OgrSource(path="input_data/osopenusrn.gpkg", row_group_size=20_000),
+    source=UsrnSource(path="input_data/osopenusrn.gpkg", row_group_size=20_000),
     parquet_path="output_data/usrns_27700.parquet",
 ))
 

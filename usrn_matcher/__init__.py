@@ -5,9 +5,10 @@ from .config import (
     CsvSource,
     DatasetConfig,
     GeometryType,
+    MatchSource,
     OgrSource,
     ParquetSource,
-    UsrnLineSource,
+    UsrnSource,
 )
 from .join import (
     AnalysisMode,
@@ -27,9 +28,10 @@ __all__ = [
     "CsvSource",
     "DatasetConfig",
     "GeometryType",
+    "MatchSource",
     "OgrSource",
     "ParquetSource",
-    "UsrnLineSource",
+    "UsrnSource",
     "AnalysisMode",
     "FilteredMode",
     "NationalMode",

@@ -1,7 +1,8 @@
-"""Tests for the prepare module: prepare() with source type structs."""
+"""Unit tests for the prepare module: prepare() with source type structs."""
 
 import csv
 import json
+import pathlib
 
 import geopandas as gpd
 import pyarrow.parquet as pq
@@ -9,7 +10,7 @@ import pytest
 from shapely.geometry import box
 
 import usrn_matcher.prepare as prepare_module
-from usrn_matcher import CsvSource, DatasetConfig, OgrSource
+from usrn_matcher import CsvSource, DatasetConfig, OgrSource, UsrnSource
 from usrn_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
@@ -54,6 +55,7 @@ def prepared_parquet(tiny_gpkg, tmp_path):
 def test_geoparquet_metadata_patch(prepared_parquet):
     """GeoParquet metadata is patched to version 1.1.0."""
     geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
+    print(json.dumps(geo, indent=2))
     assert geo["version"] == "1.1.0"
 
 
@@ -74,6 +76,9 @@ def test_compression_zstd(prepared_parquet):
     rg = pq.ParquetFile(prepared_parquet).metadata.row_group(0)
     for i in range(rg.num_columns):
         col = rg.column(i)
+
+        print(f"The compression is: {col.compression}")
+
         assert col.compression == "ZSTD", (
             f"{col.path_in_schema}: expected ZSTD, got {col.compression}"
         )
@@ -207,6 +212,107 @@ def test_prepare_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# UsrnSource tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_usrn_gdf():
+    """5-row synthetic USRN-shaped GeoDataFrame — usrn, street_type, LineString geometry."""
+    from shapely.geometry import LineString
+
+    geoms = [
+        LineString([(i * 1000, i * 1000), (i * 1000 + 500, i * 1000 + 500)])
+        for i in range(5)
+    ]
+    return gpd.GeoDataFrame(
+        {
+            "usrn": range(10000, 10005),
+            "street_type": ["Named Road"] * 5,
+            "geometry": geoms,
+        },
+        crs="EPSG:27700",
+    )
+
+
+@pytest.fixture
+def tiny_usrn_gpkg(tiny_usrn_gdf, tmp_path):
+    """Write tiny_usrn_gdf to a real GeoPackage — input for UsrnSource plain-mode tests."""
+    p = tmp_path / "tiny_usrn.gpkg"
+    tiny_usrn_gdf.to_file(str(p), driver="GPKG")
+    return p
+
+
+@pytest.fixture
+def tiny_usrn_parquet(tiny_usrn_gpkg, tmp_path):
+    """Prepared USRN centreline GeoParquet (UsrnSource plain mode) — input for buffered-mode tests."""
+    out = tmp_path / "tiny_usrns_27700.parquet"
+    cfg = DatasetConfig(
+        name="tiny_usrns", source=UsrnSource(path=tiny_usrn_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
+    return out
+
+
+def test_prepare_usrn_plain_mode_matches_ogr(tiny_usrn_gpkg, tmp_path):
+    """UsrnSource(buffer_m=None) behaves like _prepare_ogr — plain centreline GeoParquet."""
+    out = tmp_path / "usrn_plain_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_plain", source=UsrnSource(path=tiny_usrn_gpkg), parquet_path=out
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert "geometry" in schema.names
+    assert "geometry_line" not in schema.names  # plain mode never adds this column
+
+    geo = json.loads(schema.metadata[b"geo"])
+    assert geo["version"] == "1.1.0"
+    assert "27700" in str(geo["columns"]["geometry"].get("crs"))
+
+
+def test_prepare_usrn_buffered_mode_adds_geometry_line(tiny_usrn_parquet, tmp_path):
+    """UsrnSource(buffer_m=10.0) buffers `geometry`, keeps the original in `geometry_line`."""
+    out = tmp_path / "usrn_buffered_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_buffered",
+        source=UsrnSource(path=tiny_usrn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert "geometry" in schema.names
+    assert "geometry_line" in schema.names
+
+
+def test_prepare_usrn_buffered_mode_geometry_larger_than_line(
+    tiny_usrn_parquet, tmp_path
+):
+    """The buffered `geometry` column's bbox is strictly larger than `geometry_line`'s."""
+    import duckdb
+
+    out = tmp_path / "usrn_buffered_bbox_27700.parquet"
+    cfg = DatasetConfig(
+        name="usrn_buffered_bbox",
+        source=UsrnSource(path=tiny_usrn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT
+            MIN(ST_XMin(geometry)), MAX(ST_XMax(geometry)),
+            MIN(ST_XMin(geometry_line)), MAX(ST_XMax(geometry_line))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None  # aggregate query always returns exactly one row
+    buf_xmin, buf_xmax, line_xmin, line_xmax = row
+
+    assert (buf_xmax - buf_xmin) > (line_xmax - line_xmin)
+
+
+# ---------------------------------------------------------------------------
 # CsvSource tests
 # ---------------------------------------------------------------------------
 
@@ -316,13 +422,112 @@ def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
     assert "Northing" not in schema.names
 
 
-def test_prepare_csv_unsupported_geometry_type_raises(tiny_csv, tmp_path):
-    """Unsupported geometry types raise NotImplementedError."""
-    out = tmp_path / "csv_bad.parquet"
+@pytest.mark.parametrize("geometry_type", ["line", "polygon"])
+def test_prepare_csv_wkt_col_required_raises(geometry_type):
+    """geometry_type='line'/'polygon' without wkt_col is rejected at construction time,
+    before prepare() is ever called."""
+    with pytest.raises(ValueError, match="wkt_col"):
+        CsvSource(path=pathlib.Path("does_not_matter.csv"), geometry_type=geometry_type)
+
+
+# ---------------------------------------------------------------------------
+# CsvSource LINE/POLYGON (WKT) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_line_csv(tmp_path):
+    """5-row CSV with a WKT column of LINESTRING/MULTILINESTRING text."""
+    p = tmp_path / "tiny_line.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "wkt"])
+        writer.writeheader()
+        for i in range(4):
+            writer.writerow({"id": i, "wkt": f"LINESTRING({i} {i}, {i + 1} {i + 1})"})
+        writer.writerow({"id": 4, "wkt": "MULTILINESTRING((0 0, 1 1), (2 2, 3 3))"})
+    return p
+
+
+@pytest.fixture
+def tiny_polygon_csv(tmp_path):
+    """5-row CSV with a WKT column of POLYGON/MULTIPOLYGON text."""
+    p = tmp_path / "tiny_polygon.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "wkt"])
+        writer.writeheader()
+        for i in range(4):
+            writer.writerow(
+                {
+                    "id": i,
+                    "wkt": (
+                        f"POLYGON(({i} {i}, {i + 1} {i}, {i + 1} {i + 1}, "
+                        f"{i} {i + 1}, {i} {i}))"
+                    ),
+                }
+            )
+        writer.writerow(
+            {
+                "id": 4,
+                "wkt": (
+                    "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), "
+                    "((2 2, 3 2, 3 3, 2 3, 2 2)))"
+                ),
+            }
+        )
+    return p
+
+
+def test_prepare_csv_line_with_wkt_col(tiny_line_csv, tmp_path):
+    """CSV line geometries build via ST_GeomFromText and drop wkt_col from the output."""
+    out = tmp_path / "csv_line.parquet"
     cfg = DatasetConfig(
-        name="tiny",
-        source=CsvSource(path=tiny_csv, geometry_type="polygon"),
+        name="tiny_line",
+        source=CsvSource(path=tiny_line_csv, geometry_type="line", wkt_col="wkt"),
         parquet_path=out,
     )
-    with pytest.raises(NotImplementedError):
-        prepare(cfg)
+    result = prepare(cfg)
+    assert result == out
+    schema = pq.read_schema(str(out))
+    assert "geometry" in schema.names
+    assert "wkt" not in schema.names
+
+
+def test_prepare_csv_polygon_with_wkt_col(tiny_polygon_csv, tmp_path):
+    """CSV polygon geometries build via ST_GeomFromText and drop wkt_col from the output."""
+    out = tmp_path / "csv_polygon.parquet"
+    cfg = DatasetConfig(
+        name="tiny_polygon",
+        source=CsvSource(path=tiny_polygon_csv, geometry_type="polygon", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    result = prepare(cfg)
+    assert result == out
+    schema = pq.read_schema(str(out))
+    assert "geometry" in schema.names
+    assert "wkt" not in schema.names
+
+
+def test_prepare_csv_line_multilinestring_roundtrips(tiny_line_csv, tmp_path):
+    """LINESTRING and MULTILINESTRING WKT both survive the ST_GeomFromText → WKB round-trip."""
+    out = tmp_path / "csv_multiline.parquet"
+    cfg = DatasetConfig(
+        name="tiny_line",
+        source=CsvSource(path=tiny_line_csv, geometry_type="line", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    prepare(cfg)
+    gdf = gpd.read_parquet(out)
+    assert set(gdf.geometry.geom_type) == {"LineString", "MultiLineString"}
+
+
+def test_prepare_csv_polygon_multipolygon_roundtrips(tiny_polygon_csv, tmp_path):
+    """POLYGON and MULTIPOLYGON WKT both survive the ST_GeomFromText → WKB round-trip."""
+    out = tmp_path / "csv_multipolygon.parquet"
+    cfg = DatasetConfig(
+        name="tiny_polygon",
+        source=CsvSource(path=tiny_polygon_csv, geometry_type="polygon", wkt_col="wkt"),
+        parquet_path=out,
+    )
+    prepare(cfg)
+    gdf = gpd.read_parquet(out)
+    assert set(gdf.geometry.geom_type) == {"Polygon", "MultiPolygon"}

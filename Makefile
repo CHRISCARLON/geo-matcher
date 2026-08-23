@@ -8,8 +8,10 @@
 	match-soil-national match-soil-national-explain \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
-	match-gas-pipe-sample match-gas-pipe-national \
-	match-ngn-mains-sample match-ngn-mains-national \
+	match-gas-pipe-sample match-gas-pipe-sample-explain \
+	match-gas-pipe-national match-gas-pipe-national-explain \
+	match-ngn-mains-sample match-ngn-mains-sample-explain \
+	match-ngn-mains-national match-ngn-mains-national-explain \
 	clean-output clean-matched
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -59,7 +61,7 @@ prepare-counts:
 prepare-gas-pipe:
 	usrn-matcher prepare-parquet \
 		--name         gas_pipe \
-		--parquet      /Users/cmcarlon/Downloads/gas-pipe-infrastructure-gpi_open.parquet \
+		--parquet      downloads/gas-pipe-infrastructure-gpi_open.parquet \
 		--geometry-col geo_shape \
 		--source-crs   EPSG:4326 \
 		--threads      2 \
@@ -80,15 +82,14 @@ match-soil-national:
 	usrn-matcher match \
 		--rhs-name   soil \
 		--mode       polygon \
-		--output     parquet \
+		--output     parquet
 
 match-stops-national:
 	usrn-matcher match \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
-		--output   parquet \
-		--explain
+		--output   parquet
 
 match-stops-london:
 	usrn-matcher match \
@@ -96,15 +97,14 @@ match-stops-london:
 		--mode     point \
 		--distance 10 \
 		--output   parquet \
-		--explain \
-		--city LONDON
+		--city     LONDON
 
 match-counts-national:
 	usrn-matcher match \
 		--rhs-name count_points \
 		--mode     point \
 		--distance 10 \
-		--output   csv \
+		--output   csv
 
 match-soil-leeds:
 	usrn-matcher match \
@@ -128,6 +128,9 @@ match-soil-national-explain:
 		--output   csv \
 		--explain
 
+# --explain runs EXPLAIN ANALYZE and then the query again, so it doubles every run.
+# Kept out of the default targets; use the -explain variants when you want a plan.
+
 match-gas-pipe-sample:
 	usrn-matcher match \
 		--rhs-name         gas_pipe \
@@ -137,11 +140,34 @@ match-gas-pipe-sample:
 		--rhs-id-col       asset_id \
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
-		--city             MANCHESTER_CITY_CENTRE \
+		--city             MANCHESTER \
+		--output           csv
+
+match-gas-pipe-sample-explain:
+	usrn-matcher match \
+		--rhs-name         gas_pipe \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       asset_id \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--city             MANCHESTER \
 		--output           csv \
 		--explain
 
 match-gas-pipe-national:
+	usrn-matcher match \
+		--rhs-name         gas_pipe \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       asset_id \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--output           parquet
+
+match-gas-pipe-national-explain:
 	usrn-matcher match \
 		--rhs-name         gas_pipe \
 		--mode             line \
@@ -163,10 +189,33 @@ match-ngn-mains-sample:
 		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
 		--threads          4 \
 		--city             NEWCASTLE \
+		--output           csv
+
+match-ngn-mains-sample-explain:
+	usrn-matcher match \
+		--rhs-name         ngn_mains \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       ASSET_ID \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--city             NEWCASTLE \
 		--output           csv \
 		--explain
 
 match-ngn-mains-national:
+	usrn-matcher match \
+		--rhs-name         ngn_mains \
+		--mode             line \
+		--distance         10 \
+		--phase3-distance  15 \
+		--rhs-id-col       ASSET_ID \
+		--usrn-line-parquet output_data/usrns_line_10m_27700.parquet \
+		--threads          4 \
+		--output           parquet
+
+match-ngn-mains-national-explain:
 	usrn-matcher match \
 		--rhs-name         ngn_mains \
 		--mode             line \

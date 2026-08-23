@@ -153,21 +153,23 @@ def test_col_fragment_auto_reads_parquet_schema(rhs_parquet: pathlib.Path):
 #
 #   FULL_CORRIDOR    covers 100 m → overlap 1.00   (what a Phase 1 street looks like)
 #   HALF_CORRIDOR    covers  50 m → overlap 0.50   (a genuine adjacent street)
-#   SLIVER_CORRIDOR  covers   5 m → overlap 0.05   (a crossing, below the 10 % floor)
+#   PART_CORRIDOR  covers   5 m → overlap 0.05   (a crossing, below the 10 % floor)
 # ---------------------------------------------------------------------------
 
 _MAX_D = 10.0
 _FEATURE_LINE = "LINESTRING(0 0, 100 0)"
 _FULL_CORRIDOR = "POLYGON((0 -5, 100 -5, 100 5, 0 5, 0 -5))"
 _HALF_CORRIDOR = "POLYGON((0 -5, 50 -5, 50 5, 0 5, 0 -5))"
-_SLIVER_CORRIDOR = "POLYGON((0 -5, 5 -5, 5 5, 0 5, 0 -5))"
+_PART_CORRIDOR = "POLYGON((0 -5, 5 -5, 5 5, 0 5, 0 -5))"
 
 
 def _wkb(wkt: str) -> bytes:
     """WKB for a WKT literal, via DuckDB's spatial extension."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
-    return con.execute(f"SELECT ST_AsWKB(ST_GeomFromText('{wkt}'))").fetchone()[0]
+    row = con.execute(f"SELECT ST_AsWKB(ST_GeomFromText('{wkt}'))").fetchone()
+    assert row is not None  # aggregate-free single-row SELECT always returns a row
+    return row[0]
 
 
 def _corridor_candidates(
@@ -233,7 +235,7 @@ def test_phase2_select_corridors_without_exclude_pairs_is_unchanged():
 
 def test_phase2_select_corridors_drops_subthreshold_after_exclusion():
     """Excluding the Phase 1 street doesn't promote a sub-threshold crossing."""
-    candidates = _corridor_candidates([(1, _FULL_CORRIDOR), (3, _SLIVER_CORRIDOR)])
+    candidates = _corridor_candidates([(1, _FULL_CORRIDOR), (3, _PART_CORRIDOR)])
 
     result = _phase2_select_corridors(
         candidates, "asset_id", _MAX_D, 0.10, exclude_pairs=_phase1_pairs([1])

@@ -18,9 +18,10 @@ from .config import (
     CsvSource,
     DatasetConfig,
     GeometryType,
+    MatchSource,
     OgrSource,
     ParquetSource,
-    UsrnLineSource,
+    UsrnSource,
 )
 from .join import (
     AnalysisMode,
@@ -387,6 +388,16 @@ class UsrnMatcher:
             help="Column holding the Y / Northing coordinate (default: Northing).",
         )
         p_prepare_csv.add_argument(
+            "--wkt-col",
+            default=None,
+            metavar="COL",
+            help=(
+                "Column holding WKT geometry text (e.g. 'LINESTRING(...)' or "
+                "'POLYGON(...)'). Required when --geometry-type is 'line' or "
+                "'polygon'; unused for 'point'."
+            ),
+        )
+        p_prepare_csv.add_argument(
             "--crs",
             default="EPSG:27700",
             metavar="CRS",
@@ -411,7 +422,9 @@ class UsrnMatcher:
             default=GeometryType.POINT.value,
             help=(
                 "How to build geometries from the CSV (default: point). "
-                "Only 'point' is implemented so far."
+                "'point' uses --x-col/--y-col; 'line' and 'polygon' require "
+                "--wkt-col holding WKT text (LINESTRING/MULTILINESTRING or "
+                "POLYGON/MULTIPOLYGON)."
             ),
         )
         p_prepare_csv.add_argument(
@@ -667,7 +680,7 @@ class UsrnMatcher:
             prepare(
                 DatasetConfig(
                     name="usrns",
-                    source=OgrSource(path=usrn_gpkg, row_group_size=20_000),
+                    source=UsrnSource(path=usrn_gpkg, row_group_size=20_000),
                     parquet_path=cache_dir / "usrns_27700.parquet",
                 ),
                 force=args.force,
@@ -686,7 +699,7 @@ class UsrnMatcher:
             prepare(
                 DatasetConfig(
                     name=f"usrns_line_{buffer_label}m",
-                    source=UsrnLineSource(
+                    source=UsrnSource(
                         path=usrn_parquet_path,
                         buffer_m=buffer_m,
                         row_group_size=args.row_group_size,
@@ -706,12 +719,13 @@ class UsrnMatcher:
                 else DEFAULT_INPUT_DIR / f"{args.rhs_name}.gpkg"
             )
             _validate_input_file(rhs_gpkg)
+            match_source: MatchSource = OgrSource(
+                path=rhs_gpkg,
+                row_group_size=args.rhs_row_group_size,
+            )
             rhs_config: DatasetConfig = DatasetConfig(
                 name=args.rhs_name,
-                source=OgrSource(
-                    path=rhs_gpkg,
-                    row_group_size=args.rhs_row_group_size,
-                ),
+                source=match_source,
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
             )
             prepare(rhs_config, force=args.force, threads=args.threads)
@@ -723,16 +737,18 @@ class UsrnMatcher:
                 else DEFAULT_INPUT_DIR / f"{args.name}.csv"
             )
             _validate_input_file(csv_path)
+            match_source = CsvSource(
+                path=csv_path,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                geometry_type=args.geometry_type,
+                wkt_col=args.wkt_col,
+                crs=args.crs,
+                row_group_size=args.row_group_size,
+            )
             rhs_config = DatasetConfig(
                 name=args.name,
-                source=CsvSource(
-                    path=csv_path,
-                    x_col=args.x_col,
-                    y_col=args.y_col,
-                    geometry_type=args.geometry_type,
-                    crs=args.crs,
-                    row_group_size=args.row_group_size,
-                ),
+                source=match_source,
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
             )
@@ -745,15 +761,16 @@ class UsrnMatcher:
                 else DEFAULT_INPUT_DIR / f"{args.name}.parquet"
             )
             _validate_input_file(src_parquet)
+            match_source = ParquetSource(
+                path=src_parquet,
+                crs=args.crs,
+                row_group_size=args.row_group_size,
+                geometry_col=args.geometry_col,
+                source_crs=args.source_crs,
+            )
             rhs_config = DatasetConfig(
                 name=args.name,
-                source=ParquetSource(
-                    path=src_parquet,
-                    crs=args.crs,
-                    row_group_size=args.row_group_size,
-                    geometry_col=args.geometry_col,
-                    source_crs=args.source_crs,
-                ),
+                source=match_source,
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
             )

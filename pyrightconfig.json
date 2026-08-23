@@ -1,0 +1,15 @@
+{
+  "include": ["usrn_matcher", "tests"],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "dist",
+    "input_data",
+    "output_data",
+    "matched_data"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard"
+}
