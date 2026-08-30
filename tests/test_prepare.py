@@ -9,9 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 from shapely.geometry import box
 
-import usrn_matcher.prepare as prepare_module
-from usrn_matcher import CsvSource, DatasetConfig, OgrSource, UprnSource, UsrnSource
-from usrn_matcher.prepare import prepare
+import geo_matcher.prepare as prepare_module
+from geo_matcher import CsvSource, DatasetConfig, OgrSource, UprnSource, UsrnSource
+from geo_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
 

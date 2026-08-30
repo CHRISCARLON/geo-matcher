@@ -71,11 +71,10 @@ docs/_build/
 # Pyenv
 .python-version
 
-# Dirs
+# Private dirs and files
 /input_data
 /matched_data
 /output_data
-
 .pytest_cache
 .ruff_cache
 main.py
@@ -83,3 +82,4 @@ sandbox.py
 /rough_notes
 .mypy_cache
 .zed
+/benchmark

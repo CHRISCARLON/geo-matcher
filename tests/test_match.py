@@ -1,10 +1,10 @@
-"""Unit tests for UsrnMatcher match dispatch and output writing."""
+"""Unit tests for GeoMatcher match dispatch and output writing."""
 
 import pyarrow as pa
 import pytest
 
-from usrn_matcher import DatasetConfig, GeometryType, LhsKind, UsrnMatcher
-from usrn_matcher.join import (
+from geo_matcher import DatasetConfig, GeoMatcher, GeometryType, LhsKind
+from geo_matcher.join import (
     FilteredMode,
     JoinFn,
     _registry,
@@ -13,14 +13,14 @@ from usrn_matcher.join import (
 
 
 @pytest.fixture()
-def matcher(tmp_path) -> UsrnMatcher:
-    """A UsrnMatcher wired to throwaway parquet paths under tmp_path."""
+def matcher(tmp_path) -> GeoMatcher:
+    """A GeoMatcher wired to throwaway parquet paths under tmp_path."""
     cfg = DatasetConfig(
         name="test",
         source_path=tmp_path / "test.parquet",
         parquet_path=tmp_path / "test.parquet",
     )
-    return UsrnMatcher(usrn_parquet=tmp_path / "usrns_27700.parquet", rhs_config=cfg)
+    return GeoMatcher(usrn_parquet=tmp_path / "usrns_27700.parquet", rhs_config=cfg)
 
 
 def test_match_dispatch_unknown_mode_raises(matcher):
@@ -46,7 +46,7 @@ def test_match_dispatch_routes_uprn_polygon(monkeypatch, matcher):
         _registry, (LhsKind.UPRN, GeometryType.POLYGON), _fake_uprn_join
     )
     sentinel_sd = object()
-    monkeypatch.setattr(UsrnMatcher, "_connect", lambda self: sentinel_sd)
+    monkeypatch.setattr(GeoMatcher, "_connect", lambda self: sentinel_sd)
 
     matcher.match_dispatch(mode="polygon", lhs="uprn")
 

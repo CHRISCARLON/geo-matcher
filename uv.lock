@@ -316,6 +316,53 @@ wheels = [
 ]
 
 [[package]]
+name = "geo-matcher"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "apache-sedona", extra = ["db"] },
+    { name = "duckdb" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+linting = [
+    { name = "ruff" },
+]
+testing = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+]
+typechecking = [
+    { name = "mypy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "apache-sedona", extras = ["db"], specifier = "==1.8.1" },
+    { name = "duckdb", specifier = "==1.5.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = "==1.9.0" },
+    { name = "pytest", specifier = "==9.0.2" },
+    { name = "pytest-cov", specifier = "==5.0.0" },
+    { name = "ruff", specifier = ">=0.4" },
+]
+linting = [{ name = "ruff", specifier = ">=0.4" }]
+testing = [
+    { name = "pytest", specifier = "==9.0.2" },
+    { name = "pytest-cov", specifier = "==5.0.0" },
+]
+typechecking = [{ name = "mypy", specifier = "==1.9.0" }]
+
+[[package]]
 name = "geoarrow-c"
 version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1279,50 +1326,3 @@ sdist = { url = "https://files.pythonhosted.org/packages/19/f5/cd531b2d15a671a40
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b0/70/d460bd685a170790ec89317e9bd33047988e4bce507b831f5db771e142de/tzdata-2026.1-py2.py3-none-any.whl", hash = "sha256:4b1d2be7ac37ceafd7327b961aa3a54e467efbdb563a23655fbfe0d39cfc42a9", size = 348952, upload-time = "2026-04-03T11:25:20.313Z" },
 ]
-
-[[package]]
-name = "usrn-matcher"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "apache-sedona", extra = ["db"] },
-    { name = "duckdb" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-linting = [
-    { name = "ruff" },
-]
-testing = [
-    { name = "pytest" },
-    { name = "pytest-cov" },
-]
-typechecking = [
-    { name = "mypy" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "apache-sedona", extras = ["db"], specifier = "==1.8.1" },
-    { name = "duckdb", specifier = "==1.5.2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = "==1.9.0" },
-    { name = "pytest", specifier = "==9.0.2" },
-    { name = "pytest-cov", specifier = "==5.0.0" },
-    { name = "ruff", specifier = ">=0.4" },
-]
-linting = [{ name = "ruff", specifier = ">=0.4" }]
-testing = [
-    { name = "pytest", specifier = "==9.0.2" },
-    { name = "pytest-cov", specifier = "==5.0.0" },
-]
-typechecking = [{ name = "mypy", specifier = "==1.9.0" }]

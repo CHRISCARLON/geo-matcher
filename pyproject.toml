@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "usrn-matcher"
+name = "geo-matcher"
 version = "0.1.0"
-description = "A library to spatially join USRNs to other spatial datasets"
+description = "A library to spatially join USRNs and UPRNs to other spatial datasets"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -38,10 +38,10 @@ package = true
 default-groups = ["dev"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["usrn_matcher"]
+packages = ["geo_matcher"]
 
 [project.scripts]
-usrn-matcher = "usrn_matcher.matcher:UsrnMatcher.cli"
+geo-matcher = "geo_matcher.matcher:GeoMatcher.cli"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -71,11 +71,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["usrn_matcher"]
+known-first-party = ["geo_matcher"]
 
 [tool.mypy]
 python_version = "3.12"
-packages = "usrn_matcher"
+packages = "geo_matcher"
 ignore_missing_imports = true
 # gradual strict — opt in a rule at a time
 warn_unused_configs = true

@@ -1,4 +1,4 @@
-# USRN Matcher
+# Geo Matcher
 
 Spatially join Unique Street Reference Numbers (USRNs) to any geospatial dataset using SedonaDB.
 
@@ -6,7 +6,7 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 ## What it does
 
-`usrn-matcher` answers the question: *which USRN does this spatial feature interact with?*
+`geo-matcher` answers the question: *which USRN (or UPRN) does this spatial feature interact with?*
 
 Given any spatial dataset (bus stops, soil polygons, flood zones — anything with a geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN reference and the original dataset's attributes.
 
@@ -26,21 +26,21 @@ uv sync
 
 ```bash
 # 1. Create project directories
-usrn-matcher init
+geo-matcher init
 
 # 2. Prepare USRNs (run once, or when OS Open USRN is updated)
-usrn-matcher prepare-usrns \
+geo-matcher prepare-usrns \
   --usrn-gpkg  input_data/osopenusrn.gpkg \
   --cache-dir  output_data
 
 # 3. Prepare your dataset
-usrn-matcher prepare-gpkg \
+geo-matcher prepare-gpkg \
   --rhs-name   my_dataset \
   --rhs-gpkg   input_data/my_dataset.gpkg \
   --cache-dir  output_data
 
 # 4. Run the join
-usrn-matcher match \
+geo-matcher match \
   --rhs-name    my_dataset \   # prepared dataset name
   --mode        polygon \      # polygon, point, or line
   --city        LEEDS \        # pre-defined bbox (see bboxes.py) or use --bbox
@@ -53,12 +53,12 @@ usrn-matcher match \
 
 ```bash
 # Prepare buffered USRN corridors first
-usrn-matcher prepare-usrns-line \
+geo-matcher prepare-usrns-line \
   --buffer-m  10 \
   --cache-dir output_data
 
 # Four-phase line join
-usrn-matcher match \
+geo-matcher match \
   --rhs-name          my_lines \                               # prepared dataset name
   --mode              line \                                   # four-phase line strategy
   --distance          10 \                                     # Phase 1+2 buffer width in metres
@@ -75,7 +75,7 @@ usrn-matcher match \
 
 ```bash
 # Polygon join against UPRN address points instead of USRN centrelines
-usrn-matcher match \
+geo-matcher match \
   --lhs-name    uprn \         # join from UPRN address points
   --rhs-name    my_dataset \   # prepared dataset name
   --mode        polygon \      # currently the only mode registered for --lhs-name uprn

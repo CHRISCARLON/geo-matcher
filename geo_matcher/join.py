@@ -674,7 +674,7 @@ def _assert_corridor_file_current(
             "Phase 1 would silently lose every match for a USRN missing from the "
             "corridor file, reporting those pairs as match_phase=2 with "
             "is_intersection=false. Rebuild it:\n"
-            "  usrn-matcher prepare-usrns-line --buffer-m N --force"
+            "  geo-matcher prepare-usrns-line --buffer-m N --force"
         )
 
 
@@ -1452,7 +1452,7 @@ def run_uprn_polygon_join(
     carries no ``street_type`` equivalent).
 
     The parameter is named ``usrn_parquet`` (not ``uprn_parquet``) so this
-    function is callable through ``UsrnMatcher.match_dispatch`` unchanged — that
+    function is callable through ``GeoMatcher.match_dispatch`` unchanged — that
     call site always passes ``usrn_parquet=self._usrn_parquet`` regardless of
     which LHS kind was requested. Renaming that concept throughout is deferred
     to the wider project rename mentioned separately.
@@ -1602,7 +1602,7 @@ def run_usrn_line_join(
     if usrn_line_parquet is None:
         raise ValueError(
             "run_usrn_line_join requires --usrn-line-parquet. "
-            "Run 'usrn-matcher prepare-usrns-line --buffer-m N' first."
+            "Run 'geo-matcher prepare-usrns-line --buffer-m N' first."
         )
 
     rhs_view: str = rhs_config.name

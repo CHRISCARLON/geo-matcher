@@ -4,7 +4,7 @@ import pathlib
 
 import pytest
 
-from usrn_matcher.config import (
+from geo_matcher.config import (
     CsvSource,
     DatasetConfig,
     GeometryType,
