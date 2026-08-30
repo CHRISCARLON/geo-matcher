@@ -22,6 +22,16 @@ Output is attribute-only — no geometry column. Results are a plain tabular joi
 
 **National joins (no bbox)** — The USRN parquet is registered as a Sedona view once (metadata only — no rows loaded). The RHS parquet is split into `--batches` in-memory slices via PyArrow. For each slice, its spatial envelope is derived from the Parquet footer row-group statistics (no geometry read) and injected as an `ST_Intersects` predicate into the SQL. Sedona uses the USRN GeoParquet 1.1 covering metadata to skip row groups that don't overlap that envelope — so only the USRN row groups that spatially overlap the current RHS slice are read from disk and joined. Results are written incrementally to a `ParquetWriter` — at most one slice's matched rows are in memory at a time.
 
+**Which side actually gets a SQL spatial filter.** In national mode, the RHS is never given a `WHERE`-clause spatial predicate at all — it's already bounded a cheaper way, by reading only the parquet row groups that belong to the current slice (chosen from `bbox` covering-column statistics, no geometry read). Only the USRN side gets the `ST_Intersects(u.geometry, envelope)` predicate, pruning USRN row groups against that slice's envelope. In filtered mode there's no chunking, so the bbox has to do that work itself as a `WHERE` predicate on both sides — see below for how that predicate differs by side.
+
+**Exact bbox vs. expanded bbox — why `u` and `s` aren't pruned the same way.** Whether the RHS side of a filter is pruned to the *exact* bbox or one *expanded* by the match distance depends on the predicate:
+
+- `ST_Intersects` - style joins (`bbox_pruner`, used by the polygon join and line-join Phase 1) prune **both** sides to the exact bbox. A match here requires actual geometric overlap — a RHS feature entirely outside the bbox cannot intersect a USRN inside it without itself crossing into the bbox, in which case it's still caught by the exact-bbox predicate. Pruning both sides exactly loses nothing.
+
+- `ST_DWithin` - style joins (`bbox_nearest_filters`, used by the point join; and the line-join Phase 3/4 batch filters) require only *proximity*, not overlap. A real match can be an RHS feature sitting just outside the bbox but within `distance_m` of a USRN just inside it. Pruning RHS to the exact bbox would silently drop that as a false negative purely from where the tile boundary fell — not from the data. So the non-anchor side is expanded by the match radius (`distance_m` for the point join, `phase4_tolerance_m` for Phase 4) to guarantee no true match is missed, while still avoiding an unbounded scan of the RHS dataset. The USRN side stays exact because USRNs outside the bbox aren't wanted in the output — only RHS features that might match one inside it are.
+
+The same rule runs the other way in the line-join Phase 3/Phase 4 batch loops: there the RHS batch is the fixed anchor, so it's the USRN filter that gets expanded outward by the match radius instead.
+
 **Join modes:**
 
 | Mode | Architecture | Predicate | Use for |
@@ -145,7 +155,7 @@ Dedup: one row per RHS feature (closest USRN wins)
 The RHS line never comes within `--phase3-distance` of any street, but physically touches
 a feature that did. Rather than reaching for an ever-more-distant street, it inherits that
 neighbour's USRN — a claim about network membership, not proximity. Typical for spurs off
-a main run. `distance_m` still reports the true distance to the inherited centreline, so a
+a main asset. `distance_m` still reports the true distance to the inherited centreline, so a
 consumer can see how far the attribution reaches; it is usually well beyond
 `--phase3-distance`, which is exactly why these rows are flagged separately.
 

@@ -8,16 +8,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import usrn_matcher.join as join_module
 from usrn_matcher.config import DatasetConfig, GeometryType
 from usrn_matcher.join import (
     _assert_corridor_file_current,
-    _bbox_pruner,
-    _col_fragment,
     _distinct_ids,
     _log_line_match_summary,
     _nearest_dedup,
     _phase2_select_corridors,
     _registry,
+    bbox_pruner,
+    col_fragment,
     register,
 )
 
@@ -48,13 +49,13 @@ def test_register_accepts_string_value_and_normalises_key():
 
 
 # ---------------------------------------------------------------------------
-# _bbox_pruner
+# bbox_pruner
 # ---------------------------------------------------------------------------
 
 
 def test_bbox_pruner_produces_where_clause():
-    """_bbox_pruner builds an ST_Intersects clause for both sides."""
-    clause = _bbox_pruner([100.0, 200.0, 300.0, 400.0])
+    """bbox_pruner builds an ST_Intersects clause for both sides."""
+    clause = bbox_pruner([100.0, 200.0, 300.0, 400.0])
     assert "ST_Intersects(u.geometry" in clause
     assert "ST_Intersects(s.geometry" in clause
     assert "100.0" in clause
@@ -62,7 +63,7 @@ def test_bbox_pruner_produces_where_clause():
 
 
 # ---------------------------------------------------------------------------
-# _col_fragment — explicit columns (no parquet file needed)
+# col_fragment — explicit columns (no parquet file needed)
 # ---------------------------------------------------------------------------
 
 
@@ -71,7 +72,7 @@ def test_col_fragment_explicit_columns():
     cfg: DatasetConfig = DatasetConfig(
         name="soil", source_path="x.gpkg", columns=["MUSID", "MAP_SYMBOL"]
     )
-    assert _col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL"'
+    assert col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL"'
 
 
 def test_col_fragment_explicit_columns_with_spaces():
@@ -79,11 +80,11 @@ def test_col_fragment_explicit_columns_with_spaces():
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", columns=["road class", "speed limit"]
     )
-    assert _col_fragment(cfg) == ', s."road class", s."speed limit"'
+    assert col_fragment(cfg) == ', s."road class", s."speed limit"'
 
 
 # ---------------------------------------------------------------------------
-# _col_fragment — auto-discovery from parquet schema
+# col_fragment — auto-discovery from parquet schema
 # ---------------------------------------------------------------------------
 
 
@@ -109,7 +110,7 @@ def test_col_fragment_auto_excludes_geometry_and_bbox(rhs_parquet: pathlib.Path)
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", parquet_path=rhs_parquet, columns=[]
     )
-    result: str = _col_fragment(cfg)
+    result: str = col_fragment(cfg)
     assert "geometry" not in result
     assert "bbox" not in result
     assert 's."id"' in result
@@ -131,7 +132,7 @@ def test_col_fragment_auto_only_geometry_bbox(tmp_path: pathlib.Path):
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", parquet_path=out, columns=[]
     )
-    assert _col_fragment(cfg) == ", "
+    assert col_fragment(cfg) == ", "
 
 
 def test_col_fragment_auto_reads_parquet_schema(rhs_parquet: pathlib.Path):
@@ -139,7 +140,7 @@ def test_col_fragment_auto_reads_parquet_schema(rhs_parquet: pathlib.Path):
     cfg: DatasetConfig = DatasetConfig(
         name="x", source_path="x.gpkg", parquet_path=rhs_parquet, columns=[]
     )
-    result: str = _col_fragment(cfg)
+    result: str = col_fragment(cfg)
     assert 's."id"' in result
     assert 's."name"' in result
 
@@ -378,3 +379,99 @@ def test_corridor_guard_message_is_actionable(tmp_path: pathlib.Path):
     assert "1,766,832" in message
     assert "1,700,000" in message
     assert "prepare-usrns-line" in message
+
+
+# ---------------------------------------------------------------------------
+# Golden query templates — run_polygon_join / run_line_join
+#
+# These intercept the dispatcher call (execute_join / execute_line_join) via
+# monkeypatch, so the query text a real run would generate is captured without
+# needing a live SedonaContext. Whitespace is normalised before comparison —
+# indentation is incidental, but keyword/clause order and content are not — so a
+# future edit to these templates can't silently change the generated SQL unnoticed.
+# ---------------------------------------------------------------------------
+
+
+def _normalise_sql(s: str) -> str:
+    return " ".join(s.split())
+
+
+def test_run_polygon_join_query_golden(monkeypatch):
+    """The exact (whitespace-normalised) SQL text run_polygon_join hands to execute_join."""
+    captured: dict = {}
+
+    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, query, mode, **kw):
+        captured["query"] = query
+        return pa.table({})
+
+    monkeypatch.setattr(join_module, "execute_join", _fake_execute_join)
+
+    cfg = DatasetConfig(
+        name="soil",
+        source_path="x.gpkg",
+        parquet_path=pathlib.Path("fake_27700.parquet"),
+        columns=["MUSID"],
+    )
+    join_module.run_polygon_join(
+        sd=None, usrn_parquet=pathlib.Path("usrns_27700.parquet"), rhs_config=cfg
+    )
+
+    assert _normalise_sql(captured["query"]) == _normalise_sql("""
+        SELECT
+            u.usrn,
+            u.street_type
+            , s."MUSID"
+        FROM usrns AS u
+        JOIN soil AS s
+          ON ST_Intersects(u.geometry, s.geometry)
+        WHERE TRUE
+        {spatial_filter}
+        ORDER BY u.usrn
+    """)
+
+
+def test_run_line_join_phase1_template_golden(monkeypatch):
+    """The exact (whitespace-normalised) Phase 1 template run_line_join builds.
+
+    Placeholders survive unfilled here — .format() only happens later, inside
+    _national_line_join / _filtered_line_join.
+    """
+    captured: dict = {}
+
+    def _fake_execute_line_join(*args, **kwargs):
+        captured["intersect_template"] = kwargs["intersect_template"]
+        return pa.table({})
+
+    monkeypatch.setattr(join_module, "execute_line_join", _fake_execute_line_join)
+
+    cfg = DatasetConfig(
+        name="gas_pipe",
+        source_path="x.gpkg",
+        parquet_path=pathlib.Path("fake_27700.parquet"),
+        columns=["ASSET_ID"],
+    )
+    join_module.run_line_join(
+        sd=None,
+        usrn_parquet=pathlib.Path("usrns_27700.parquet"),
+        rhs_config=cfg,
+        rhs_id_col="ASSET_ID",
+        usrn_line_parquet=pathlib.Path("usrns_line_10m_27700.parquet"),
+    )
+
+    assert _normalise_sql(captured["intersect_template"]) == _normalise_sql("""
+        SELECT
+            u.usrn,
+            u.street_type
+            , s."ASSET_ID",
+            ST_Distance(u.geometry, s.geometry) AS distance_m,
+            TRUE AS is_intersection,
+            ST_AsWKB(ul.geometry) AS _u_geom,
+            ST_AsWKB(s.geometry) AS _s_geom
+        FROM usrns AS u
+        JOIN gas_pipe AS s ON ST_Intersects(u.geometry, s.geometry)
+        JOIN usrns_line AS ul ON ul.usrn = u.usrn
+        WHERE TRUE
+        {spatial_filter}
+        {corridor_filter}
+        ORDER BY u.usrn, distance_m
+    """)
