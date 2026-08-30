@@ -100,15 +100,41 @@ class UsrnSource:
     row_group_size: int = 20_000
 
 
+@dataclass(frozen=True)
+class UprnSource:
+    """UPRN preparation, in one of two modes selected by ``buffer_m``.
+
+    ``buffer_m=None`` (default) — ``path`` points at a raw OGR-readable UPRN
+    source (e.g. the OS Open UPRN GeoPackage). Produces a plain Hilbert-sorted
+    address-point GeoParquet with just ``uprn`` and ``geometry`` — the
+    source's uppercase ``UPRN`` id is renamed to match this pipeline's
+    lowercase convention, and ``X_COORDINATE``/``Y_COORDINATE``/``LATITUDE``/
+    ``LONGITUDE`` are dropped as redundant with ``geometry`` (same point, two
+    encodings) — at 40M+ rows that's four fewer doubles per row.
+
+    ``buffer_m=<float>`` — ``path`` points at an already-prepared UPRN
+    GeoParquet (e.g. the output of the ``buffer_m=None`` mode). Produces a
+    buffered catchment-polygon GeoParquet, where ``geometry`` is
+    ``ST_Buffer(point, buffer_m)`` (the join predicate) and ``geometry_point``
+    is the original point WKB, alongside ``uprn``.
+    """
+
+    path: pathlib.Path
+    crs: str = "EPSG:27700"
+    buffer_m: float | None = None
+    row_group_size: int = 20_000
+
+
 MatchSource: TypeAlias = OgrSource | CsvSource | ParquetSource
 """The three formats usable as the RHS/match dataset."""
 
-AnySource: TypeAlias = MatchSource | UsrnSource
+AnySource: TypeAlias = MatchSource | UsrnSource | UprnSource
 
 DEFAULT_INPUT_DIR: pathlib.Path = pathlib.Path("input_data")
 DEFAULT_OUTPUT_DIR: pathlib.Path = pathlib.Path("output_data")
 DEFAULT_MATCHED_DIR: pathlib.Path = pathlib.Path("matched_data")
 DEFAULT_USRN_GPKG: pathlib.Path = DEFAULT_INPUT_DIR / "osopenusrn.gpkg"
+DEFAULT_UPRN_GPKG: pathlib.Path = DEFAULT_INPUT_DIR / "osopenuprn.gpkg"
 
 
 class DatasetConfig:

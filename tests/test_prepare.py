@@ -10,7 +10,7 @@ import pytest
 from shapely.geometry import box
 
 import usrn_matcher.prepare as prepare_module
-from usrn_matcher import CsvSource, DatasetConfig, OgrSource, UsrnSource
+from usrn_matcher import CsvSource, DatasetConfig, OgrSource, UprnSource, UsrnSource
 from usrn_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
@@ -310,6 +310,111 @@ def test_prepare_usrn_buffered_mode_geometry_larger_than_line(
     buf_xmin, buf_xmax, line_xmin, line_xmax = row
 
     assert (buf_xmax - buf_xmin) > (line_xmax - line_xmin)
+
+
+# ---------------------------------------------------------------------------
+# UprnSource tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_uprn_gdf():
+    """5-row synthetic UPRN-shaped GeoDataFrame — uppercase columns, Point geometry.
+
+    Column names/casing mirror the real OS Open UPRN GeoPackage (``UPRN``,
+    ``X_COORDINATE``, ``Y_COORDINATE``, ``LATITUDE``, ``LONGITUDE``).
+    """
+    from shapely.geometry import Point
+
+    xs = [i * 1000 for i in range(5)]
+    ys = [i * 1000 for i in range(5)]
+    return gpd.GeoDataFrame(
+        {
+            "UPRN": range(100000, 100005),
+            "X_COORDINATE": xs,
+            "Y_COORDINATE": ys,
+            "LATITUDE": [51.5 + i * 0.01 for i in range(5)],
+            "LONGITUDE": [-0.1 + i * 0.01 for i in range(5)],
+            "geometry": [Point(x, y) for x, y in zip(xs, ys)],
+        },
+        crs="EPSG:27700",
+    )
+
+
+@pytest.fixture
+def tiny_uprn_gpkg(tiny_uprn_gdf, tmp_path):
+    """Write tiny_uprn_gdf to a real GeoPackage — input for UprnSource plain-mode tests."""
+    p = tmp_path / "tiny_uprn.gpkg"
+    tiny_uprn_gdf.to_file(str(p), driver="GPKG")
+    return p
+
+
+@pytest.fixture
+def tiny_uprn_parquet(tiny_uprn_gpkg, tmp_path):
+    """Prepared UPRN address-point GeoParquet (UprnSource plain mode) — input for buffered-mode tests."""
+    out = tmp_path / "tiny_uprns_27700.parquet"
+    cfg = DatasetConfig(
+        name="tiny_uprns", source=UprnSource(path=tiny_uprn_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
+    return out
+
+
+def test_prepare_uprn_plain_mode_minimal_columns(tiny_uprn_gpkg, tmp_path):
+    """UprnSource(buffer_m=None) keeps only `uprn` + `geometry` (+ bbox) — id lowercased,
+    x/y/lat/lon dropped as redundant with geometry."""
+    out = tmp_path / "uprn_plain_27700.parquet"
+    cfg = DatasetConfig(
+        name="uprn_plain", source=UprnSource(path=tiny_uprn_gpkg), parquet_path=out
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert set(schema.names) == {"uprn", "geometry", "bbox"}
+
+    geo = json.loads(schema.metadata[b"geo"])
+    assert geo["version"] == "1.1.0"
+    assert "27700" in str(geo["columns"]["geometry"].get("crs"))
+
+
+def test_prepare_uprn_buffered_mode_adds_geometry_point(tiny_uprn_parquet, tmp_path):
+    """UprnSource(buffer_m=10.0) buffers `geometry`, keeps the original in `geometry_point`."""
+    out = tmp_path / "uprn_buffered_27700.parquet"
+    cfg = DatasetConfig(
+        name="uprn_buffered",
+        source=UprnSource(path=tiny_uprn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    result = prepare(cfg, force=True)
+    schema = pq.read_schema(str(result))
+    assert set(schema.names) == {"uprn", "geometry", "geometry_point", "bbox"}
+
+
+def test_prepare_uprn_buffered_mode_geometry_larger_than_point(
+    tiny_uprn_parquet, tmp_path
+):
+    """The buffered `geometry` column's bbox is strictly larger than `geometry_point`'s."""
+    import duckdb
+
+    out = tmp_path / "uprn_buffered_bbox_27700.parquet"
+    cfg = DatasetConfig(
+        name="uprn_buffered_bbox",
+        source=UprnSource(path=tiny_uprn_parquet, buffer_m=10.0),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT
+            MIN(ST_XMin(geometry)), MAX(ST_XMax(geometry)),
+            MIN(ST_XMin(geometry_point)), MAX(ST_XMax(geometry_point))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None  # aggregate query always returns exactly one row
+    buf_xmin, buf_xmax, pt_xmin, pt_xmax = row
+
+    assert (buf_xmax - buf_xmin) > (pt_xmax - pt_xmin)
 
 
 # ---------------------------------------------------------------------------

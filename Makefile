@@ -4,6 +4,7 @@
 .PHONY: \
 	init \
 	prepare-usrns prepare-usrns-line \
+	prepare-uprns prepare-uprns-buffer \
 	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-ngn-mains prepare-all \
 	match-soil-national match-soil-national-explain \
 	match-soil-leeds match-soil-leeds-explain \
@@ -28,6 +29,20 @@ prepare-usrns:
 
 prepare-usrns-line:
 	usrn-matcher prepare-usrns-line \
+		--buffer-m 10 \
+		--force \
+		--threads 4
+
+# ── Prepare UPRNs ─────────────────────────────────────────────────────────────
+
+prepare-uprns:
+	usrn-matcher prepare-uprns \
+		--uprn-gpkg input_data/osopenuprn_202608.gpkg \
+		--force \
+		--threads 4
+
+prepare-uprns-buffer:
+	usrn-matcher prepare-uprns-buffer \
 		--buffer-m 10 \
 		--force \
 		--threads 4

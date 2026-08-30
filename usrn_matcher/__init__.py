@@ -8,6 +8,7 @@ from .config import (
     MatchSource,
     OgrSource,
     ParquetSource,
+    UprnSource,
     UsrnSource,
 )
 from .join import (
@@ -31,6 +32,7 @@ __all__ = [
     "MatchSource",
     "OgrSource",
     "ParquetSource",
+    "UprnSource",
     "UsrnSource",
     "AnalysisMode",
     "FilteredMode",

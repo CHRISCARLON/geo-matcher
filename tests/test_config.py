@@ -4,7 +4,13 @@ import pathlib
 
 import pytest
 
-from usrn_matcher.config import CsvSource, DatasetConfig, GeometryType, UsrnSource
+from usrn_matcher.config import (
+    CsvSource,
+    DatasetConfig,
+    GeometryType,
+    UprnSource,
+    UsrnSource,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -103,4 +109,27 @@ def test_usrn_source_crs_defaults_to_epsg_27700():
 def test_usrn_source_buffer_m_stored_when_set():
     """Setting buffer_m stores it correctly (buffered corridor mode)."""
     src = UsrnSource(path=pathlib.Path("usrns_27700.parquet"), buffer_m=10.0)
+    assert src.buffer_m == 10.0
+
+
+# ---------------------------------------------------------------------------
+# UprnSource
+# ---------------------------------------------------------------------------
+
+
+def test_uprn_source_buffer_m_defaults_to_none():
+    """buffer_m defaults to None (plain address-point mode)."""
+    src = UprnSource(path=pathlib.Path("osopenuprn.gpkg"))
+    assert src.buffer_m is None
+
+
+def test_uprn_source_crs_defaults_to_epsg_27700():
+    """crs defaults to 'EPSG:27700', matching every other source struct."""
+    src = UprnSource(path=pathlib.Path("osopenuprn.gpkg"))
+    assert src.crs == "EPSG:27700"
+
+
+def test_uprn_source_buffer_m_stored_when_set():
+    """Setting buffer_m stores it correctly (buffered catchment mode)."""
+    src = UprnSource(path=pathlib.Path("uprns_27700.parquet"), buffer_m=10.0)
     assert src.buffer_m == 10.0
