@@ -86,3 +86,4 @@ geo-matcher match \
 - [Usage — CLI & Python API](docs/usage.md)
 - [Output formats & cardinality](docs/output.md)
 - [How it works](docs/how-it-works.md)
+- [Changelog](CHANGELOG.md)
