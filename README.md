@@ -1,4 +1,4 @@
-# Geo Matcher
+# GeoMatcher
 
 Spatially join Unique Street Reference Numbers (USRNs) & Unique Propert Reference Numbers to geospatial datasets using SedonaDB.
 
