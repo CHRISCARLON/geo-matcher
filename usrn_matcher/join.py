@@ -318,7 +318,7 @@ def _register_neighbours_view(
         FROM best AS b
         JOIN _feat AS f ON f."{id_col}" = b._id
         WHERE b._rn = 1
-    """).fetch_arrow_table()
+    """).to_arrow_table()
     if not len(neighbours):
         return 0
     sd.create_data_frame(neighbours).to_view("neighbours_raw", overwrite=True)
@@ -354,7 +354,7 @@ def _phase1_score_overlap(table: pa.Table, distance_m: float) -> pa.Table:
         SELECT * EXCLUDE (_u_geom, _s_geom),
             {expr} AS overlap_length_pct
         FROM t
-    """).fetch_arrow_table()
+    """).to_arrow_table()
     return result.append_column(
         "match_phase", pa.array([1] * len(result), type=pa.int8())
     )
@@ -416,7 +416,7 @@ def _phase2_select_corridors(
         FROM ranked
         WHERE _max_overlap >= {min_overlap}
           AND overlap_length_pct >= _max_overlap * 0.8
-    """).fetch_arrow_table()
+    """).to_arrow_table()
     log.debug(
         "Phase 2 (corridor) overlap: %d → %d rows kept (best per feature)",
         len(table),
@@ -452,7 +452,7 @@ def _nearest_dedup(table: pa.Table, id_col: str, phase: int = 3) -> pa.Table:
         SELECT * EXCLUDE (_rn)
         FROM ranked
         WHERE _rn = 1
-    """).fetch_arrow_table()
+    """).to_arrow_table()
     return result.append_column(
         "match_phase", pa.array([phase] * len(result), type=pa.int8())
     )
