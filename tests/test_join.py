@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import usrn_matcher.join as join_module
-from usrn_matcher.config import DatasetConfig, GeometryType
+from usrn_matcher.config import DatasetConfig, GeometryType, LhsKind
 from usrn_matcher.join import (
     _assert_corridor_file_current,
     _distinct_ids,
@@ -31,18 +31,29 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("name", ["hexagon", "", "POINT", 1])
 def test_register_rejects_non_geometry_type(name):
-    """register() only accepts GeometryType members (or their string values)."""
+    """register() only accepts GeometryType members (or their string values)
+    for its second (geometry) argument — pass a valid lhs to isolate that."""
     with pytest.raises(ValueError, match="not a GeometryType"):
-        register(name)
+        register("usrn", name)
+
+
+@pytest.mark.parametrize("name", ["street", "", "USRN", 1])
+def test_register_rejects_non_lhs_kind(name):
+    """register() only accepts LhsKind members (or their string values) for
+    its first (lhs) argument — pass a valid geometry to isolate that."""
+    with pytest.raises(ValueError, match="not a LhsKind"):
+        register(name, "point")
 
 
 def test_register_accepts_string_value_and_normalises_key():
-    """A plain string value registers under the matching GeometryType member."""
+    """Plain string values register under the matching (LhsKind, GeometryType) key."""
     original = dict(_registry)
     try:
-        register("point")(lambda *a, **k: None)
-        key = next(k for k in _registry if k == GeometryType.POINT)
-        assert isinstance(key, GeometryType)
+        register("usrn", "point")(lambda *a, **k: None)
+        key = next(k for k in _registry if k == (LhsKind.USRN, GeometryType.POINT))
+        lhs_kind, geometry_type = key
+        assert isinstance(lhs_kind, LhsKind)
+        assert isinstance(geometry_type, GeometryType)
     finally:
         _registry.clear()
         _registry.update(original)
@@ -382,7 +393,7 @@ def test_corridor_guard_message_is_actionable(tmp_path: pathlib.Path):
 
 
 # ---------------------------------------------------------------------------
-# Golden query templates — run_polygon_join / run_line_join
+# Golden query templates — run_usrn_polygon_join / run_usrn_line_join / run_uprn_polygon_join
 #
 # These intercept the dispatcher call (execute_join / execute_line_join) via
 # monkeypatch, so the query text a real run would generate is captured without
@@ -396,12 +407,13 @@ def _normalise_sql(s: str) -> str:
     return " ".join(s.split())
 
 
-def test_run_polygon_join_query_golden(monkeypatch):
-    """The exact (whitespace-normalised) SQL text run_polygon_join hands to execute_join."""
+def test_run_usrn_polygon_join_query_golden(monkeypatch):
+    """The exact (whitespace-normalised) SQL text run_usrn_polygon_join hands to execute_join."""
     captured: dict = {}
 
     def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, query, mode, **kw):
         captured["query"] = query
+        captured["kwargs"] = kw
         return pa.table({})
 
     monkeypatch.setattr(join_module, "execute_join", _fake_execute_join)
@@ -412,7 +424,7 @@ def test_run_polygon_join_query_golden(monkeypatch):
         parquet_path=pathlib.Path("fake_27700.parquet"),
         columns=["MUSID"],
     )
-    join_module.run_polygon_join(
+    join_module.run_usrn_polygon_join(
         sd=None, usrn_parquet=pathlib.Path("usrns_27700.parquet"), rhs_config=cfg
     )
 
@@ -428,10 +440,51 @@ def test_run_polygon_join_query_golden(monkeypatch):
         {spatial_filter}
         ORDER BY u.usrn
     """)
+    # Default lhs_view_name — unset here means "usrns", matching the query above.
+    assert captured["kwargs"].get("lhs_view_name", "usrns") == "usrns"
 
 
-def test_run_line_join_phase1_template_golden(monkeypatch):
-    """The exact (whitespace-normalised) Phase 1 template run_line_join builds.
+def test_run_uprn_polygon_join_query_golden(monkeypatch):
+    """The exact (whitespace-normalised) SQL text run_uprn_polygon_join hands to execute_join.
+
+    Structurally identical to the USRN polygon join's golden test — same
+    execute_join engine, different LHS view/columns.
+    """
+    captured: dict = {}
+
+    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, query, mode, **kw):
+        captured["query"] = query
+        captured["kwargs"] = kw
+        return pa.table({})
+
+    monkeypatch.setattr(join_module, "execute_join", _fake_execute_join)
+
+    cfg = DatasetConfig(
+        name="soil",
+        source_path="x.gpkg",
+        parquet_path=pathlib.Path("fake_27700.parquet"),
+        columns=["MUSID"],
+    )
+    join_module.run_uprn_polygon_join(
+        sd=None, usrn_parquet=pathlib.Path("uprns_27700.parquet"), rhs_config=cfg
+    )
+
+    assert _normalise_sql(captured["query"]) == _normalise_sql("""
+        SELECT
+            u.uprn
+            , s."MUSID"
+        FROM uprns AS u
+        JOIN soil AS s
+          ON ST_Intersects(u.geometry, s.geometry)
+        WHERE TRUE
+        {spatial_filter}
+        ORDER BY u.uprn
+    """)
+    assert captured["kwargs"]["lhs_view_name"] == "uprns"
+
+
+def test_run_usrn_line_join_phase1_template_golden(monkeypatch):
+    """The exact (whitespace-normalised) Phase 1 template run_usrn_line_join builds.
 
     Placeholders survive unfilled here — .format() only happens later, inside
     _national_line_join / _filtered_line_join.
@@ -450,7 +503,7 @@ def test_run_line_join_phase1_template_golden(monkeypatch):
         parquet_path=pathlib.Path("fake_27700.parquet"),
         columns=["ASSET_ID"],
     )
-    join_module.run_line_join(
+    join_module.run_usrn_line_join(
         sd=None,
         usrn_parquet=pathlib.Path("usrns_27700.parquet"),
         rhs_config=cfg,

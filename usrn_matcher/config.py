@@ -14,6 +14,19 @@ class GeometryType(StrEnum):
     POLYGON = "polygon"
 
 
+class LhsKind(StrEnum):
+    """Which base dataset a join runs from — keys the second axis of the join registry.
+
+    USRN joins (street centrelines) and UPRN joins (address points) can both
+    register a strategy for the same RHS ``GeometryType`` (e.g. both have a
+    ``polygon`` join) without colliding, because the registry is keyed by
+    ``(LhsKind, GeometryType)`` rather than ``GeometryType`` alone.
+    """
+
+    USRN = "usrn"
+    UPRN = "uprn"
+
+
 @dataclass(frozen=True)
 class OgrSource:
     """Any GDAL-readable vector format (GeoPackage, Shapefile, etc.)."""

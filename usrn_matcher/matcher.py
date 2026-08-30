@@ -19,6 +19,7 @@ from .config import (
     CsvSource,
     DatasetConfig,
     GeometryType,
+    LhsKind,
     MatchSource,
     OgrSource,
     ParquetSource,
@@ -26,9 +27,9 @@ from .config import (
     UsrnSource,
 )
 from .join import (
-    AnalysisMode,
     FilteredMode,
     JoinFn,
+    JoinMode,
     NationalMode,
     _registry,
     configure_sedona_session,
@@ -84,6 +85,7 @@ class UsrnMatcher:
     def match_dispatch(
         self,
         mode: GeometryType | str,
+        lhs: LhsKind | str = LhsKind.USRN,
         bbox: BBox | None = None,
         explain: bool = False,
         n_chunks: int = 50,
@@ -97,21 +99,24 @@ class UsrnMatcher:
     ) -> pa.Table:
         """Dispatch the match to the registered Join Function.
 
-        *mode* is the RHS geometry type — it must be a GeometryType (or its
-        string value) with a join registered against it.
+        *mode* is the RHS geometry type and *lhs* is the base dataset to join
+        from (``"usrn"`` street centrelines by default, or ``"uprn"`` address
+        points) — the pair must have a join registered against it.
 
         The Analysis mode is driven by whether or not a bbox is provided.
         """
         try:
             # This will be one of the registered JoinFns
-            # from join.py such as run_line_join
+            # from join.py such as run_usrn_line_join
             geometry_type: GeometryType = GeometryType(mode)
-            fn: JoinFn = get_join(geometry_type)
+            lhs_kind: LhsKind = LhsKind(lhs)
+            fn: JoinFn = get_join(lhs_kind, geometry_type)
         except (ValueError, KeyError):
             raise ValueError(
-                f"Unknown join mode {mode!r}. Available: {[g.value for g in _registry]}"
+                f"Unknown join lhs={lhs!r}/mode={mode!r}. "
+                f"Available: {[(str(lk), str(gk)) for (lk, gk) in _registry]}"
             ) from None
-        analysis_mode: AnalysisMode = (
+        join_mode: JoinMode = (
             FilteredMode(bbox=bbox)
             if bbox is not None
             else NationalMode(n_chunks=n_chunks)
@@ -121,7 +126,7 @@ class UsrnMatcher:
             sd,
             usrn_parquet=self._usrn_parquet,
             rhs_config=self._rhs_config,
-            mode=analysis_mode,
+            mode=join_mode,
             explain=explain,
             distance_m=distance_m,
             phase3_distance_m=phase3_distance_m,
@@ -643,8 +648,18 @@ class UsrnMatcher:
             help="Number of rows for --output sample (default: 100000).",
         )
         p_match.add_argument(
+            "--lhs-name",
+            choices=[lhs.value for lhs in LhsKind],
+            default=LhsKind.USRN.value,
+            help=(
+                "Base dataset to join from (default: 'usrn'): 'usrn' — street "
+                "centrelines; 'uprn' — address points. Not every --mode is "
+                "registered for every --lhs-name (currently 'uprn' only has 'polygon')."
+            ),
+        )
+        p_match.add_argument(
             "--mode",
-            choices=[g.value for g in _registry],
+            choices=sorted({g.value for (_, g) in _registry}),
             default=GeometryType.POLYGON.value,
             help=(
                 "Join strategy: 'polygon' for area/polygon datasets (default); "
@@ -918,13 +933,18 @@ class UsrnMatcher:
                     "--mode line requires --usrn-line-parquet (run 'prepare-usrns-line --buffer-m N' first)"
                 )
 
+            lhs_parquet_name: str = (
+                "usrns_27700.parquet"
+                if args.lhs_name == LhsKind.USRN
+                else "uprns_27700.parquet"
+            )
             matcher: UsrnMatcher = cls(
-                usrn_parquet=cache_dir / "usrns_27700.parquet",
+                usrn_parquet=cache_dir / lhs_parquet_name,
                 rhs_config=rhs_config,
                 threads=args.threads,
             )
 
-            stem: str = f"usrn_{args.rhs_name}_attribution"
+            stem: str = f"{args.lhs_name}_{args.rhs_name}_attribution"
             matched_dir: pathlib.Path = pathlib.Path(args.matched_dir)
 
             # National + parquet output → stream each RHS chunk directly to file
@@ -935,6 +955,7 @@ class UsrnMatcher:
 
             table: pa.Table = matcher.match_dispatch(
                 mode=args.mode,
+                lhs=args.lhs_name,
                 bbox=bbox,
                 explain=args.explain,
                 n_chunks=args.batches,

@@ -7,6 +7,7 @@
 	prepare-uprns prepare-uprns-buffer \
 	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-ngn-mains prepare-all \
 	match-soil-national match-soil-national-explain \
+	match-soil-uprn match-built-uprn \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
 	match-gas-pipe-sample match-gas-pipe-sample-explain \
@@ -52,11 +53,13 @@ prepare-uprns-buffer:
 prepare-soil:
 	usrn-matcher prepare-gpkg \
 		--rhs-name soil \
+		--rhs-row-group-size 100 \
 		--force
 
 prepare-built:
 	usrn-matcher prepare-gpkg \
 		--rhs-name os_open_built_up_areas \
+		--rhs-row-group-size 100 \
 		--force
 
 prepare-stops:
@@ -97,6 +100,22 @@ match-soil-national:
 	usrn-matcher match \
 		--rhs-name   soil \
 		--mode       polygon \
+		--output     parquet
+
+match-soil-uprn:
+	usrn-matcher match \
+		--lhs-name   uprn \
+		--rhs-name   soil \
+		--mode       polygon \
+		--batches    200 \
+		--output     parquet
+
+match-built-uprn:
+	usrn-matcher match \
+		--lhs-name   uprn \
+		--rhs-name   os_open_built_up_areas \
+		--mode       polygon \
+		--batches    200 \
 		--output     parquet
 
 match-stops-national:

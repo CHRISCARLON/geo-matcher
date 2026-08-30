@@ -54,11 +54,40 @@ The same rule runs the other way in the line-join Phase 3/Phase 4 batch loops: t
 
 **Join modes:**
 
-| Mode | Architecture | Predicate | Use for |
-|---|---|---|---|
-| `polygon` | Single-phase · 1 USRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
-| `point` | Single-phase · 1 USRN file | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
-| `line` | Four-phase · 2 USRN files | Phases 1+2: `ST_Intersects` then corridor, both over every feature; Phase 3: nearest fallback; Phase 4: connectivity inheritance | Linestrings |
+| Lhs | Mode | Architecture | Predicate | Use for |
+|---|---|---|---|---|
+| `usrn` (default) | `polygon` | Single-phase · 1 USRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
+| `usrn` | `point` | Single-phase · 1 USRN file | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
+| `usrn` | `line` | Four-phase · 2 USRN files | Phases 1+2: `ST_Intersects` then corridor, both over every feature; Phase 3: nearest fallback; Phase 4: connectivity inheritance | Linestrings |
+| `uprn` | `polygon` | Single-phase · 1 UPRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
+
+The join registry is keyed by `(lhs, mode)` — `--lhs-name` picks the base dataset to
+join *from* (`usrn` street centrelines by default, or `uprn` address points),
+`--mode` picks the RHS geometry strategy. Not every `(lhs, mode)` combination is
+registered — currently `uprn` only has a `polygon` join — `usrn-matcher match`
+raises a clear error listing the registered combinations if you ask for one
+that doesn't exist. The `uprn` polygon join reuses the exact same single-phase
+engine (`execute_join`) as the `usrn` polygon join; it just registers the UPRN
+GeoParquet as the `uprns` Sedona view instead of `usrns`.
+
+**`--lhs-name uprn` needs a finely-row-grouped RHS file.** `_split_into_chunks` can
+only split the RHS at existing row-group boundaries — it can never subdivide a
+row group further — so the RHS file's row-group count sets a hard ceiling on
+how many chunks a national join can ever have, no matter what `--batches` is
+passed. That ceiling barely matters for `usrn` joins (1.76M LHS rows), but with
+`uprn` as the LHS (41.6M rows, 23x more), a coarsely-row-grouped RHS produces
+chunks with such broad spatial envelopes that a huge fraction of UPRN rows
+become join candidates per chunk. Concretely: matching `uprn` against a `soil`
+RHS prepared at the default `row_group_size=10,000` (42,603 rows → only 5 row
+groups) OOM'd/hung after chunk 1 (5.5M matches from that one chunk alone).
+Re-preparing `soil` with `--rhs-row-group-size 100` (→ 427 row groups) and
+matching with `--batches 200` (→ 143 actual chunks, ~3 row groups/~300 rows
+each) fixed it: the full national join completed in ~60s, streaming
+37.7M matches with no memory blowup. When adding a new RHS dataset for use
+with `--lhs-name uprn`, prepare it with a small `--rhs-row-group-size` (or
+`--row-group-size` for `prepare-csv`/`prepare-parquet`) and pass a `--batches`
+high enough to actually spend that row-group count as chunks — see
+`prepare-soil`/`match-soil-uprn` in the `Makefile` for a working example.
 
 **Line join four-phase strategy**
 

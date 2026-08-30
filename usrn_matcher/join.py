@@ -11,7 +11,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from sedonadb.context import SedonaContext
 
-from .config import BBox, DatasetConfig, GeometryType
+from .config import BBox, DatasetConfig, GeometryType, LhsKind
 from .explain import log_plan
 from .join_sql import (
     OVERLAP_EXPR_CORRIDOR,
@@ -64,12 +64,12 @@ class FilteredMode:
 class NationalMode:
     """Full national join — RHS split into *n_chunks* chunks processed one at a time."""
 
-    n_chunks: int = 50
+    n_chunks: int = 80
 
 
-AnalysisMode = FilteredMode | NationalMode
+JoinMode = FilteredMode | NationalMode
 
-_DEFAULT_MODE: AnalysisMode = NationalMode()
+_DEFAULT_MODE: JoinMode = NationalMode()
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ class JoinFn(Protocol):
         usrn_parquet: pathlib.Path,
         rhs_config: DatasetConfig,
         *,
-        mode: AnalysisMode = ...,
+        mode: JoinMode = ...,
         explain: bool = ...,
         distance_m: float = ...,
         phase3_distance_m: float | None = ...,
@@ -99,47 +99,59 @@ class JoinFn(Protocol):
     ) -> pa.Table: ...
 
 
-# The registry dictionary that get_join reads from — keyed by GeometryType so the
-# registered join strategies can never drift from the enum.
-_registry: dict[GeometryType, JoinFn] = {}
+# The registry dictionary that get_join reads from — keyed by (LhsKind, GeometryType)
+# so the registered join strategies can never drift from either enum, and USRN and
+# UPRN can each register a strategy for the same RHS geometry type (e.g. both have
+# a "polygon" join) without colliding on a single GeometryType key.
+_registry: dict[tuple[LhsKind, GeometryType], JoinFn] = {}
 _J = TypeVar("_J", bound=JoinFn)
 
 
-def register(name: GeometryType | str) -> Callable[[_J], _J]:
-    """Register a join function under the *name* geometry type.
+def register(lhs: LhsKind | str, geometry: GeometryType | str) -> Callable[[_J], _J]:
+    """Register a join function under the *lhs* base dataset and *geometry* RHS type.
 
-    Raises at import time if *name* is not a GeometryType, so a typo in a
-    @register decorator can never produce an unreachable join.
+    Raises at import time if either argument isn't a valid enum member (or its
+    plain-string value), so a typo in a @register decorator can never produce
+    an unreachable join.
     """
     try:
-        geometry_type: GeometryType = GeometryType(name)
+        lhs_kind: LhsKind = LhsKind(lhs)
     except ValueError:
         raise ValueError(
-            f"Cannot register join {name!r}: not a GeometryType. "
+            f"Cannot register join for lhs={lhs!r}: not a LhsKind. "
+            f"Available: {[member.value for member in LhsKind]}"
+        ) from None
+    try:
+        geometry_type: GeometryType = GeometryType(geometry)
+    except ValueError:
+        raise ValueError(
+            f"Cannot register join {geometry!r}: not a GeometryType. "
             f"Available: {[g.value for g in GeometryType]}"
         ) from None
 
     # The inner function that registers the function against
-    # what is in @register(GeometryType.POINT)
+    # what is in @register(LhsKind.USRN, GeometryType.POINT)
     def decorator(fn: _J) -> _J:
-        _registry[geometry_type] = fn
+        _registry[(lhs_kind, geometry_type)] = fn
         return fn
 
     return decorator
 
 
-def get_join(name: GeometryType | str) -> JoinFn:
-    """Look up the join registered for a geometry type.
+def get_join(lhs: LhsKind | str, geometry: GeometryType | str) -> JoinFn:
+    """Look up the join registered for an (lhs, geometry) pair.
 
-    Accepts either a GeometryType member or its plain-string value — StrEnum
-    members hash and compare equal to their values.
+    Accepts either enum members or their plain-string values — StrEnum members
+    hash and compare equal to their values, so a plain-string tuple matches a
+    tuple of enum members in the registry.
     """
-    if name not in _registry:
+    key = (lhs, geometry)
+    if key not in _registry:
         raise KeyError(
-            f"No join registered for '{name}'. "
-            f"Available: {[g.value for g in _registry]}"
+            f"No join registered for lhs={lhs!r}, mode={geometry!r}. "
+            f"Available: {[(str(lk), str(gk)) for (lk, gk) in _registry]}"
         )
-    return _registry[GeometryType(name)]
+    return _registry[(LhsKind(lhs), GeometryType(geometry))]
 
 
 # ---------------------------------------------------------------------------
@@ -681,14 +693,15 @@ def _national_single_phase(
     explain: bool,
     output_path: pathlib.Path,
     n_chunks: int = 50,  # controlled by NationalMode.n_chunks
+    lhs_view_name: str = "usrns",
 ) -> None:
-    """Single-phase NationalMode executor — one USRN file, chunked RHS.
+    """Single-phase NationalMode executor — one LHS file, chunked RHS.
 
-    Used by ``polygon`` and ``point`` joins.
-    USRN registered once; each RHS chunk's envelope drives USRN row-group pruning.
-    Results streamed incrementally to *output_path*.
+    Used by the ``polygon``/``point`` USRN joins and the UPRN polygon join.
+    LHS registered once (as *lhs_view_name*); each RHS chunk's envelope drives
+    LHS row-group pruning. Results streamed incrementally to *output_path*.
     """
-    sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
+    sd.read_parquet(str(usrn_parquet)).to_view(lhs_view_name, overwrite=True)
 
     rhs_pf = pq.ParquetFile(str(rhs_parquet))
     n_rgs = rhs_pf.metadata.num_row_groups
@@ -744,20 +757,25 @@ def _filtered_single_phase(
     bbox: BBox,
     filter_fn: Callable[[BBox], str],
     explain: bool,
+    lhs_view_name: str = "usrns",
 ) -> pa.Table:
     """Single-phase FilteredMode executor — one query against a city/custom bbox.
 
-    Used by ``polygon`` and ``point`` joins. Mirrors ``_national_single_phase``
-    structurally: unlike NationalMode there's no chunking, so both parquets are
-    registered as full Sedona views and the query runs once.
+    Used by the ``polygon``/``point`` USRN joins and the UPRN polygon join.
+    Mirrors ``_national_single_phase`` structurally: unlike NationalMode there's
+    no chunking, so both parquets are registered as full Sedona views and the
+    query runs once.
     """
-    sd.read_parquet(str(usrn_parquet)).to_view("usrns", overwrite=True)
+    sd.read_parquet(str(usrn_parquet)).to_view(lhs_view_name, overwrite=True)
     sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
 
     usrn_meta = pq.read_metadata(str(usrn_parquet))
     rhs_meta = pq.read_metadata(str(rhs_parquet))
     log.info(
-        "USRN: %d rows / %d row groups", usrn_meta.num_rows, usrn_meta.num_row_groups
+        "%s: %d rows / %d row groups",
+        lhs_view_name,
+        usrn_meta.num_rows,
+        usrn_meta.num_row_groups,
     )
     log.info(
         "RHS (%s): %d rows / %d row groups",
@@ -1172,26 +1190,40 @@ def execute_join(
     rhs_parquet: pathlib.Path,
     rhs_view: str,
     query: str,
-    mode: AnalysisMode,
+    mode: JoinMode,
     filter_fn: Callable[[BBox], str],
     usrn_expand_m: float = 0.0,
     explain: bool = False,
     output_path: pathlib.Path | None = None,
+    lhs_view_name: str = "usrns",
 ) -> pa.Table:
-    """Single-phase dispatcher for ``polygon`` and ``point`` joins.
+    """Single-phase dispatcher for the ``polygon``/``point`` USRN joins and the UPRN
+    polygon join.
 
     Line joins go through ``execute_line_join`` instead.
 
     FilteredMode: delegates to ``_filtered_single_phase`` — one query against the bbox.
 
     NationalMode: delegates to ``_national_single_phase`` which chunks the RHS and streams
-    results. ``usrn_expand_m`` expands the USRN spatial filter per chunk (= ``distance_m``
-    for point joins so USRNs just outside the raw chunk envelope remain reachable).
+    results. ``usrn_expand_m`` expands the LHS spatial filter per chunk (= ``distance_m``
+    for point joins so LHS rows just outside the raw chunk envelope remain reachable).
+
+    ``lhs_view_name`` names the Sedona view *usrn_parquet* is registered under —
+    ``"usrns"`` by default (every USRN join), ``"uprns"`` for the UPRN join —
+    the *query* text must reference whichever name it's given.
     """
     match mode:
         case FilteredMode(bbox=bbox):
             return _filtered_single_phase(
-                sd, usrn_parquet, rhs_parquet, rhs_view, query, bbox, filter_fn, explain
+                sd,
+                usrn_parquet,
+                rhs_parquet,
+                rhs_view,
+                query,
+                bbox,
+                filter_fn,
+                explain,
+                lhs_view_name=lhs_view_name,
             )
 
         case NationalMode(n_chunks=n_chunks):
@@ -1206,6 +1238,7 @@ def execute_join(
                     explain,
                     output_path,
                     n_chunks=n_chunks,
+                    lhs_view_name=lhs_view_name,
                 )
                 return pa.table({})
             with tempfile.TemporaryDirectory() as _tmp:
@@ -1220,6 +1253,7 @@ def execute_join(
                     explain,
                     _path,
                     n_chunks=n_chunks,
+                    lhs_view_name=lhs_view_name,
                 )
                 return pq.read_table(str(_path)) if _path.exists() else pa.table({})
 
@@ -1235,7 +1269,7 @@ def execute_line_join(
     phase4_template: str,
     id_col: str,
     distance_m: float,
-    mode: AnalysisMode,
+    mode: JoinMode,
     usrn_line_parquet: pathlib.Path,
     explain: bool = False,
     output_path: pathlib.Path | None = None,
@@ -1319,17 +1353,18 @@ def execute_line_join(
 # ---------------------------------------------------------------------------
 # Join strategies
 #
-# Three strategies, two architectures:
+# Registered under (LhsKind, GeometryType) — three USRN strategies plus one
+# UPRN strategy so far, three architectures:
 #
-#   polygon  — polygon datasets (e.g. soil, land cover)
+#   (usrn, polygon)  — run_usrn_polygon_join — polygon datasets (e.g. soil, land cover)
 #              Single-phase · 1 USRN file (usrns_27700.parquet)
 #              ST_Intersects(u.geometry, s.geometry)
 #
-#   point    — point datasets (e.g. bus stops, traffic counts)
+#   (usrn, point)    — run_usrn_point_join — point datasets (e.g. bus stops, traffic counts)
 #              Single-phase · 1 USRN file (usrns_27700.parquet)
 #              ST_DWithin(u.geometry, s.geometry, distance_m)
 #
-#   line     — linestring datasets (e.g. gas pipes, cables)
+#   (usrn, line)     — run_usrn_line_join — linestring datasets (e.g. gas pipes, cables)
 #              Four-phase · 2 USRN files (usrns_27700.parquet + usrns_line_Nm_27700.parquet)
 #              Phase 1: ST_Intersects against centrelines (all touching pairs kept)
 #              Phase 2: ST_Intersects against pre-buffered corridor polygons, over the
@@ -1337,16 +1372,24 @@ def execute_line_join(
 #                       own pairs excluded). Phases 1 and 2 are unioned, not chained.
 #              Phase 3: ST_DWithin nearest USRN for features matched by neither
 #              Phase 4: inherit a USRN from a physically connected matched feature
+#
+#   (uprn, polygon)  — run_uprn_polygon_join — address points against polygon
+#              datasets (e.g. wards, flood zones)
+#              Single-phase · 1 UPRN file (uprns_27700.parquet)
+#              ST_Intersects(u.geometry, s.geometry) — reuses execute_join /
+#              _national_single_phase / _filtered_single_phase exactly as the
+#              USRN polygon join does, just registering "uprns" instead of
+#              "usrns" as the LHS view (lhs_view_name="uprns").
 # ---------------------------------------------------------------------------
 
 
-@register(GeometryType.POLYGON)
-def run_polygon_join(
+@register(LhsKind.USRN, GeometryType.POLYGON)
+def run_usrn_polygon_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
     *,
-    mode: AnalysisMode = _DEFAULT_MODE,
+    mode: JoinMode = _DEFAULT_MODE,
     explain: bool = False,
     output_path: pathlib.Path | None = None,
     **_kwargs: Any,
@@ -1389,13 +1432,75 @@ def run_polygon_join(
     )
 
 
-@register(GeometryType.POINT)
-def run_point_join(
+@register(LhsKind.UPRN, GeometryType.POLYGON)
+def run_uprn_polygon_join(
+    sd: SedonaContext,
+    usrn_parquet: pathlib.Path,  # holds the UPRN parquet path — see module docstring note below
+    rhs_config: DatasetConfig,
+    *,
+    mode: JoinMode = _DEFAULT_MODE,
+    explain: bool = False,
+    output_path: pathlib.Path | None = None,
+    **_kwargs: Any,
+) -> pa.Table:
+    """Intersect UPRN address points against a polygon dataset — single-phase, one UPRN file.
+
+    Structurally identical to ``run_usrn_polygon_join`` — same ``execute_join``
+    engine, same ``ST_Intersects`` predicate — just registering the LHS view as
+    ``"uprns"`` instead of ``"usrns"`` (``lhs_view_name="uprns"``) and selecting
+    ``uprn`` instead of ``usrn``/``street_type`` (the prepared UPRN GeoParquet
+    carries no ``street_type`` equivalent).
+
+    The parameter is named ``usrn_parquet`` (not ``uprn_parquet``) so this
+    function is callable through ``UsrnMatcher.match_dispatch`` unchanged — that
+    call site always passes ``usrn_parquet=self._usrn_parquet`` regardless of
+    which LHS kind was requested. Renaming that concept throughout is deferred
+    to the wider project rename mentioned separately.
+    """
+    rhs_view: str = rhs_config.name
+
+    match mode:
+        case FilteredMode(bbox=bbox):
+            log.info("Bbox filter: xmin=%s ymin=%s xmax=%s ymax=%s", *bbox)
+        case NationalMode():
+            log.info("No bbox supplied — running full national join.")
+
+    cols_fragment: str = col_fragment(rhs_config)
+
+    query: str = f"""
+        SELECT
+            u.uprn
+            {cols_fragment}
+        FROM uprns AS u
+        JOIN {rhs_view} AS s
+          ON ST_Intersects(u.geometry, s.geometry)
+        WHERE TRUE
+        {{spatial_filter}}
+        ORDER BY u.uprn
+    """
+
+    return execute_join(
+        sd,
+        usrn_parquet,
+        rhs_config.parquet_path,
+        rhs_view,
+        query,
+        mode,
+        filter_fn=bbox_pruner,
+        explain=explain,
+        output_path=output_path,
+        usrn_expand_m=0.0,
+        lhs_view_name="uprns",
+    )
+
+
+@register(LhsKind.USRN, GeometryType.POINT)
+def run_usrn_point_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
     *,
-    mode: AnalysisMode = _DEFAULT_MODE,
+    mode: JoinMode = _DEFAULT_MODE,
     distance_m: float = 10.0,
     explain: bool = False,
     output_path: pathlib.Path | None = None,
@@ -1448,13 +1553,13 @@ def run_point_join(
     )
 
 
-@register(GeometryType.LINE)
-def run_line_join(
+@register(LhsKind.USRN, GeometryType.LINE)
+def run_usrn_line_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_config: DatasetConfig,
     *,
-    mode: AnalysisMode = _DEFAULT_MODE,
+    mode: JoinMode = _DEFAULT_MODE,
     distance_m: float = 10.0,
     phase3_distance_m: float | None = None,
     explain: bool = False,
@@ -1488,7 +1593,7 @@ def run_line_join(
     """
     if not rhs_id_col:
         raise ValueError(
-            "run_line_join requires --rhs-id-col to track matched RHS features between phases."
+            "run_usrn_line_join requires --rhs-id-col to track matched RHS features between phases."
         )
     # Validated once here, at the point rhs_id_col first enters the pipeline — every
     # downstream phase (_phase2_select_corridors, _nearest_dedup, _register_neighbours_view)
@@ -1496,7 +1601,7 @@ def run_line_join(
     rhs_id_col = sql_ident(rhs_id_col, context="--rhs-id-col")
     if usrn_line_parquet is None:
         raise ValueError(
-            "run_line_join requires --usrn-line-parquet. "
+            "run_usrn_line_join requires --usrn-line-parquet. "
             "Run 'usrn-matcher prepare-usrns-line --buffer-m N' first."
         )
 
