@@ -12,6 +12,26 @@ Source files are converted to optimised GeoParquet 1.1 in `output_data/`. Run on
 
 **Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups for 1.76M rows); other datasets default to `10,000`. More row groups means more pruning opportunities.
 
+**UPRN prep (`prepare-uprns` / `prepare-uprns-buffer`)** — mirrors USRN's two-file
+plain/buffered split (`UprnSource`, same `buffer_m` mode switch as
+`UsrnSource`), with two differences driven by the source and its scale
+(~41.6M rows vs. USRN's 1.76M):
+
+- The OS Open UPRN GeoPackage ships an uppercase `UPRN` id column; the plain
+  prepare step renames it to lowercase `uprn` to match this pipeline's
+  convention (`usrn`, `street_type`, ...).
+- Only `uprn` + `geometry` are kept in the plain file, and only `uprn` +
+  `geometry`/`geometry_point` in the buffered one — the source's
+  `x_coordinate`/`y_coordinate`/`latitude`/`longitude` columns are dropped
+  everywhere as redundant with `geometry` (same point, two encodings), which
+  meaningfully cuts file size at this row count.
+
+The buffered file replaces `geometry` with `ST_Buffer(point, buffer_m)` — a
+circular catchment polygon per address point — and keeps the original point
+as `geometry_point`, the same relationship `usrns_line_{N}m` has to its
+`geometry_line`. A prepared `uprns_27700.parquet` needs no new join code: it's
+usable as an ordinary RHS point dataset via `--mode point`.
+
 ---
 
 ## Match phase

@@ -13,6 +13,7 @@ from .config import (
     DEFAULT_INPUT_DIR,
     DEFAULT_MATCHED_DIR,
     DEFAULT_OUTPUT_DIR,
+    DEFAULT_UPRN_GPKG,
     DEFAULT_USRN_GPKG,
     BBox,
     CsvSource,
@@ -21,6 +22,7 @@ from .config import (
     MatchSource,
     OgrSource,
     ParquetSource,
+    UprnSource,
     UsrnSource,
 )
 from .join import (
@@ -55,7 +57,7 @@ class UsrnMatcher:
     _sd: "SedonaContext | None"
     _threads: (
         int | None
-    )  # This limits the amount of CPU the SeondaSession has access to
+    )  # This limits the amount of CPU/threads the SeondaSession has access to
 
     def __init__(
         self,
@@ -77,6 +79,8 @@ class UsrnMatcher:
         assert self._sd is not None
         return self._sd
 
+    # TODO: rename the mode var to rhs_geom_type
+    # TODO: rename analysis mode to join mode
     def match_dispatch(
         self,
         mode: GeometryType | str,
@@ -145,7 +149,9 @@ class UsrnMatcher:
         stem: str,
         sample: int = 100_000,
     ) -> None:
-        """Write finished match results to the requested output format."""
+        """Write finished match results to the requested output format.
+
+        Takes in a Arrow table and outputs a parquet file (or csv)"""
         if output not in self._OUTPUT_FORMATS:
             raise ValueError(
                 f"Unknown output format {output!r}. Available: {sorted(self._OUTPUT_FORMATS)}"
@@ -298,6 +304,84 @@ class UsrnMatcher:
             help="Re-prepare even if the GeoParquet already exists.",
         )
         p_prepare_usrns_line.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+
+        # ------------------------------------------------------------------ #
+        # prepare-uprns                                                      #
+        # ------------------------------------------------------------------ #
+        p_prepare_uprns = sub.add_parser(
+            "prepare-uprns",
+            help="Pre-process the OS Open UPRN GeoPackage into optimised GeoParquet.",
+        )
+        p_prepare_uprns.add_argument(
+            "--uprn-gpkg",
+            default=DEFAULT_UPRN_GPKG,
+            metavar="PATH",
+            help=f"Path to the OS Open UPRN GeoPackage (default: {DEFAULT_UPRN_GPKG}).",
+        )
+        p_prepare_uprns.add_argument(
+            "--cache-dir",
+            default=DEFAULT_OUTPUT_DIR,
+            metavar="DIR",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
+        )
+        p_prepare_uprns.add_argument(
+            "--force",
+            action="store_true",
+            help="Re-prepare even if the GeoParquet already exists.",
+        )
+        p_prepare_uprns.add_argument(
+            "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+
+        # ------------------------------------------------------------------ #
+        # prepare-uprns-buffer                                               #
+        # ------------------------------------------------------------------ #
+        p_prepare_uprns_buffer = sub.add_parser(
+            "prepare-uprns-buffer",
+            help="Prepare buffered UPRN catchment polygons from a prepared UPRN GeoParquet.",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--buffer-m",
+            type=float,
+            required=True,
+            metavar="METRES",
+            help="Buffer radius in metres applied to each UPRN point.",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--uprn-parquet",
+            default=None,
+            metavar="PATH",
+            help="Path to existing uprns_27700.parquet (default: {cache-dir}/uprns_27700.parquet).",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--cache-dir",
+            default=DEFAULT_OUTPUT_DIR,
+            metavar="DIR",
+            help=f"Directory for cached GeoParquet files (default: {DEFAULT_OUTPUT_DIR}).",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--row-group-size",
+            type=int,
+            default=20_000,
+            metavar="N",
+            help="Row group size for the output GeoParquet (default: 20000).",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--force",
+            action="store_true",
+            help="Re-prepare even if the GeoParquet already exists.",
+        )
+        p_prepare_uprns_buffer.add_argument(
             "--threads",
             type=int,
             default=None,
@@ -706,6 +790,44 @@ class UsrnMatcher:
                     ),
                     parquet_path=cache_dir
                     / f"usrns_line_{buffer_label}m_27700.parquet",
+                ),
+                force=args.force,
+                threads=args.threads,
+            )
+
+        elif args.command == "prepare-uprns":
+            uprn_gpkg: pathlib.Path = pathlib.Path(args.uprn_gpkg)
+            _validate_input_file(uprn_gpkg)
+            cache_dir = pathlib.Path(args.cache_dir)
+            prepare(
+                DatasetConfig(
+                    name="uprns",
+                    source=UprnSource(path=uprn_gpkg, row_group_size=20_000),
+                    parquet_path=cache_dir / "uprns_27700.parquet",
+                ),
+                force=args.force,
+                threads=args.threads,
+            )
+
+        elif args.command == "prepare-uprns-buffer":
+            cache_dir = pathlib.Path(args.cache_dir)
+            uprn_parquet_path: pathlib.Path = (
+                pathlib.Path(args.uprn_parquet)
+                if args.uprn_parquet
+                else cache_dir / "uprns_27700.parquet"
+            )
+            buffer_m = args.buffer_m
+            buffer_label = f"{buffer_m:g}".replace(".", "_")
+            prepare(
+                DatasetConfig(
+                    name=f"uprns_buffer_{buffer_label}m",
+                    source=UprnSource(
+                        path=uprn_parquet_path,
+                        buffer_m=buffer_m,
+                        row_group_size=args.row_group_size,
+                    ),
+                    parquet_path=cache_dir
+                    / f"uprns_buffer_{buffer_label}m_27700.parquet",
                 ),
                 force=args.force,
                 threads=args.threads,

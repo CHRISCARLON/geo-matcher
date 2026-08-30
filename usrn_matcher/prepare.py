@@ -16,6 +16,7 @@ from .config import (
     GeometryType,
     OgrSource,
     ParquetSource,
+    UprnSource,
     UsrnSource,
 )
 from .logger import get_logger
@@ -521,6 +522,134 @@ def _prepare_usrn(
     return _prepare_usrn_buffer(source, parquet_path, name, force, threads)
 
 
+def _prepare_uprn_plain(
+    source: UprnSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    """Prepare a raw OS Open UPRN GeoPackage into a plain address-point GeoParquet.
+
+    Unlike ``UsrnSource``'s plain mode, this can't just delegate to
+    ``_prepare_ogr`` unchanged: the OS Open UPRN source ships an uppercase
+    ``UPRN`` id column, and every other id column in this pipeline is
+    lowercase (``usrn``). This renames it to match on the way in.
+
+    Only ``uprn`` and ``geometry`` are carried through — ``X_COORDINATE``/
+    ``Y_COORDINATE``/``LATITUDE``/``LONGITUDE`` are dropped as redundant with
+    ``geometry`` (same point, two encodings), and at 40M+ rows that's four
+    fewer doubles per row across the whole file.
+    """
+    if _should_skip(parquet_path, force):
+        return parquet_path
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Preparing %s from %s", name, source.path)
+
+    con = _open_connection(threads)
+
+    src_geom: str = _get_src_geometry_col(con, str(source.path))
+    log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
+
+    core_select_sql = f"""
+        SELECT
+            UPRN AS uprn,
+            "{src_geom}" AS geometry
+        FROM st_read('{_sql_str(source.path)}')
+    """
+    elapsed = _write_geoparquet(
+        con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
+    )
+    _log_prepared(parquet_path, elapsed)
+    return parquet_path
+
+
+def _prepare_uprn_buffer(
+    source: UprnSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    """Buffer an already-prepared UPRN point GeoParquet into catchment polygons.
+
+    Private helper — only reachable with ``source.buffer_m`` set. Call
+    ``_prepare_uprn`` instead, which dispatches correctly based on
+    ``source.buffer_m``.
+    """
+    if source.buffer_m is None:
+        raise ValueError(
+            "_prepare_uprn_buffer requires UprnSource.buffer_m to be set; got None. "
+            "Call _prepare_uprn(source, ...) instead — it dispatches to the plain "
+            "OGR-derived path when buffer_m is None."
+        )
+
+    if _should_skip(parquet_path, force):
+        return parquet_path
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+    con = _open_connection(threads)
+
+    pq_src = pq.read_metadata(str(source.path))
+    log.info("Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path)
+    log.info(
+        "  Source: %s rows | %d row groups",
+        f"{pq_src.num_rows:,}",
+        pq_src.num_row_groups,
+    )
+    log.info(
+        "  Source geometry column: 'geometry' → output column: 'geometry' "
+        "(buffered %.0fm; original point kept as 'geometry_point')",
+        source.buffer_m,
+    )
+    log.info("  Hilbert sort + write → %s ...", parquet_path)
+
+    # Only uprn carries through — x/y/lat/lon are redundant with geometry_point
+    # and this file's row count is large enough that dropping four doubles per
+    # row is worth it.
+    core_select_sql = f"""
+        SELECT
+            uprn,
+            geometry AS geometry_point,
+            ST_Buffer(geometry, {source.buffer_m}) AS geometry
+        FROM read_parquet('{_sql_str(source.path)}')
+    """
+    elapsed = _write_geoparquet(
+        con,
+        core_select_sql,
+        parquet_path,
+        source.row_group_size,
+        crs=source.crs,
+        primary_column="geometry",
+    )
+    _log_prepared(parquet_path, elapsed)
+    return parquet_path
+
+
+def _prepare_uprn(
+    source: UprnSource,
+    parquet_path: pathlib.Path,
+    name: str,
+    force: bool,
+    threads: int | None = None,
+) -> pathlib.Path:
+    """Dispatch a UprnSource to plain (address-point) or buffered (catchment) prep.
+
+    ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable UPRN
+    source; delegates to ``_prepare_uprn_plain``.
+
+    ``source.buffer_m`` set — ``source.path`` is an already-prepared plain
+    UPRN GeoParquet; delegates to ``_prepare_uprn_buffer`` to build the
+    buffered catchment polygons.
+    """
+    if source.buffer_m is None:
+        return _prepare_uprn_plain(source, parquet_path, name, force, threads)
+    return _prepare_uprn_buffer(source, parquet_path, name, force, threads)
+
+
 def prepare(
     config: DatasetConfig,
     force: bool = False,
@@ -535,6 +664,8 @@ def prepare(
     - ``ParquetSource`` — existing GeoParquet to re-sort and re-compress
     - ``UsrnSource`` — USRN prep: plain centrelines (``buffer_m=None``) or
       buffered corridors for line-join Phase 2 (``buffer_m=<float>``)
+    - ``UprnSource`` — UPRN prep: plain address points (``buffer_m=None``) or
+      buffered catchment polygons (``buffer_m=<float>``)
 
     A ``config.source`` must always be provided.
 
@@ -573,3 +704,5 @@ def prepare(
             )
         case UsrnSource() as src:
             return _prepare_usrn(src, config.parquet_path, config.name, force, threads)
+        case UprnSource() as src:
+            return _prepare_uprn(src, config.parquet_path, config.name, force, threads)
