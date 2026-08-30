@@ -32,6 +32,19 @@ usrn-matcher prepare-usrns
 
 Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`. Add `--force` to re-prepare.
 
+**UPRNs (address points, optional):**
+
+```bash
+usrn-matcher prepare-uprns
+```
+
+Reads `input_data/osopenuprn.gpkg`, writes `output_data/uprns_27700.parquet`
+(`uprn` + `geometry` only — the source's redundant coordinate columns are
+dropped). ~23x the row count of USRN, so it takes noticeably longer. Follow
+with `usrn-matcher prepare-uprns-buffer --buffer-m 10` for buffered catchment
+polygons (`uprns_buffer_10m_27700.parquet`, adds `geometry_point` for the
+original point).
+
 **RHS from GeoPackage / shapefile:**
 
 ```bash
@@ -109,7 +122,7 @@ usrn-matcher match --rhs-name soil --output parquet
 ```python
 import pathlib
 
-from usrn_matcher import DatasetConfig, UsrnSource, CsvSource, UsrnMatcher
+from usrn_matcher import DatasetConfig, UsrnSource, UprnSource, CsvSource, UsrnMatcher
 from usrn_matcher.prepare import prepare
 from usrn_matcher.bboxes import LEEDS
 
@@ -118,6 +131,13 @@ prepare(DatasetConfig(
     name="usrns",
     source=UsrnSource(path="input_data/osopenusrn.gpkg", row_group_size=20_000),
     parquet_path="output_data/usrns_27700.parquet",
+))
+
+# Prepare UPRNs (optional — address points, uprn + geometry only)
+prepare(DatasetConfig(
+    name="uprns",
+    source=UprnSource(path="input_data/osopenuprn.gpkg", row_group_size=20_000),
+    parquet_path="output_data/uprns_27700.parquet",
 ))
 
 # Prepare RHS dataset
