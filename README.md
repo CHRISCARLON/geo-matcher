@@ -1,24 +1,22 @@
 # Geo Matcher
 
-Spatially join Unique Street Reference Numbers (USRNs) to any geospatial dataset using SedonaDB.
+Spatially join Unique Street Reference Numbers (USRNs) & Unique Propert Reference Numbers to geospatial datasets using SedonaDB.
 
-Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) for spatial joins and [DuckDB](https://duckdb.org/) for GeoParquet preparation, with optimised [GeoParquet 1.1](https://geoparquet.org/) output.
+Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query engine) for spatial joins and [DuckDB](https://duckdb.org/) for GeoParquet preparation, with optimised [GeoParquet 1.1](https://geoparquet.org/) files for use during matching.
 
 ## What it does
 
-`geo-matcher` answers the question: *which USRN (or UPRN) does this spatial feature interact with?*
-
-Given any spatial dataset (bus stops, soil polygons, flood zones — anything with a geometry), it finds the USRN or USRNs that intersect or are nearest to each feature and produces a joined output carrying both the USRN reference and the original dataset's attributes.
+`geo-matcher` focuses on one thing: *spatially matching USRNs & UPRNS to other datasets*
 
 All geometries must be in British National Grid (EPSG:27700). 
 
-Output is attribute-only — no geometry column.
+Output is attribute-only — no geometry columns are included in the outputs as they can be joined back on later.
 
 ## Installation
 
 ```bash
 git clone <repo>
-cd usrn-matcher
+cd geo-matcher
 uv sync
 ```
 

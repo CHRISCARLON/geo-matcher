@@ -17,8 +17,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/cmcarlon/usrn-matcher"
-Repository = "https://github.com/cmcarlon/usrn-matcher"
+Homepage = "https://github.com/CHRISCARLON/geo-matcher"
+Repository = "https://github.com/CHRISCARLON/geo-matcher"
 
 [dependency-groups]
 linting = ["ruff>=0.4"]
