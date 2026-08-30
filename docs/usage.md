@@ -15,7 +15,7 @@ The prepare step converts source files into spatially-sorted GeoParquet cached o
 ### 1. Init
 
 ```bash
-usrn-matcher init
+geo-matcher init
 ```
 
 Creates `input_data/`, `output_data/`, and `matched_data/`.
@@ -27,7 +27,7 @@ Creates `input_data/`, `output_data/`, and `matched_data/`.
 **USRNs:**
 
 ```bash
-usrn-matcher prepare-usrns
+geo-matcher prepare-usrns
 ```
 
 Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`. Add `--force` to re-prepare.
@@ -35,26 +35,26 @@ Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`. Ad
 **UPRNs (address points, optional):**
 
 ```bash
-usrn-matcher prepare-uprns
+geo-matcher prepare-uprns
 ```
 
 Reads `input_data/osopenuprn.gpkg`, writes `output_data/uprns_27700.parquet`
 (`uprn` + `geometry` only — the source's redundant coordinate columns are
 dropped). ~23x the row count of USRN, so it takes noticeably longer. Follow
-with `usrn-matcher prepare-uprns-buffer --buffer-m 10` for buffered catchment
+with `geo-matcher prepare-uprns-buffer --buffer-m 10` for buffered catchment
 polygons (`uprns_buffer_10m_27700.parquet`, adds `geometry_point` for the
 original point).
 
 **RHS from GeoPackage / shapefile:**
 
 ```bash
-usrn-matcher prepare-gpkg --rhs-name dataset_one
+geo-matcher prepare-gpkg --rhs-name dataset_one
 ```
 
 **RHS from CSV with coordinate columns:**
 
 ```bash
-usrn-matcher prepare-csv \
+geo-matcher prepare-csv \
   --name  stops \
   --x-col Easting \
   --y-col Northing
@@ -63,7 +63,7 @@ usrn-matcher prepare-csv \
 **RHS from CSV with WKT geometry text (line/polygon):**
 
 ```bash
-usrn-matcher prepare-csv \
+geo-matcher prepare-csv \
   --name          gas_pipes \
   --geometry-type line \
   --wkt-col       wkt
@@ -77,7 +77,7 @@ quotes that field — most spreadsheet/export tools do this automatically.
 **RHS from an existing Parquet (re-optimise / reproject):**
 
 ```bash
-usrn-matcher prepare-parquet \
+geo-matcher prepare-parquet \
   --name       dataset_one \
   --source-crs EPSG:4326
 ```
@@ -90,19 +90,19 @@ All prepare commands accept `--force` (re-prepare even if output exists) and `--
 
 ```bash
 # Polygon join — area / polygon datasets (default)
-usrn-matcher match --rhs-name soil --city LEEDS
+geo-matcher match --rhs-name soil --city LEEDS
 
 # Point join — point datasets
-usrn-matcher match --rhs-name stops --city LEEDS --mode point --distance 25
+geo-matcher match --rhs-name stops --city LEEDS --mode point --distance 25
 
 # Line join — linestring datasets (two-phase, requires buffered USRN file)
-usrn-matcher match --rhs-name gas_pipe --mode line --distance 10 --rhs-id-col asset_id --city MANCHESTER
+geo-matcher match --rhs-name gas_pipe --mode line --distance 10 --rhs-id-col asset_id --city MANCHESTER
 
 # Full national join (streaming parquet output)
-usrn-matcher match --rhs-name soil --output parquet
+geo-matcher match --rhs-name soil --output parquet
 
 # UPRN polygon join — address points against a polygon dataset
-usrn-matcher match --lhs-name uprn --rhs-name soil --city LEEDS
+geo-matcher match --lhs-name uprn --rhs-name soil --city LEEDS
 ```
 
 | Flag | Default | Description |
@@ -126,9 +126,9 @@ usrn-matcher match --lhs-name uprn --rhs-name soil --city LEEDS
 ```python
 import pathlib
 
-from usrn_matcher import DatasetConfig, UsrnSource, UprnSource, CsvSource, UsrnMatcher
-from usrn_matcher.prepare import prepare
-from usrn_matcher.bboxes import LEEDS
+from geo_matcher import DatasetConfig, UsrnSource, UprnSource, CsvSource, GeoMatcher
+from geo_matcher.prepare import prepare
+from geo_matcher.bboxes import LEEDS
 
 # Prepare USRNs
 prepare(DatasetConfig(
@@ -152,7 +152,7 @@ prepare(DatasetConfig(
 ))
 
 # Match
-matcher = UsrnMatcher(
+matcher = GeoMatcher(
     usrn_parquet="output_data/usrns_27700.parquet",
     rhs_config=DatasetConfig(
         name="stops",

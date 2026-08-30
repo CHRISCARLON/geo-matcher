@@ -64,7 +64,7 @@ The same rule runs the other way in the line-join Phase 3/Phase 4 batch loops: t
 The join registry is keyed by `(lhs, mode)` — `--lhs-name` picks the base dataset to
 join *from* (`usrn` street centrelines by default, or `uprn` address points),
 `--mode` picks the RHS geometry strategy. Not every `(lhs, mode)` combination is
-registered — currently `uprn` only has a `polygon` join — `usrn-matcher match`
+registered — currently `uprn` only has a `polygon` join — `geo-matcher match`
 raises a clear error listing the registered combinations if you ask for one
 that doesn't exist. The `uprn` polygon join reuses the exact same single-phase
 engine (`execute_join`) as the `usrn` polygon join; it just registers the UPRN

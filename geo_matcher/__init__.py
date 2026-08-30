@@ -21,10 +21,10 @@ from .join import (
     execute_line_join,
     get_join,
 )
-from .matcher import UsrnMatcher
+from .matcher import GeoMatcher
 
 __all__ = [
-    "UsrnMatcher",
+    "GeoMatcher",
     "AnySource",
     "BBox",
     "CsvSource",

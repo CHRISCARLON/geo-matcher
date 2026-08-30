@@ -1,5 +1,5 @@
 {
-  "include": ["usrn_matcher", "tests"],
+  "include": ["geo_matcher", "tests"],
   "exclude": [
     "**/__pycache__",
     ".venv",

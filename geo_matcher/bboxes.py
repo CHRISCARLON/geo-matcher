@@ -4,10 +4,10 @@ Each bbox is ``[xmin, ymin, xmax, ymax]`` in metres.
 
 Usage::
 
-    from usrn_matcher import UsrnMatcher
-    from usrn_matcher.bboxes import LEEDS, LONDON
+    from geo_matcher import GeoMatcher
+    from geo_matcher.bboxes import LEEDS, LONDON
 
-    matcher = UsrnMatcher(...)
+    matcher = GeoMatcher(...)
     table = matcher.match_dispatch("polygon", bbox=LEEDS)
 """
 

@@ -1,8 +1,8 @@
-"""Unit tests for usrn_matcher/join_sql.py — SQL fragment builders."""
+"""Unit tests for geo_matcher/join_sql.py — SQL fragment builders."""
 
 import pytest
 
-from usrn_matcher.join_sql import (
+from geo_matcher.join_sql import (
     OVERLAP_EXPR_CORRIDOR,
     _bbox_to_wkt,
     bbox_nearest_filters,

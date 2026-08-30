@@ -8,9 +8,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import usrn_matcher.join as join_module
-from usrn_matcher.config import DatasetConfig, GeometryType, LhsKind
-from usrn_matcher.join import (
+import geo_matcher.join as join_module
+from geo_matcher.config import DatasetConfig, GeometryType, LhsKind
+from geo_matcher.join import (
     _assert_corridor_file_current,
     _distinct_ids,
     _log_line_match_summary,
@@ -335,7 +335,7 @@ def test_distinct_ids_unions_across_parts():
 
 def test_log_line_match_summary_counts_each_feature_once(caplog):
     """Phases 1 and 2 overlap now, so `matched` is a union, not a sum."""
-    with caplog.at_level(logging.INFO, logger="usrn_matcher"):
+    with caplog.at_level(logging.INFO, logger="geo_matcher"):
         # 10 features: 6 matched at Phase 1, 5 at Phase 2 of which 4 are the same
         # features. Summing would claim 11 matched out of 10.
         _log_line_match_summary(10, 7, 6, 5, 1, 0, 4)

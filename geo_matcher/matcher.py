@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 log: logging.Logger = get_logger()
 
 
-class UsrnMatcher:
+class GeoMatcher:
     """Spatially join USRNs to any polygon, point, or linestring dataset using SedonaDB."""
 
     _OUTPUT_FORMATS: ClassVar[dict[str, str]] = {
@@ -218,13 +218,13 @@ class UsrnMatcher:
 
     @classmethod
     def cli(cls) -> None:
-        """Entry point for the ``usrn-matcher`` command-line tool."""
+        """Entry point for the ``geo-matcher`` command-line tool."""
         city_names: list[str] = [
             city for city in vars(_bboxes) if not city.startswith("_")
         ]
 
         parser = argparse.ArgumentParser(
-            prog="usrn-matcher",
+            prog="geo-matcher",
             description="Spatially join USRNs to any spatial dataset.",
         )
         sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -938,7 +938,7 @@ class UsrnMatcher:
                 if args.lhs_name == LhsKind.USRN
                 else "uprns_27700.parquet"
             )
-            matcher: UsrnMatcher = cls(
+            matcher: GeoMatcher = cls(
                 usrn_parquet=cache_dir / lhs_parquet_name,
                 rhs_config=rhs_config,
                 threads=args.threads,
@@ -987,7 +987,7 @@ def _validate_input_file(path: pathlib.Path) -> None:
     """Check the input dir exists, all filenames are lowercase, and the target file is present."""
     if not DEFAULT_INPUT_DIR.exists():
         raise ValueError(
-            f"Input directory '{DEFAULT_INPUT_DIR}' does not exist. Run 'usrn-matcher init' first."
+            f"Input directory '{DEFAULT_INPUT_DIR}' does not exist. Run 'geo-matcher init' first."
         )
 
     bad: list[str] = [
@@ -1015,7 +1015,7 @@ def _cmd_init() -> None:
         DEFAULT_OUTPUT_DIR,
         DEFAULT_MATCHED_DIR,
     ]
-    print("Initialising usrn-matcher project directories:")  # noqa: T201
+    print("Initialising geo-matcher project directories:")  # noqa: T201
     for d in dirs:
         created: bool = not d.exists()
         d.mkdir(exist_ok=True)

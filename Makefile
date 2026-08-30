@@ -1,4 +1,4 @@
-# usrn-matcher — task runner
+# geo-matcher — task runner
 # Usage: make <target>
 
 .PHONY: \
@@ -19,17 +19,17 @@
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 init:
-	usrn-matcher init
+	geo-matcher init
 
 # ── Prepare USRNs ─────────────────────────────────────────────────────────────
 
 prepare-usrns:
-	usrn-matcher prepare-usrns \
+	geo-matcher prepare-usrns \
 		--usrn-gpkg input_data/osopenusrn_202607.gpkg \
 		--force
 
 prepare-usrns-line:
-	usrn-matcher prepare-usrns-line \
+	geo-matcher prepare-usrns-line \
 		--buffer-m 10 \
 		--force \
 		--threads 4
@@ -37,13 +37,13 @@ prepare-usrns-line:
 # ── Prepare UPRNs ─────────────────────────────────────────────────────────────
 
 prepare-uprns:
-	usrn-matcher prepare-uprns \
+	geo-matcher prepare-uprns \
 		--uprn-gpkg input_data/osopenuprn_202608.gpkg \
 		--force \
 		--threads 4
 
 prepare-uprns-buffer:
-	usrn-matcher prepare-uprns-buffer \
+	geo-matcher prepare-uprns-buffer \
 		--buffer-m 10 \
 		--force \
 		--threads 4
@@ -51,33 +51,33 @@ prepare-uprns-buffer:
 # ── Prepare ───────────────────────────────────────────────────────────────────
 
 prepare-soil:
-	usrn-matcher prepare-gpkg \
+	geo-matcher prepare-gpkg \
 		--rhs-name soil \
 		--rhs-row-group-size 100 \
 		--force
 
 prepare-built:
-	usrn-matcher prepare-gpkg \
+	geo-matcher prepare-gpkg \
 		--rhs-name os_open_built_up_areas \
 		--rhs-row-group-size 100 \
 		--force
 
 prepare-stops:
-	usrn-matcher prepare-csv \
+	geo-matcher prepare-csv \
 		--name   stops \
 		--x-col  Easting \
 		--y-col  Northing \
 		--force
 
 prepare-counts:
-	usrn-matcher prepare-csv \
+	geo-matcher prepare-csv \
 		--name   count_points \
 		--x-col  easting \
 		--y-col  northing \
 		--force
 
 prepare-gas-pipe:
-	usrn-matcher prepare-parquet \
+	geo-matcher prepare-parquet \
 		--name         gas_pipe \
 		--parquet      downloads/gas-pipe-infrastructure-gpi_open.parquet \
 		--geometry-col geo_shape \
@@ -86,7 +86,7 @@ prepare-gas-pipe:
 		--force
 
 prepare-ngn-mains:
-	usrn-matcher prepare-gpkg \
+	geo-matcher prepare-gpkg \
 		--rhs-name  ngn_mains \
 		--rhs-gpkg  input_data/ngn_mains.gpkg \
 		--threads   4 \
@@ -97,13 +97,13 @@ prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
 # ── Match — National (no bbox) ────────────────────────────────────────────────
 
 match-soil-national:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name   soil \
 		--mode       polygon \
 		--output     parquet
 
 match-soil-uprn:
-	usrn-matcher match \
+	geo-matcher match \
 		--lhs-name   uprn \
 		--rhs-name   soil \
 		--mode       polygon \
@@ -111,7 +111,7 @@ match-soil-uprn:
 		--output     parquet
 
 match-built-uprn:
-	usrn-matcher match \
+	geo-matcher match \
 		--lhs-name   uprn \
 		--rhs-name   os_open_built_up_areas \
 		--mode       polygon \
@@ -119,14 +119,14 @@ match-built-uprn:
 		--output     parquet
 
 match-stops-national:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
 		--output   parquet
 
 match-stops-london:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
@@ -134,21 +134,21 @@ match-stops-london:
 		--city     LONDON
 
 match-counts-national:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name count_points \
 		--mode     point \
 		--distance 10 \
 		--output   csv
 
 match-soil-leeds:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
 		--output   csv
 
 match-soil-leeds-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
@@ -156,7 +156,7 @@ match-soil-leeds-explain:
 		--explain
 
 match-soil-national-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name soil \
 		--mode     polygon \
 		--output   csv \
@@ -166,7 +166,7 @@ match-soil-national-explain:
 # Kept out of the default targets; use the -explain variants when you want a plan.
 
 match-gas-pipe-sample:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -178,7 +178,7 @@ match-gas-pipe-sample:
 		--output           csv
 
 match-gas-pipe-sample-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -191,7 +191,7 @@ match-gas-pipe-sample-explain:
 		--explain
 
 match-gas-pipe-national:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -202,7 +202,7 @@ match-gas-pipe-national:
 		--output           parquet
 
 match-gas-pipe-national-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -214,7 +214,7 @@ match-gas-pipe-national-explain:
 		--explain
 
 match-ngn-mains-sample:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -226,7 +226,7 @@ match-ngn-mains-sample:
 		--output           csv
 
 match-ngn-mains-sample-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -239,7 +239,7 @@ match-ngn-mains-sample-explain:
 		--explain
 
 match-ngn-mains-national:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -250,7 +250,7 @@ match-ngn-mains-national:
 		--output           parquet
 
 match-ngn-mains-national-explain:
-	usrn-matcher match \
+	geo-matcher match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \

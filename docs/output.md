@@ -1,10 +1,12 @@
 # Output
 
-All match results are attribute-only (no geometry column). Output is a tabular join of USRNs to RHS dataset attributes.
+All match results are attribute-only (no geometry column). 
+
+Output is a tabular join of USRNs (or UPRNs, via `--lhs-name uprn`) to RHS dataset attributes.
 
 ---
 
-## Polygon join
+## Polygon join (`--lhs-name usrn`, default)
 
 One row per USRN–feature intersection:
 
@@ -16,7 +18,26 @@ One row per USRN–feature intersection:
 
 ---
 
-## Point join
+## UPRN polygon join (`--lhs-name uprn`)
+
+One row per UPRN that falls inside an RHS polygon — a plain point-in-polygon
+join, no `street_type`/`distance_m`/phase columns (those are USRN-specific
+concepts with no UPRN equivalent):
+
+| Column | Description |
+|---|---|
+| `uprn` | Unique Property Reference Number |
+| *(RHS columns)* | All selected columns from the RHS dataset |
+
+Cardinality differs from the USRN polygon join too: each UPRN is a single
+point, so it appears at most once per RHS polygon it falls inside (zero rows
+at all if it falls inside none — no explicit "unmatched" row is emitted,
+unlike USRN's phased line join). If the RHS polygons overlap, a UPRN inside
+the overlap gets one row per overlapping polygon.
+
+---
+
+## Point join (`--lhs-name usrn`, default)
 
 One row per USRN–point pair within `--distance`:
 
@@ -29,7 +50,7 @@ One row per USRN–point pair within `--distance`:
 
 ---
 
-## Line join
+## Line join (`--lhs-name usrn`, default)
 
 One row per USRN–line pair:
 
@@ -45,7 +66,7 @@ One row per USRN–line pair:
 
 ---
 
-## Cardinality
+## Cardinality (`--lhs-name usrn`, default)
 
 The join is many-to-many. A USRN can cross many RHS features; an RHS feature can touch many USRNs.
 
@@ -59,3 +80,7 @@ ever apply to features that matched in neither of the first two, so:
 
 - Each `(feature, usrn)` pair appears exactly once.
 - Counting matched features means `COUNT(DISTINCT <rhs id>)`, not summing per-phase counts.
+
+`--lhs-name uprn`'s cardinality is simpler and covered inline in the UPRN
+polygon join section above, not here — no phases, no many-to-many street
+crossings, just one point per matching polygon.
