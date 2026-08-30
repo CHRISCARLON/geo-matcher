@@ -100,11 +100,15 @@ usrn-matcher match --rhs-name gas_pipe --mode line --distance 10 --rhs-id-col as
 
 # Full national join (streaming parquet output)
 usrn-matcher match --rhs-name soil --output parquet
+
+# UPRN polygon join — address points against a polygon dataset
+usrn-matcher match --lhs-name uprn --rhs-name soil --city LEEDS
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--rhs-name` | _(required)_ | Must match name used in prepare |
+| `--lhs-name` | `usrn` | Base dataset to join from: `usrn` (street centrelines) or `uprn` (address points). Not every `--mode` is registered for every `--lhs-name` — currently `uprn` only has `polygon`. |
 | `--mode` | `polygon` | `polygon` (area datasets), `point` (point datasets), or `line` (linestring datasets — two-phase) |
 | `--distance` | `10` | Search radius in metres (`point` / `line` only) |
 | `--rhs-id-col` | none | Required for `--mode line` |

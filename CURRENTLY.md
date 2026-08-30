@@ -1,3 +1,3 @@
 # Current Focus
 
-- Improve join organisation and structure
+- Extending the project to accomodate UPRN joins

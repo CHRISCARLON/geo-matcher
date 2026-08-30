@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pytest
 
-from usrn_matcher import DatasetConfig, GeometryType, UsrnMatcher
+from usrn_matcher import DatasetConfig, GeometryType, LhsKind, UsrnMatcher
 from usrn_matcher.join import (
     FilteredMode,
     JoinFn,
@@ -25,22 +25,48 @@ def matcher(tmp_path) -> UsrnMatcher:
 
 def test_match_dispatch_unknown_mode_raises(matcher):
     """match_dispatch() rejects a mode that isn't a GeometryType."""
-    with pytest.raises(ValueError, match="Unknown join mode") as exc:
+    with pytest.raises(ValueError, match="Unknown join") as exc:
         matcher.match_dispatch(mode="fuzzy")
-    # The error lists the valid modes as plain values, not enum reprs
+    # The error lists the valid (lhs, mode) pairs as plain values, not enum reprs
     assert "'polygon'" in str(exc.value)
     assert "GeometryType" not in str(exc.value)
 
 
-def test_registry_keys_are_geometry_types():
-    """Every registered join is keyed by a GeometryType member."""
+def test_match_dispatch_routes_uprn_polygon(monkeypatch, matcher):
+    """match_dispatch(lhs='uprn', mode='polygon') resolves and calls the registered UPRN join."""
+    captured: dict = {}
+
+    def _fake_uprn_join(sd, usrn_parquet, rhs_config, **kwargs):
+        captured["sd"] = sd
+        captured["usrn_parquet"] = usrn_parquet
+        captured["rhs_config"] = rhs_config
+        return pa.table({})
+
+    monkeypatch.setitem(
+        _registry, (LhsKind.UPRN, GeometryType.POLYGON), _fake_uprn_join
+    )
+    sentinel_sd = object()
+    monkeypatch.setattr(UsrnMatcher, "_connect", lambda self: sentinel_sd)
+
+    matcher.match_dispatch(mode="polygon", lhs="uprn")
+
+    assert captured["sd"] is sentinel_sd
+    assert captured["usrn_parquet"] == matcher._usrn_parquet
+    assert captured["rhs_config"] is matcher._rhs_config
+
+
+def test_registry_keys_are_lhs_geometry_tuples():
+    """Every registered join is keyed by a (LhsKind, GeometryType) tuple."""
     assert _registry
-    assert all(isinstance(key, GeometryType) for key in _registry)
+    assert all(
+        isinstance(lhs, LhsKind) and isinstance(geometry, GeometryType)
+        for lhs, geometry in _registry
+    )
 
 
-def test_get_join_accepts_enum_member_and_string():
-    """A GeometryType member and its string value resolve to the same join."""
-    assert get_join(GeometryType.POINT) is get_join("point")
+def test_get_join_accepts_enum_members_and_strings():
+    """Enum members and their string values resolve to the same join."""
+    assert get_join(LhsKind.USRN, GeometryType.POINT) is get_join("usrn", "point")
 
 
 def test_output_writer_unknown_format_raises(matcher, tmp_path):
@@ -50,11 +76,12 @@ def test_output_writer_unknown_format_raises(matcher, tmp_path):
 
 
 def test_registry_contains_expected_modes():
-    """The join registry exposes the polygon, point and line modes."""
-    assert "polygon" in _registry
-    assert "point" in _registry
-    assert "line" in _registry
-    assert all(isinstance(get_join(k), JoinFn) for k in _registry)
+    """The join registry exposes USRN's polygon, point and line modes, plus UPRN's polygon mode."""
+    assert (LhsKind.USRN, GeometryType.POLYGON) in _registry
+    assert (LhsKind.USRN, GeometryType.POINT) in _registry
+    assert (LhsKind.USRN, GeometryType.LINE) in _registry
+    assert (LhsKind.UPRN, GeometryType.POLYGON) in _registry
+    assert all(isinstance(get_join(*k), JoinFn) for k in _registry)
 
 
 def test_filtered_mode_rejects_oversized_bbox():

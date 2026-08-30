@@ -71,6 +71,18 @@ usrn-matcher match \
   --matched-dir       matched_data
 ```
 
+### UPRN joins (address points)
+
+```bash
+# Polygon join against UPRN address points instead of USRN centrelines
+usrn-matcher match \
+  --lhs-name    uprn \         # join from UPRN address points
+  --rhs-name    my_dataset \   # prepared dataset name
+  --mode        polygon \      # currently the only mode registered for --lhs-name uprn
+  --city        LEEDS \
+  --output      csv
+```
+
 ## Docs
 
 - [Usage — CLI & Python API](docs/usage.md)
