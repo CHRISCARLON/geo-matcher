@@ -7,10 +7,16 @@ name = "geo-matcher"
 version = "0.1.1"
 description = "A library to spatially join USRNs and UPRNs to other spatial datasets"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Chris Carlon", email = "chriscarlon@icloud.com" }]
 keywords = ["usrn", "geospatial", "geoparquet", "sedona", "spatial-join", "british-national-grid", "duckdb"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "apache-sedona[db]==1.8.1",
     "duckdb==1.5.2",

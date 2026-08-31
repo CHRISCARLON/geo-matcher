@@ -7,8 +7,8 @@
 </picture>
 
 [![CI](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml/badge.svg)](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/geo-matcher)](https://pypi.org/project/geo-matcher/)
-[![Python](https://img.shields.io/pypi/pyversions/geo-matcher)](https://pypi.org/project/geo-matcher/)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue.svg)](pyproject.toml)
 [![Licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-green.svg)](LICENSE)
 
 </div>
