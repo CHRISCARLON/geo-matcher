@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-31
+
+### Added
+
+- Readability pass on Phase 4 (connected) USRN matching in `join.py`: clearer
+  names (`_propagate_phase4` → `_phase4_match`, `best` → `best_match`) and
+  added explanatory comments around the neighbour-seeding query and the
+  unmatched-feature lookup.
+- Raised the default national join chunk count from 50 to 80.
+
 ## [0.1.0] - 2026-08-30
 
 ### Added
