@@ -263,7 +263,7 @@ def _normalise_arrow(table: pa.Table) -> pa.Table:
 
 
 def _anti_join_mask(
-    table: pa.Table, id_col: str, exclude_ids: set
+    table: pa.Table, id_col: str, exclude_ids: pa.Array | pa.ChunkedArray
 ) -> pa.Array | pa.ChunkedArray:
     """Boolean mask — True where ``table[id_col]`` is NOT in ``exclude_ids``.
 
@@ -272,18 +272,33 @@ def _anti_join_mask(
     An empty ``exclude_ids`` keeps every row (all-True mask).
     """
     col = table.column(id_col)
-    if not exclude_ids:
+    if len(exclude_ids) == 0:
         return pa.array([True] * len(table), type=pa.bool_())
-    value_set = pa.array(list(exclude_ids), type=col.type)
-    return pc.invert(pc.is_in(col, value_set=value_set))
+    return pc.invert(pc.is_in(col, value_set=exclude_ids))
 
 
-def _distinct_ids(parts: list[pa.Table], id_col: str) -> set:
-    """Distinct ``id_col`` values across a list of result tables."""
-    ids: set = set()
-    for t in parts:
-        ids.update(t.column(id_col).to_pylist())
-    return ids
+def _distinct_ids(parts: list[pa.Table], id_col: str, id_type: pa.DataType) -> pa.Array:
+    """Distinct ``id_col`` values across a list of result tables, as an Arrow array.
+
+    Stays inside Arrow/C++ rather than boxing every id to a Python object — the
+    same reasoning as ``_anti_join_mask``'s docstring, just applied on the way in
+    instead of the way out. *id_type* covers the all-empty case (``parts`` empty,
+    or every part in it empty): there is then no column left to infer the type
+    from, so the caller passes it explicitly — the id column's type on the RHS
+    table these parts were derived from.
+    """
+    chunks = [chunk for t in parts for chunk in t.column(id_col).chunks]
+    return pc.unique(pa.chunked_array(chunks, type=id_type))
+
+
+def _union_ids(*arrays: pa.Array) -> pa.Array:
+    """Distinct union of several already-deduplicated id arrays (``_distinct_ids`` output)."""
+    return pc.unique(pa.concat_arrays(arrays))
+
+
+def _intersect_len(a: pa.Array, b: pa.Array) -> int:
+    """Count of ids common to both (already-deduplicated) id arrays."""
+    return len(a.filter(pc.is_in(a, value_set=b)))
 
 
 def _register_rhs_view(sd: SedonaContext, table: pa.Table, rhs_view: str) -> None:
@@ -589,7 +604,7 @@ def _phase4_match(
     # things from 1,2,3 that have already been matched
     # return the features that haven't been matched yet
     unmatched = features.filter(
-        _anti_join_mask(features, id_col, set(matched_pairs.column(id_col).to_pylist()))
+        _anti_join_mask(features, id_col, pc.unique(matched_pairs.column(id_col)))
     )
     if not len(unmatched):
         return []
@@ -840,6 +855,7 @@ def _national_line_join(
     n_rgs = rhs_pf.metadata.num_row_groups
     chunk_row_groups = _split_into_chunks(n_rgs, n_chunks)
     bbox_idx = _bbox_col_indices(rhs_pf)
+    id_type = rhs_pf.schema_arrow.field(id_col).type
 
     log.info(
         "RHS (%s): %d row groups → %d chunks (four-phase intersect-first); streaming to %s",
@@ -923,10 +939,10 @@ def _national_line_join(
                 phase2_parts.append(phase2_result)
 
             # Phase 3: ST_DWithin nearest USRN for features matched by neither phase
-            p1_ids = _distinct_ids(phase1_parts, id_col)
-            p2_ids = _distinct_ids(phase2_parts, id_col)
+            p1_ids = _distinct_ids(phase1_parts, id_col, id_type)
+            p2_ids = _distinct_ids(phase2_parts, id_col, id_type)
             phase3_features = chunk.filter(
-                _anti_join_mask(chunk, id_col, p1_ids | p2_ids)
+                _anti_join_mask(chunk, id_col, _union_ids(p1_ids, p2_ids))
             )
 
             if len(phase3_features):
@@ -980,15 +996,15 @@ def _national_line_join(
                 writer.write_table(chunk_result)
 
             # Accumulate match-rate figures (each feature lives in exactly one chunk)
-            p3_ids = _distinct_ids(phase3_parts, id_col)
-            p4_ids = _distinct_ids(phase4_parts, id_col)
+            p3_ids = _distinct_ids(phase3_parts, id_col, id_type)
+            p4_ids = _distinct_ids(phase4_parts, id_col, id_type)
             total_features += len(chunk)
             sum_p1 += len(p1_ids)
             sum_p2 += len(p2_ids)
             sum_p3 += len(p3_ids)
             sum_p4 += len(p4_ids)
-            sum_both += len(p1_ids & p2_ids)
-            sum_matched += len(p1_ids | p2_ids | p3_ids | p4_ids)
+            sum_both += _intersect_len(p1_ids, p2_ids)
+            sum_matched += len(_union_ids(p1_ids, p2_ids, p3_ids, p4_ids))
 
             log.info(
                 "  Chunk %d/%d done: %d intersect + %d corridor + %d nearest + %d connected rows",
@@ -1079,6 +1095,7 @@ def _filtered_line_join(
     log.info("RHS features in scope: %d rows (expanded bbox)", len(all_features))
     # The "started with" denominator for the match-rate summary.
     total_features = len(all_features)
+    id_type = all_features.column(id_col).type
     if len(all_features):
         _register_rhs_view(sd, all_features, rhs_view)
 
@@ -1128,10 +1145,10 @@ def _filtered_line_join(
             phase2_parts.append(phase2_result)
 
     # Phase 3 gets whatever neither Phase 1 nor Phase 2 matched
-    p1_ids = _distinct_ids(phase1_parts, id_col)
-    p2_ids = _distinct_ids(phase2_parts, id_col)
+    p1_ids = _distinct_ids(phase1_parts, id_col, id_type)
+    p2_ids = _distinct_ids(phase2_parts, id_col, id_type)
     phase3_features = all_features.filter(
-        _anti_join_mask(all_features, id_col, p1_ids | p2_ids)
+        _anti_join_mask(all_features, id_col, _union_ids(p1_ids, p2_ids))
     )
 
     if len(phase3_features):
@@ -1169,16 +1186,16 @@ def _filtered_line_join(
             sum(len(t) for t in phase4_parts),
         )
 
-    p3_ids = _distinct_ids(phase3_parts, id_col)
-    p4_ids = _distinct_ids(phase4_parts, id_col)
+    p3_ids = _distinct_ids(phase3_parts, id_col, id_type)
+    p4_ids = _distinct_ids(phase4_parts, id_col, id_type)
     _log_line_match_summary(
         total_features,
-        len(p1_ids | p2_ids | p3_ids | p4_ids),
+        len(_union_ids(p1_ids, p2_ids, p3_ids, p4_ids)),
         len(p1_ids),
         len(p2_ids),
         len(p3_ids),
         len(p4_ids),
-        len(p1_ids & p2_ids),
+        _intersect_len(p1_ids, p2_ids),
     )
 
     all_parts = phase1_parts + phase2_parts + phase3_parts + phase4_parts

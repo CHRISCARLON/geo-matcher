@@ -330,7 +330,15 @@ def test_distinct_ids_unions_across_parts():
         pa.table({"asset_id": pa.array(["A", "B", "A"])}),
         pa.table({"asset_id": pa.array(["B", "C"])}),
     ]
-    assert _distinct_ids(parts, "asset_id") == {"A", "B", "C"}
+    result = _distinct_ids(parts, "asset_id", pa.string())
+    assert set(result.to_pylist()) == {"A", "B", "C"}
+
+
+def test_distinct_ids_empty_parts_returns_typed_empty_array():
+    """No parts (or every part empty) still yields a valid, correctly-typed array."""
+    result = _distinct_ids([], "asset_id", pa.string())
+    assert len(result) == 0
+    assert result.type == pa.string()
 
 
 def test_log_line_match_summary_counts_each_feature_once(caplog):

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-31
+
+### Changed
+
+- `join.py`'s four-phase line-join ID bookkeeping (`_distinct_ids` and the
+  matched/unmatched split in `_phase4_match`) moved off Python `set`s onto
+  Arrow arrays throughout, so per-chunk match-phase id tracking stays inside
+  PyArrow's compute layer (`pc.unique`, plus new `_union_ids`/`_intersect_len`
+  helpers) instead of boxing every id to a Python object.
+- Added `assets/geomatcher-mark-light.png` / `-dark.png` logo, shown at the
+  top of the README via a theme-aware `<picture>` element.
+- Added CI (`.github/workflows/ci.yml`): ruff, mypy, and pytest across
+  Python 3.11–3.13 via `uv`.
+- Added README badges (CI, licence, version, Python).
+- Corrected `pyproject.toml`'s `license` field from `MIT` to `Apache-2.0`
+  (the actual `LICENSE` file), and bumped `requires-python` to `>=3.11`.
+- Added `classifiers` (licence + supported Python versions) to `pyproject.toml`.
+
 ## [0.1.1] - 2026-08-31
 
 ### Added
