@@ -6,6 +6,11 @@
   <img alt="GeoMatcher logo" src="assets/geomatcher-mark-light.png" width="120">
 </picture>
 
+[![CI](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml/badge.svg)](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/geo-matcher)](https://pypi.org/project/geo-matcher/)
+[![Python](https://img.shields.io/pypi/pyversions/geo-matcher)](https://pypi.org/project/geo-matcher/)
+[![Licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-green.svg)](LICENSE)
+
 </div>
 
 # GeoMatcher
