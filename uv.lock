@@ -317,7 +317,7 @@ wheels = [
 
 [[package]]
 name = "geo-matcher"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "apache-sedona", extra = ["db"] },

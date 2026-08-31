@@ -1,3 +1,18 @@
+<div align='center'>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/geomatcher-mark-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/geomatcher-mark-light.png">
+  <img alt="GeoMatcher logo" src="assets/geomatcher-mark-light.png" width="120">
+</picture>
+
+[![CI](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml/badge.svg)](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue.svg)](pyproject.toml)
+[![Licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-green.svg)](LICENSE)
+
+</div>
+
 # GeoMatcher
 
 Spatially join Unique Street Reference Numbers (USRNs) & Unique Propert Reference Numbers to geospatial datasets using SedonaDB.
@@ -6,7 +21,7 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 ## What it does
 
-`geo-matcher` focuses on one thing: *spatially matching USRNs & UPRNS to other datasets*
+`geo-matcher` focuses on one thing: *spatially matching USRNs & UPRNS to other datasets*.
 
 All geometries must be in British National Grid (EPSG:27700). 
 
