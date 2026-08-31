@@ -3,7 +3,7 @@ import logging
 import pathlib
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Callable, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
 import duckdb
 import pyarrow as pa
@@ -28,7 +28,7 @@ log: logging.Logger = get_logger()
 
 
 # ---------------------------------------------------------------------------
-# Join mode
+# Join Mode
 # ---------------------------------------------------------------------------
 
 
@@ -67,7 +67,7 @@ class NationalMode:
     n_chunks: int = 80
 
 
-JoinMode = FilteredMode | NationalMode
+JoinMode: TypeAlias = FilteredMode | NationalMode
 
 _DEFAULT_MODE: JoinMode = NationalMode()
 
@@ -307,9 +307,7 @@ def _register_neighbours_view(
 
     Each matched feature contributes its geometry plus the single best USRN it
     resolved to — lowest ``match_phase`` first (an intersection beats a corridor beats
-    a nearest hit), then shortest ``distance_m``. Phase 4 propagates that USRN across
-    physical connections, so seeding it with the feature's strongest match keeps the
-    inherited value as trustworthy as the evidence allows.
+    a nearest hit), then shortest ``distance_m``.
 
     Returns the number of neighbour rows registered (0 if there is nothing to seed from).
     """
@@ -318,8 +316,11 @@ def _register_neighbours_view(
     con = _duck()
     con.register("_feat", features)
     con.register("_matched", matched)
+
+    # Find the best, single USRN match for a
+    # given feature from phase 1,2,3
     neighbours = con.execute(f"""
-        WITH best AS (
+        WITH best_match AS (
             SELECT "{id_col}" AS _id, usrn, street_type,
                 ROW_NUMBER() OVER (
                     PARTITION BY "{id_col}" ORDER BY match_phase, distance_m, usrn
@@ -327,13 +328,18 @@ def _register_neighbours_view(
             FROM _matched
         )
         SELECT f.geometry AS geometry, b.usrn AS usrn, b.street_type AS street_type
-        FROM best AS b
+        FROM best_match AS b
         JOIN _feat AS f ON f."{id_col}" = b._id
         WHERE b._rn = 1
     """).to_arrow_table()
     if not len(neighbours):
         return 0
     sd.create_data_frame(neighbours).to_view("neighbours_raw", overwrite=True)
+
+    # Register a view for phase 4
+    # usrn, street type and the geometry of the matched feautre
+    # TODO: Return the feature's column ID as well
+    # So we can see what features bridges the usrns to the new target feature
     sd.sql(
         "SELECT usrn, street_type,"
         " ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM neighbours_raw"
@@ -547,7 +553,7 @@ def _run_in_batches(
     return parts
 
 
-def _propagate_phase4(
+def _phase4_match(
     sd: SedonaContext,
     features: pa.Table,
     matched_parts: list[pa.Table],
@@ -562,7 +568,7 @@ def _propagate_phase4(
 ) -> list[pa.Table]:
     """Propagate USRNs across physical connections to features Phases 1-3 left unmatched.
 
-    A gas main that never comes within ``phase3_distance`` of a street is usually a spur
+    E.g. a gas main that never comes within ``phase3_distance`` of a street is usually a spur
     of a run that does. Rather than reaching for an ever-more-distant street, this
     inherits the USRN of an already-matched feature it physically touches (within
     *tolerance_m*), which is a claim about network membership rather than proximity.
@@ -573,11 +579,15 @@ def _propagate_phase4(
     if tolerance_m <= 0 or not len(features):
         return []
 
-    matched_parts = [t for t in matched_parts if len(t)]
+    matched_parts = [part for part in matched_parts if len(part)]
     if not matched_parts:
         return []
     matched_pairs = pa.concat_tables(matched_parts)
 
+    # Here we pass in features from phase 4
+    # the id column we are matching against
+    # things from 1,2,3 that have already been matched
+    # return the features that haven't been matched yet
     unmatched = features.filter(
         _anti_join_mask(features, id_col, set(matched_pairs.column(id_col).to_pylist()))
     )
@@ -692,7 +702,7 @@ def _national_single_phase(
     usrn_expand_m: float,
     explain: bool,
     output_path: pathlib.Path,
-    n_chunks: int = 50,  # controlled by NationalMode.n_chunks
+    n_chunks: int = 80,  # controlled by NationalMode.n_chunks
     lhs_view_name: str = "usrns",
 ) -> None:
     """Single-phase NationalMode executor — one LHS file, chunked RHS.
@@ -804,7 +814,7 @@ def _national_line_join(
     explain: bool,
     output_path: pathlib.Path,
     usrn_line_parquet: pathlib.Path,
-    n_chunks: int = 50,
+    n_chunks: int = 80,
     overlap_threshold: float = 0.10,
     phase4_tolerance_m: float = 5.0,
 ) -> None:
@@ -942,12 +952,12 @@ def _national_line_join(
             # Phase 4: inherit a USRN across a physical connection. Confined to this
             # chunk — Hilbert ordering keeps connected features together, so the loss
             # against a global pass is under half a percentage point.
-            phase4_parts = _propagate_phase4(
+            phase4_parts = _phase4_match(
                 sd,
-                chunk,
-                phase1_parts + phase2_parts + phase3_parts,
-                rhs_view,
-                phase4_template,
+                features=chunk,
+                matched_parts=phase1_parts + phase2_parts + phase3_parts,
+                rhs_view=rhs_view,
+                phase4_template=phase4_template,
                 id_col=id_col,
                 tolerance_m=phase4_tolerance_m,
                 expand_m=distance_m,
@@ -1142,7 +1152,7 @@ def _filtered_line_join(
         log.info("Phase 3 (nearest): %d matches", sum(len(t) for t in phase3_parts))
 
     # Phase 4: inherit a USRN across a physical connection to an already-matched feature
-    phase4_parts = _propagate_phase4(
+    phase4_parts = _phase4_match(
         sd,
         all_features,
         phase1_parts + phase2_parts + phase3_parts,

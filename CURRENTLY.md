@@ -1,3 +1,3 @@
 # Current Focus
 
-- Extending the project to accomodate UPRN joins
+## Working on join fucntions and private function readability

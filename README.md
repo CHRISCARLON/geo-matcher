@@ -6,7 +6,7 @@ Built on [Apache Sedona](https://sedona.apache.org/) (Rust-based spatial query e
 
 ## What it does
 
-`geo-matcher` focuses on one thing: *spatially matching USRNs & UPRNS to other datasets*
+`geo-matcher` focuses on one thing: *spatially matching USRNs & UPRNS to other datasets*.
 
 All geometries must be in British National Grid (EPSG:27700). 
 
