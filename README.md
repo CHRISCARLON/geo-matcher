@@ -1,3 +1,13 @@
+<div align='center'>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/geomatcher-mark-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/geomatcher-mark-light.png">
+  <img alt="GeoMatcher logo" src="assets/geomatcher-mark-light.png" width="120">
+</picture>
+
+</div>
+
 # GeoMatcher
 
 Spatially join Unique Street Reference Numbers (USRNs) & Unique Propert Reference Numbers to geospatial datasets using SedonaDB.
