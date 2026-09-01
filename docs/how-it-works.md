@@ -4,33 +4,15 @@
 
 Source files are converted to optimised GeoParquet 1.1 in `output_data/`. Run once.
 
-**DuckDB pipeline** — `ST_Read()` ingests GeoPackage/shapefile sources; `read_csv()` + `ST_Point()` builds point geometries from CSV coordinate columns. DuckDB sorts, computes the bbox struct, and writes the Parquet file in a single `COPY TO PARQUET` statement. A PyArrow post-processing step patches the GeoParquet 1.1 covering metadata into the file footer.
+I'll soon account for GeoParquet 2.0.
 
-**Hilbert sort** — Geometries are sorted by a Hilbert curve key computed from each feature's centroid within the BNG extent (`ST_Hilbert(geom, BOX_2D)`). This clusters spatially adjacent features into consecutive row groups, maximising row-group pruning during joins.
+**Sources** — `st_read()` ingests any GDAL-readable format (GeoPackage, Shapefile, …); `read_csv()` builds geometry from x/y columns for points or a WKT column for lines/polygons; `read_parquet()` re-sorts/re-compresses an existing GeoParquet, reprojecting via `ST_Transform(..., always_xy := true)` only when a foreign `source_crs` is given. For every other source the CRS is *asserted*, not reprojected — the file must already be EPSG:27700.
 
-**bbox covering columns** — A `bbox` struct column (`xmin/ymin/xmax/ymax`) is written to every row. Parquet records min/max statistics for these floats in the file footer at the row-group level. The GeoParquet 1.1 `covering` key in the geo metadata points at these columns so both DuckDB and SedonaDB can skip row groups without reading any geometry bytes.
+**One `COPY`, three jobs** — each source's `SELECT` is wrapped in a single `COPY ... TO PARQUET` statement (geometry materialised once in a subquery so it isn't recomputed): it adds a `bbox` struct (`ST_XMin/YMin/XMax/YMax`), Hilbert-sorts by `ST_Hilbert(geometry, BOX_2D)` within the BNG extent, and writes ZSTD-compressed Parquet. The Hilbert sort clusters spatially adjacent features into consecutive row groups; Parquet then records min/max stats on `bbox` per row group, and the GeoParquet 1.1 `covering` key (patched in by a PyArrow post-processing step — DuckDB itself only writes 1.0.0 metadata) points at those columns so a join can skip whole row groups without reading geometry bytes.
 
-**Fine-grained row groups** — USRNs use `row_group_size=20,000` (89 row groups for 1.76M rows); other datasets default to `10,000`. More row groups means more pruning opportunities.
+**Row group size** — plain USRN/UPRN prep (`prepare-usrns`/`prepare-uprns`) is fixed at 20,000 (89 row groups for USRN's 1.76M rows) and isn't configurable. Every other prepare command exposes `--row-group-size`/`--rhs-row-group-size`: the line/buffer variants default to 20,000, `prepare-gpkg`/`prepare-csv`/`prepare-parquet` to 10,000 — see the `--lhs-name uprn` note further down for when to lower it.
 
-**UPRN prep (`prepare-uprns` / `prepare-uprns-buffer`)** — mirrors USRN's two-file
-plain/buffered split (`UprnSource`, same `buffer_m` mode switch as
-`UsrnSource`), with two differences driven by the source and its scale
-(~41.6M rows vs. USRN's 1.76M):
-
-- The OS Open UPRN GeoPackage ships an uppercase `UPRN` id column; the plain
-  prepare step renames it to lowercase `uprn` to match this pipeline's
-  convention (`usrn`, `street_type`, ...).
-- Only `uprn` + `geometry` are kept in the plain file, and only `uprn` +
-  `geometry`/`geometry_point` in the buffered one — the source's
-  `x_coordinate`/`y_coordinate`/`latitude`/`longitude` columns are dropped
-  everywhere as redundant with `geometry` (same point, two encodings), which
-  meaningfully cuts file size at this row count.
-
-The buffered file replaces `geometry` with `ST_Buffer(point, buffer_m)` — a
-circular catchment polygon per address point — and keeps the original point
-as `geometry_point`, the same relationship `usrns_line_{N}m` has to its
-`geometry_line`. A prepared `uprns_27700.parquet` needs no new join code: it's
-usable as an ordinary RHS point dataset via `--mode point`.
+**UPRN prep** (`prepare-uprns`/`prepare-uprns-buffer`) mirrors USRN's plain/buffered split, with two changes for its scale (~41.6M rows vs. USRN's 1.76M): the source's uppercase `UPRN` column is renamed to lowercase `uprn`, and only `uprn` + `geometry` are kept — `x/y/lat/lon` are dropped as redundant with `geometry`. The buffered file has the same `geometry`/`geometry_point` split USRN's buffered file has for `geometry`/`geometry_line` (`geometry` becomes `ST_Buffer(point, buffer_m)`; the original point survives as `geometry_point`). No new join code needed — `uprns_27700.parquet` is an ordinary RHS point dataset via `--mode point`.
 
 ---
 
@@ -56,19 +38,34 @@ The same rule runs the other way in the line-join Phase 3/Phase 4 batch loops: t
 
 | Lhs | Mode | Architecture | Predicate | Use for |
 |---|---|---|---|---|
-| `usrn` (default) | `polygon` | Single-phase · 1 USRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
-| `usrn` | `point` | Single-phase · 1 USRN file | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
-| `usrn` | `line` | Four-phase · 2 USRN files | Phases 1+2: `ST_Intersects` then corridor, both over every feature; Phase 3: nearest fallback; Phase 4: connectivity inheritance | Linestrings |
-| `uprn` | `polygon` | Single-phase · 1 UPRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
+| `usrn` (default) | `polygon` | Direct spatial join · 1 USRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
+| `usrn` | `point` | Direct spatial join · 1 USRN file | `ST_DWithin(u.geometry, s.geometry, distance_m)` ordered by distance | Points |
+| `usrn` | `line` | USRN line-network match · 2 USRN files | Phases 1+2: `ST_Intersects` then corridor, both over every feature; Phase 3: nearest fallback; Phase 4: connectivity inheritance | Linestrings |
+| `uprn` | `polygon` | Direct spatial join · 1 UPRN file | `ST_Intersects(u.geometry, s.geometry)` | Polygons, areas |
 
 The join registry is keyed by `(lhs, mode)` — `--lhs-name` picks the base dataset to
 join *from* (`usrn` street centrelines by default, or `uprn` address points),
 `--mode` picks the RHS geometry strategy. Not every `(lhs, mode)` combination is
 registered — currently `uprn` only has a `polygon` join — `geo-matcher match`
 raises a clear error listing the registered combinations if you ask for one
-that doesn't exist. The `uprn` polygon join reuses the exact same single-phase
+that doesn't exist. The `uprn` polygon join reuses the exact same direct-spatial-join
 engine (`execute_join`) as the `usrn` polygon join; it just registers the UPRN
 GeoParquet as the `uprns` Sedona view instead of `usrns`.
+
+**All four rows in the table above go through one `execute_join` entry point**,
+which dispatches on two independent axes:
+
+1. **Kind of join** — decided by which keyword arguments the caller passes, not
+   by an explicit flag. `query` + `filter_fn` means a direct spatial join
+   (`polygon`/`point`); `line_phases` means the USRN line-network match. Passing
+   both, or an incomplete pair, raises immediately rather than guessing.
+2. **Mode** — a `FilteredMode`/`NationalMode` match that runs separately inside
+   whichever kind was selected, since each kind calls different executor
+   functions: `_filtered_spatial_join`/`_national_spatial_join` for a direct
+   spatial join, `_filtered_line_join`/`_national_line_join` for the line match.
+
+Four executors, reached by a 2×2 of (kind, mode) — no per-dataset-type
+branching lives outside `execute_join` itself.
 
 **`--lhs-name uprn` needs a finely-row-grouped RHS file.** `_split_into_chunks` can
 only split the RHS at existing row-group boundaries — it can never subdivide a
@@ -89,7 +86,7 @@ with `--lhs-name uprn`, prepare it with a small `--rhs-row-group-size` (or
 high enough to actually spend that row-group count as chunks — see
 `prepare-soil`/`match-soil-uprn` in the `Makefile` for a working example.
 
-**Line join four-phase strategy**
+**USRN line-network match strategy**
 
 Phases 1 and 2 both run over **every** feature in the slice and their results are unioned.
 They answer different questions — "does this line cross a street?" and "does this line run

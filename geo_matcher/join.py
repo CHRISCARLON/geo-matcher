@@ -708,7 +708,7 @@ def _assert_corridor_file_current(
 # ---------------------------------------------------------------------------
 
 
-def _national_single_phase(
+def _national_spatial_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_parquet: pathlib.Path,
@@ -720,11 +720,13 @@ def _national_single_phase(
     n_chunks: int = 80,  # controlled by NationalMode.n_chunks
     lhs_view_name: str = "usrns",
 ) -> None:
-    """Single-phase NationalMode executor — one LHS file, chunked RHS.
+    """Direct spatial-join NationalMode executor — one LHS file, chunked RHS.
 
-    Used by the ``polygon``/``point`` USRN joins and the UPRN polygon join.
-    LHS registered once (as *lhs_view_name*); each RHS chunk's envelope drives
-    LHS row-group pruning. Results streamed incrementally to *output_path*.
+    Used by the ``polygon``/``point`` USRN joins and the UPRN polygon join: each
+    runs a single ST_Intersects/ST_DWithin predicate between LHS and RHS, with no
+    multi-phase matching logic. LHS registered once (as *lhs_view_name*); each RHS
+    chunk's envelope drives LHS row-group pruning. Results streamed incrementally
+    to *output_path*.
     """
     sd.read_parquet(str(usrn_parquet)).to_view(lhs_view_name, overwrite=True)
 
@@ -773,7 +775,7 @@ def _national_single_phase(
             writer.close()
 
 
-def _filtered_single_phase(
+def _filtered_spatial_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_parquet: pathlib.Path,
@@ -784,12 +786,16 @@ def _filtered_single_phase(
     explain: bool,
     lhs_view_name: str = "usrns",
 ) -> pa.Table:
-    """Single-phase FilteredMode executor — one query against a city/custom bbox.
+    """Direct spatial-join FilteredMode executor — one query against a city/custom bbox.
 
     Used by the ``polygon``/``point`` USRN joins and the UPRN polygon join.
-    Mirrors ``_national_single_phase`` structurally: unlike NationalMode there's
+    Mirrors ``_national_spatial_join`` structurally: unlike NationalMode there's
     no chunking, so both parquets are registered as full Sedona views and the
-    query runs once.
+    query runs once. Spatial pruning here isn't a Python-computed row-group
+    envelope (that's NationalMode's job) — it's ``filter_fn(bbox)``'s WHERE-clause
+    fragment (e.g. ``bbox_pruner``), substituted into the query's
+    ``{spatial_filter}`` placeholder, which Sedona's own query planner then pushes
+    down against the registered views.
     """
     sd.read_parquet(str(usrn_parquet)).to_view(lhs_view_name, overwrite=True)
     sd.read_parquet(str(rhs_parquet)).to_view(rhs_view, overwrite=True)
@@ -858,7 +864,7 @@ def _national_line_join(
     id_type = rhs_pf.schema_arrow.field(id_col).type
 
     log.info(
-        "RHS (%s): %d row groups → %d chunks (four-phase intersect-first); streaming to %s",
+        "RHS (%s): %d row groups → %d chunks (USRN line-network match, intersect-first); streaming to %s",
         rhs_view,
         n_rgs,
         len(chunk_row_groups),
@@ -1207,174 +1213,183 @@ def _filtered_line_join(
 # ---------------------------------------------------------------------------
 
 
-# TODO: line joins still have their own dispatch pair (_filtered_line_join /
-# _national_line_join) rather than sharing this dispatcher — unifying single-phase
-# and four-phase dispatch remains a bigger change than the FilteredMode/NationalMode
-# symmetry fix below.
+def _materialise_national(
+    run: Callable[[pathlib.Path], None],
+    output_path: pathlib.Path | None,
+) -> pa.Table:
+    """Run a NationalMode executor and materialise its streamed output as a pa.Table.
+
+    *run* is a closure over one of ``_national_spatial_join``/``_national_line_join``
+    with every mode-specific argument already bound except the destination parquet
+    path, which this function supplies — either *output_path* itself (caller wants
+    a real file; nothing is read back) or a scratch file in a temp dir that is read
+    back into memory once ``run`` returns. Shared by both of ``execute_join``'s
+    NationalMode branches so they don't duplicate the tempfile/stream-readback
+    boilerplate.
+    """
+    if output_path is not None:
+        run(output_path)
+        return pa.table({})
+    with tempfile.TemporaryDirectory() as _tmp:
+        _path = pathlib.Path(_tmp) / "stream.parquet"
+        run(_path)
+        return pq.read_table(str(_path)) if _path.exists() else pa.table({})
+
+
+@dataclass(frozen=True)
+class LineJoinPhases:
+    """Bundles the SQL templates and parameters for matching RHS linestrings against
+    the USRN street network — the line-match counterpart to `query`/`filter_fn`."""
+
+    intersect_template: str
+    phase2_template: str
+    phase3_template: str
+    phase4_template: str
+    id_col: str
+    distance_m: float
+    usrn_line_parquet: pathlib.Path
+    overlap_threshold: float = 0.10
+    phase4_tolerance_m: float = 5.0
+
+
 def execute_join(
     sd: SedonaContext,
     usrn_parquet: pathlib.Path,
     rhs_parquet: pathlib.Path,
     rhs_view: str,
-    query: str,
     mode: JoinMode,
-    filter_fn: Callable[[BBox], str],
+    *,
+    query: str | None = None,
+    filter_fn: Callable[[BBox], str] | None = None,
+    line_phases: LineJoinPhases | None = None,
     usrn_expand_m: float = 0.0,
     explain: bool = False,
     output_path: pathlib.Path | None = None,
     lhs_view_name: str = "usrns",
 ) -> pa.Table:
-    """Single-phase dispatcher for the ``polygon``/``point`` USRN joins and the UPRN
-    polygon join.
+    """Single entry-point dispatcher for every registered join strategy.
 
-    Line joins go through ``execute_line_join`` instead.
+    Dispatches on two independent axes, giving four possible outcomes:
 
-    FilteredMode: delegates to ``_filtered_single_phase`` — one query against the bbox.
+    1. **Kind of join** — chosen by *which keyword arguments the caller passes*,
+       not by an explicit "kind" flag:
 
-    NationalMode: delegates to ``_national_single_phase`` which chunks the RHS and streams
-    results. ``usrn_expand_m`` expands the LHS spatial filter per chunk (= ``distance_m``
-    for point joins so LHS rows just outside the raw chunk envelope remain reachable).
+       - ``query`` + ``filter_fn``: a direct spatial join — the ``polygon``/
+         ``point`` USRN joins and the UPRN polygon join. ``usrn_expand_m``
+         expands the LHS spatial filter per chunk (= ``distance_m`` for the
+         point join, so LHS rows just outside the raw chunk envelope remain
+         reachable).
+       - ``line_phases`` (a ``LineJoinPhases``): matches RHS linestrings against
+         the USRN street network — always two USRN parquets. The corridor file
+         is checked against the USRN file once here before any work starts.
+
+       Passing both, or an incomplete pair (only one of ``query``/``filter_fn``,
+       and no ``line_phases``), raises ``ValueError`` immediately rather than
+       dispatching on a guess.
+
+    2. **Mode** — a ``match mode: case FilteredMode(...) / case NationalMode(...)``
+       that runs separately *inside* each kind above (it isn't shared across
+       kinds, since each kind calls different executors with different argument
+       shapes):
+
+       - direct spatial join → ``_filtered_spatial_join`` (FilteredMode, one query
+         against the bbox) or ``_national_spatial_join`` (NationalMode, chunks the
+         RHS and streams results).
+       - line match → ``_filtered_line_join`` (FilteredMode) or
+         ``_national_line_join`` (NationalMode, chunks and streams).
 
     ``lhs_view_name`` names the Sedona view *usrn_parquet* is registered under —
-    ``"usrns"`` by default (every USRN join), ``"uprns"`` for the UPRN join —
-    the *query* text must reference whichever name it's given.
+    ``"usrns"`` by default (every USRN join, including line joins), ``"uprns"`` for
+    the UPRN join. Line joins always use ``"usrns"`` (hard-coded into the
+    line-match templates), so ``lhs_view_name`` has no effect when ``line_phases``
+    is given.
     """
+    if line_phases is not None:
+        if query is not None or filter_fn is not None:
+            raise ValueError(
+                "execute_join: `line_phases` cannot be combined with `query`/`filter_fn`."
+            )
+        lp = line_phases
+        _assert_corridor_file_current(usrn_parquet, lp.usrn_line_parquet)
+        match mode:
+            case FilteredMode(bbox=bbox):
+                return _filtered_line_join(
+                    sd,
+                    usrn_parquet,
+                    rhs_parquet,
+                    rhs_view,
+                    lp.intersect_template,
+                    lp.phase2_template,
+                    lp.phase3_template,
+                    lp.phase4_template,
+                    lp.id_col,
+                    lp.distance_m,
+                    bbox,
+                    explain,
+                    lp.overlap_threshold,
+                    lp.usrn_line_parquet,
+                    phase4_tolerance_m=lp.phase4_tolerance_m,
+                )
+            case NationalMode(n_chunks=n_chunks):
+                return _materialise_national(
+                    lambda path: _national_line_join(
+                        sd,
+                        usrn_parquet,
+                        rhs_parquet,
+                        rhs_view,
+                        lp.intersect_template,
+                        lp.phase2_template,
+                        lp.phase3_template,
+                        lp.phase4_template,
+                        lp.id_col,
+                        lp.distance_m,
+                        explain,
+                        path,
+                        lp.usrn_line_parquet,
+                        n_chunks=n_chunks,
+                        overlap_threshold=lp.overlap_threshold,
+                        phase4_tolerance_m=lp.phase4_tolerance_m,
+                    ),
+                    output_path,
+                )
+
+    if query is None or filter_fn is None:
+        raise ValueError(
+            "execute_join: a direct spatial join requires both `query` and "
+            "`filter_fn` (pass `line_phases` instead to match against the USRN "
+            "line network)."
+        )
+    q, ff = query, filter_fn
     match mode:
         case FilteredMode(bbox=bbox):
-            return _filtered_single_phase(
+            return _filtered_spatial_join(
                 sd,
                 usrn_parquet,
                 rhs_parquet,
                 rhs_view,
-                query,
+                q,
                 bbox,
-                filter_fn,
+                ff,
                 explain,
                 lhs_view_name=lhs_view_name,
             )
 
         case NationalMode(n_chunks=n_chunks):
-            if output_path is not None:
-                _national_single_phase(
+            return _materialise_national(
+                lambda path: _national_spatial_join(
                     sd,
                     usrn_parquet,
                     rhs_parquet,
                     rhs_view,
-                    query,
+                    q,
                     usrn_expand_m,
                     explain,
-                    output_path,
+                    path,
                     n_chunks=n_chunks,
                     lhs_view_name=lhs_view_name,
-                )
-                return pa.table({})
-            with tempfile.TemporaryDirectory() as _tmp:
-                _path = pathlib.Path(_tmp) / "stream.parquet"
-                _national_single_phase(
-                    sd,
-                    usrn_parquet,
-                    rhs_parquet,
-                    rhs_view,
-                    query,
-                    usrn_expand_m,
-                    explain,
-                    _path,
-                    n_chunks=n_chunks,
-                    lhs_view_name=lhs_view_name,
-                )
-                return pq.read_table(str(_path)) if _path.exists() else pa.table({})
-
-
-def execute_line_join(
-    sd: SedonaContext,
-    usrn_parquet: pathlib.Path,
-    rhs_parquet: pathlib.Path,
-    rhs_view: str,
-    intersect_template: str,
-    phase2_template: str,
-    phase3_template: str,
-    phase4_template: str,
-    id_col: str,
-    distance_m: float,
-    mode: JoinMode,
-    usrn_line_parquet: pathlib.Path,
-    explain: bool = False,
-    output_path: pathlib.Path | None = None,
-    overlap_threshold: float = 0.10,
-    phase4_tolerance_m: float = 5.0,
-) -> pa.Table:
-    """Four-phase dispatcher for ``line`` joins — always uses two USRN parquets.
-
-    FilteredMode: delegates to ``_filtered_line_join``.
-    NationalMode: delegates to ``_national_line_join``.
-
-    Both paths depend on the corridor file matching the USRN file, so that is checked
-    once here before any work starts.
-    """
-    _assert_corridor_file_current(usrn_parquet, usrn_line_parquet)
-
-    match mode:
-        case FilteredMode(bbox=bbox):
-            return _filtered_line_join(
-                sd,
-                usrn_parquet,
-                rhs_parquet,
-                rhs_view,
-                intersect_template,
-                phase2_template,
-                phase3_template,
-                phase4_template,
-                id_col,
-                distance_m,
-                bbox,
-                explain,
-                overlap_threshold,
-                usrn_line_parquet,
-                phase4_tolerance_m=phase4_tolerance_m,
+                ),
+                output_path,
             )
-
-        case NationalMode(n_chunks=n_chunks):
-            if output_path is not None:
-                _national_line_join(
-                    sd,
-                    usrn_parquet,
-                    rhs_parquet,
-                    rhs_view,
-                    intersect_template,
-                    phase2_template,
-                    phase3_template,
-                    phase4_template,
-                    id_col,
-                    distance_m,
-                    explain,
-                    output_path,
-                    usrn_line_parquet,
-                    n_chunks=n_chunks,
-                    overlap_threshold=overlap_threshold,
-                    phase4_tolerance_m=phase4_tolerance_m,
-                )
-                return pa.table({})
-            with tempfile.TemporaryDirectory() as _tmp:
-                _path = pathlib.Path(_tmp) / "stream.parquet"
-                _national_line_join(
-                    sd,
-                    usrn_parquet,
-                    rhs_parquet,
-                    rhs_view,
-                    intersect_template,
-                    phase2_template,
-                    phase3_template,
-                    phase4_template,
-                    id_col,
-                    distance_m,
-                    explain=explain,
-                    output_path=_path,
-                    n_chunks=n_chunks,
-                    overlap_threshold=overlap_threshold,
-                    usrn_line_parquet=usrn_line_parquet,
-                    phase4_tolerance_m=phase4_tolerance_m,
-                )
-                return pq.read_table(str(_path)) if _path.exists() else pa.table({})
 
 
 # ---------------------------------------------------------------------------
@@ -1384,27 +1399,29 @@ def execute_line_join(
 # UPRN strategy so far, three architectures:
 #
 #   (usrn, polygon)  — run_usrn_polygon_join — polygon datasets (e.g. soil, land cover)
-#              Single-phase · 1 USRN file (usrns_27700.parquet)
+#              Direct spatial join (ST_Intersects) · 1 USRN file (usrns_27700.parquet)
 #              ST_Intersects(u.geometry, s.geometry)
 #
 #   (usrn, point)    — run_usrn_point_join — point datasets (e.g. bus stops, traffic counts)
-#              Single-phase · 1 USRN file (usrns_27700.parquet)
+#              Direct spatial join (ST_DWithin) · 1 USRN file (usrns_27700.parquet)
 #              ST_DWithin(u.geometry, s.geometry, distance_m)
 #
 #   (usrn, line)     — run_usrn_line_join — linestring datasets (e.g. gas pipes, cables)
-#              Four-phase · 2 USRN files (usrns_27700.parquet + usrns_line_Nm_27700.parquet)
+#              USRN line-network match · 2 USRN files (usrns_27700.parquet + usrns_line_Nm_27700.parquet)
 #              Phase 1: ST_Intersects against centrelines (all touching pairs kept)
 #              Phase 2: ST_Intersects against pre-buffered corridor polygons, over the
 #                       same full feature set as Phase 1 (overlap-filtered; Phase 1's
 #                       own pairs excluded). Phases 1 and 2 are unioned, not chained.
 #              Phase 3: ST_DWithin nearest USRN for features matched by neither
 #              Phase 4: inherit a USRN from a physically connected matched feature
+#              Routed through the same execute_join entry point as every other
+#              strategy, via the line_phases= parameter (see LineJoinPhases).
 #
 #   (uprn, polygon)  — run_uprn_polygon_join — address points against polygon
 #              datasets (e.g. wards, flood zones)
-#              Single-phase · 1 UPRN file (uprns_27700.parquet)
+#              Direct spatial join (ST_Intersects) · 1 UPRN file (uprns_27700.parquet)
 #              ST_Intersects(u.geometry, s.geometry) — reuses execute_join /
-#              _national_single_phase / _filtered_single_phase exactly as the
+#              _national_spatial_join / _filtered_spatial_join exactly as the
 #              USRN polygon join does, just registering "uprns" instead of
 #              "usrns" as the LHS view (lhs_view_name="uprns").
 # ---------------------------------------------------------------------------
@@ -1421,7 +1438,7 @@ def run_usrn_polygon_join(
     output_path: pathlib.Path | None = None,
     **_kwargs: Any,
 ) -> pa.Table:
-    """Intersect USRNs against a polygon dataset — single-phase, one USRN file."""
+    """Intersect USRNs against a polygon dataset — a direct ST_Intersects join, one USRN file."""
     rhs_view: str = rhs_config.name
 
     match mode:
@@ -1450,8 +1467,8 @@ def run_usrn_polygon_join(
         usrn_parquet,
         rhs_config.parquet_path,
         rhs_view,
-        query,
         mode,
+        query=query,
         filter_fn=bbox_pruner,
         explain=explain,
         output_path=output_path,
@@ -1470,7 +1487,7 @@ def run_uprn_polygon_join(
     output_path: pathlib.Path | None = None,
     **_kwargs: Any,
 ) -> pa.Table:
-    """Intersect UPRN address points against a polygon dataset — single-phase, one UPRN file.
+    """Intersect UPRN address points against a polygon dataset — a direct ST_Intersects join, one UPRN file.
 
     Structurally identical to ``run_usrn_polygon_join`` — same ``execute_join``
     engine, same ``ST_Intersects`` predicate — just registering the LHS view as
@@ -1511,8 +1528,8 @@ def run_uprn_polygon_join(
         usrn_parquet,
         rhs_config.parquet_path,
         rhs_view,
-        query,
         mode,
+        query=query,
         filter_fn=bbox_pruner,
         explain=explain,
         output_path=output_path,
@@ -1533,7 +1550,7 @@ def run_usrn_point_join(
     output_path: pathlib.Path | None = None,
     **_kwargs: Any,
 ) -> pa.Table:
-    """Assign each point to its nearest USRN — single-phase, one USRN file.
+    """Assign each point to its nearest USRN — a direct ST_DWithin join, one USRN file.
 
     ST_DWithin finds all USRNs within ``distance_m`` metres, ordered by distance.
     """
@@ -1571,8 +1588,8 @@ def run_usrn_point_join(
         usrn_parquet,
         rhs_config.parquet_path,
         rhs_view,
-        query,
         mode,
+        query=query,
         filter_fn=lambda bbox: bbox_nearest_filters(bbox, distance_m),
         explain=explain,
         output_path=output_path,
@@ -1597,7 +1614,7 @@ def run_usrn_line_join(
     phase4_tolerance_m: float = 5.0,
     **_kwargs: Any,
 ) -> pa.Table:
-    """Match each linestring in the RHS dataset to USRNs — always four-phase, two USRN files always needed.
+    """Match each linestring in the RHS dataset against the USRN street network — always two USRN files needed.
 
     Phase 1 uses ``usrns_27700.parquet`` (centrelines) with ``ST_Intersects`` —
     touching pairs are definitive matches (``match_phase=1``).
@@ -1638,12 +1655,15 @@ def run_usrn_line_join(
     match mode:
         case FilteredMode(bbox=bbox):
             log.info(
-                "Bbox filter four-phase (USRNs exact, RHS expanded by %.0fm): xmin=%s ymin=%s xmax=%s ymax=%s",
+                "Bbox filter for USRN line-network match (USRNs exact, RHS expanded by %.0fm): "
+                "xmin=%s ymin=%s xmax=%s ymax=%s",
                 distance_m,
                 *bbox,
             )
         case NationalMode():
-            log.info("No bbox supplied — matching all lines (four-phase).")
+            log.info(
+                "No bbox supplied — matching all lines against the USRN line network."
+            )
 
     # These are the non geometry columns from the RHS dataset
     # We build this once for all join phases
@@ -1728,21 +1748,23 @@ def run_usrn_line_join(
             ORDER BY n.usrn, distance_m
         """
 
-    return execute_line_join(
+    return execute_join(
         sd,
         usrn_parquet,
         rhs_config.parquet_path,
         rhs_view,
-        intersect_template=intersect_template,
-        phase2_template=phase2_template,
-        phase3_template=phase3_template,
-        phase4_template=phase4_template,
-        id_col=rhs_id_col,
-        distance_m=distance_m,
-        mode=mode,
-        usrn_line_parquet=usrn_line_parquet,
+        mode,
+        line_phases=LineJoinPhases(
+            intersect_template=intersect_template,
+            phase2_template=phase2_template,
+            phase3_template=phase3_template,
+            phase4_template=phase4_template,
+            id_col=rhs_id_col,
+            distance_m=distance_m,
+            usrn_line_parquet=usrn_line_parquet,
+            overlap_threshold=overlap_threshold,
+            phase4_tolerance_m=phase4_tolerance_m,
+        ),
         explain=explain,
         output_path=output_path,
-        overlap_threshold=overlap_threshold,
-        phase4_tolerance_m=phase4_tolerance_m,
     )

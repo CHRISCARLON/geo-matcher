@@ -80,8 +80,6 @@ class GeoMatcher:
         assert self._sd is not None
         return self._sd
 
-    # TODO: rename the mode var to rhs_geom_type
-    # TODO: rename analysis mode to join mode
     def match_dispatch(
         self,
         mode: GeometryType | str,
