@@ -7,7 +7,7 @@
 </picture>
 
 [![CI](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml/badge.svg)](https://github.com/CHRISCARLON/geo-matcher/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue.svg)](pyproject.toml)
 [![Licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-green.svg)](LICENSE)
 
@@ -35,7 +35,7 @@ cd geo-matcher
 uv sync
 ```
 
-## Quick start
+## Quick CLI Start Guide
 
 ```bash
 # 1. Create project directories
@@ -102,3 +102,4 @@ geo-matcher match \
 - [Output formats & cardinality](docs/output.md)
 - [How it works](docs/how-it-works.md)
 - [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)

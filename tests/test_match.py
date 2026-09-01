@@ -11,6 +11,8 @@ from geo_matcher.join import (
     get_join,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture()
 def matcher(tmp_path) -> GeoMatcher:

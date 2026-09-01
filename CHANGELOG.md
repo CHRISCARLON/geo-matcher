@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-01
+
+### Changed
+
+- `join.py`'s two join dispatchers merged into one: `execute_join` now handles
+  every registered strategy (polygon/point USRN joins, the UPRN polygon join,
+  and the USRN line-network match), dispatching on which keyword arguments are
+  passed (`query`+`filter_fn` vs. `line_phases`) and then on `JoinMode`
+  (`FilteredMode`/`NationalMode`) inside each. `execute_line_join` is gone from
+  the public API; `LineJoinPhases` (a new frozen dataclass bundling the line
+  match's SQL templates and parameters) is exported in its place.
+- Renamed `_national_single_phase`/`_filtered_single_phase` to
+  `_national_spatial_join`/`_filtered_spatial_join` — the old names described
+  step count, not intent; these run one direct `ST_Intersects`/`ST_DWithin`
+  predicate between LHS and RHS. Docstrings, comments, and log messages across
+  `join.py` and `docs/how-it-works.md` reworded to lead with what each join
+  does rather than its phase count.
+- Extracted `_materialise_national` — the "stream to `output_path` if given,
+  else stream to a scratch tempfile and read it back" logic that both
+  `NationalMode` branches previously duplicated.
+
 ## [0.1.2] - 2026-08-31
 
 ### Changed

@@ -1,4 +1,4 @@
 # Current Focus
 
-## Working towards release on pypi
-## Documenation site
+- Working towards release on pypi
+- Documenation site

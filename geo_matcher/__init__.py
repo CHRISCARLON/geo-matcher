@@ -16,9 +16,9 @@ from .join import (
     FilteredMode,
     JoinFn,
     JoinMode,
+    LineJoinPhases,
     NationalMode,
     execute_join,
-    execute_line_join,
     get_join,
 )
 from .matcher import GeoMatcher
@@ -38,10 +38,10 @@ __all__ = [
     "UsrnSource",
     "FilteredMode",
     "JoinMode",
+    "LineJoinPhases",
     "NationalMode",
     "JoinFn",
     "execute_join",
-    "execute_line_join",
     "get_join",
     "bboxes",
 ]

@@ -14,6 +14,7 @@ from geo_matcher.join import (
     _assert_corridor_file_current,
     _distinct_ids,
     _log_line_match_summary,
+    _materialise_national,
     _nearest_dedup,
     _phase2_select_corridors,
     _registry,
@@ -67,6 +68,7 @@ def test_register_accepts_string_value_and_normalises_key():
 def test_bbox_pruner_produces_where_clause():
     """bbox_pruner builds an ST_Intersects clause for both sides."""
     clause = bbox_pruner([100.0, 200.0, 300.0, 400.0])
+    print(clause)
     assert "ST_Intersects(u.geometry" in clause
     assert "ST_Intersects(s.geometry" in clause
     assert "100.0" in clause
@@ -81,9 +83,11 @@ def test_bbox_pruner_produces_where_clause():
 def test_col_fragment_explicit_columns():
     """Explicit columns are emitted as quoted, s-prefixed fields."""
     cfg: DatasetConfig = DatasetConfig(
-        name="soil", source_path="x.gpkg", columns=["MUSID", "MAP_SYMBOL"]
+        name="soil",
+        source_path="x.gpkg",
+        columns=["MUSID", "MAP_SYMBOL", "DESCRIPTION"],
     )
-    assert col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL"'
+    assert col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL", s."DESCRIPTION"'
 
 
 def test_col_fragment_explicit_columns_with_spaces():
@@ -401,13 +405,56 @@ def test_corridor_guard_message_is_actionable(tmp_path: pathlib.Path):
 
 
 # ---------------------------------------------------------------------------
-# Golden query templates — run_usrn_polygon_join / run_usrn_line_join / run_uprn_polygon_join
+# _materialise_national — shared NationalMode stream/tempfile-readback helper
+# ---------------------------------------------------------------------------
+
+
+def test_materialise_national_writes_directly_to_output_path(tmp_path: pathlib.Path):
+    """When output_path is given, run() is handed it directly and nothing is read back."""
+    output_path = tmp_path / "matches.parquet"
+    seen: list[pathlib.Path] = []
+
+    def run(path: pathlib.Path) -> None:
+        seen.append(path)
+
+    result = _materialise_national(run, output_path)
+
+    assert seen == [output_path]
+    assert result == pa.table({})
+
+
+def test_materialise_national_reads_back_from_tempfile_when_no_output_path():
+    """With no output_path, run() streams to a scratch file that's read back into a Table."""
+
+    def run(path: pathlib.Path) -> None:
+        pq.write_table(pa.table({"id": [1, 2, 3]}), str(path))
+
+    result = _materialise_national(run, None)
+
+    assert result.column("id").to_pylist() == [1, 2, 3]
+
+
+def test_materialise_national_returns_empty_table_when_run_writes_nothing():
+    """A run() that finds no matches (e.g. every chunk empty) leaves no file to read back."""
+
+    def run(path: pathlib.Path) -> None:
+        pass
+
+    result = _materialise_national(run, None)
+
+    assert result == pa.table({})
+
+
+# ---------------------------------------------------------------------------
+# Query-text tests — run_usrn_polygon_join / run_usrn_line_join / run_uprn_polygon_join
 #
-# These intercept the dispatcher call (execute_join / execute_line_join) via
-# monkeypatch, so the query text a real run would generate is captured without
-# needing a live SedonaContext. Whitespace is normalised before comparison —
-# indentation is incidental, but keyword/clause order and content are not — so a
-# future edit to these templates can't silently change the generated SQL unnoticed.
+# These intercept the merged dispatcher call (execute_join) via monkeypatch, so the
+# query text a real run would generate is captured without needing a live
+# SedonaContext. Whitespace is normalised before comparison — indentation is
+# incidental, but keyword/clause order and content are not — so a future edit to
+# these templates can't silently change the generated SQL unnoticed. This checks
+# only the text these functions build, not that SedonaDB accepts or executes it
+# correctly — see test_integration.py for that.
 # ---------------------------------------------------------------------------
 
 
@@ -415,12 +462,12 @@ def _normalise_sql(s: str) -> str:
     return " ".join(s.split())
 
 
-def test_run_usrn_polygon_join_query_golden(monkeypatch):
+def test_run_usrn_polygon_join_builds_expected_query(monkeypatch):
     """The exact (whitespace-normalised) SQL text run_usrn_polygon_join hands to execute_join."""
     captured: dict = {}
 
-    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, query, mode, **kw):
-        captured["query"] = query
+    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, mode, **kw):
+        captured["query"] = kw.pop("query")
         captured["kwargs"] = kw
         return pa.table({})
 
@@ -452,16 +499,16 @@ def test_run_usrn_polygon_join_query_golden(monkeypatch):
     assert captured["kwargs"].get("lhs_view_name", "usrns") == "usrns"
 
 
-def test_run_uprn_polygon_join_query_golden(monkeypatch):
+def test_run_uprn_polygon_join_builds_expected_query(monkeypatch):
     """The exact (whitespace-normalised) SQL text run_uprn_polygon_join hands to execute_join.
 
-    Structurally identical to the USRN polygon join's golden test — same
+    Structurally identical to the USRN polygon join's query-text test — same
     execute_join engine, different LHS view/columns.
     """
     captured: dict = {}
 
-    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, query, mode, **kw):
-        captured["query"] = query
+    def _fake_execute_join(sd, usrn_parquet, rhs_parquet, rhs_view, mode, **kw):
+        captured["query"] = kw.pop("query")
         captured["kwargs"] = kw
         return pa.table({})
 
@@ -491,7 +538,7 @@ def test_run_uprn_polygon_join_query_golden(monkeypatch):
     assert captured["kwargs"]["lhs_view_name"] == "uprns"
 
 
-def test_run_usrn_line_join_phase1_template_golden(monkeypatch):
+def test_run_usrn_line_join_builds_expected_phase1_template(monkeypatch):
     """The exact (whitespace-normalised) Phase 1 template run_usrn_line_join builds.
 
     Placeholders survive unfilled here — .format() only happens later, inside
@@ -499,11 +546,11 @@ def test_run_usrn_line_join_phase1_template_golden(monkeypatch):
     """
     captured: dict = {}
 
-    def _fake_execute_line_join(*args, **kwargs):
-        captured["intersect_template"] = kwargs["intersect_template"]
+    def _fake_execute_join(*args, **kwargs):
+        captured["intersect_template"] = kwargs["line_phases"].intersect_template
         return pa.table({})
 
-    monkeypatch.setattr(join_module, "execute_line_join", _fake_execute_line_join)
+    monkeypatch.setattr(join_module, "execute_join", _fake_execute_join)
 
     cfg = DatasetConfig(
         name="gas_pipe",

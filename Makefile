@@ -7,7 +7,7 @@
 	prepare-uprns prepare-uprns-buffer \
 	prepare-soil prepare-stops prepare-counts prepare-built prepare-gas-pipe prepare-ngn-mains prepare-all \
 	match-soil-national match-soil-national-explain \
-	match-soil-uprn match-built-uprn \
+	match-soil-uprn match-soil-uprn-leeds match-built-uprn \
 	match-soil-leeds match-soil-leeds-explain \
 	match-stops-national match-counts-national match-all-national \
 	match-gas-pipe-sample match-gas-pipe-sample-explain \
@@ -108,6 +108,14 @@ match-soil-uprn:
 		--rhs-name   soil \
 		--mode       polygon \
 		--batches    200 \
+		--output     parquet
+
+match-soil-uprn-leeds:
+	geo-matcher match \
+		--lhs-name   uprn \
+		--rhs-name   soil \
+		--mode       polygon \
+		--city       LEEDS \
 		--output     parquet
 
 match-built-uprn:
