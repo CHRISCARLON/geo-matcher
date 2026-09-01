@@ -83,9 +83,11 @@ def test_bbox_pruner_produces_where_clause():
 def test_col_fragment_explicit_columns():
     """Explicit columns are emitted as quoted, s-prefixed fields."""
     cfg: DatasetConfig = DatasetConfig(
-        name="soil", source_path="x.gpkg", columns=["MUSID", "MAP_SYMBOL"]
+        name="soil",
+        source_path="x.gpkg",
+        columns=["MUSID", "MAP_SYMBOL", "DESCRIPTION"],
     )
-    assert col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL"'
+    assert col_fragment(cfg) == ', s."MUSID", s."MAP_SYMBOL", s."DESCRIPTION"'
 
 
 def test_col_fragment_explicit_columns_with_spaces():
@@ -444,13 +446,15 @@ def test_materialise_national_returns_empty_table_when_run_writes_nothing():
 
 
 # ---------------------------------------------------------------------------
-# Golden query templates — run_usrn_polygon_join / run_usrn_line_join / run_uprn_polygon_join
+# Query-text tests — run_usrn_polygon_join / run_usrn_line_join / run_uprn_polygon_join
 #
-# These intercept the merged dispatcher call (execute_join) via
-# monkeypatch, so the query text a real run would generate is captured without
-# needing a live SedonaContext. Whitespace is normalised before comparison —
-# indentation is incidental, but keyword/clause order and content are not — so a
-# future edit to these templates can't silently change the generated SQL unnoticed.
+# These intercept the merged dispatcher call (execute_join) via monkeypatch, so the
+# query text a real run would generate is captured without needing a live
+# SedonaContext. Whitespace is normalised before comparison — indentation is
+# incidental, but keyword/clause order and content are not — so a future edit to
+# these templates can't silently change the generated SQL unnoticed. This checks
+# only the text these functions build, not that SedonaDB accepts or executes it
+# correctly — see test_integration.py for that.
 # ---------------------------------------------------------------------------
 
 
@@ -458,7 +462,7 @@ def _normalise_sql(s: str) -> str:
     return " ".join(s.split())
 
 
-def test_run_usrn_polygon_join_query_golden(monkeypatch):
+def test_run_usrn_polygon_join_builds_expected_query(monkeypatch):
     """The exact (whitespace-normalised) SQL text run_usrn_polygon_join hands to execute_join."""
     captured: dict = {}
 
@@ -495,10 +499,10 @@ def test_run_usrn_polygon_join_query_golden(monkeypatch):
     assert captured["kwargs"].get("lhs_view_name", "usrns") == "usrns"
 
 
-def test_run_uprn_polygon_join_query_golden(monkeypatch):
+def test_run_uprn_polygon_join_builds_expected_query(monkeypatch):
     """The exact (whitespace-normalised) SQL text run_uprn_polygon_join hands to execute_join.
 
-    Structurally identical to the USRN polygon join's golden test — same
+    Structurally identical to the USRN polygon join's query-text test — same
     execute_join engine, different LHS view/columns.
     """
     captured: dict = {}
@@ -534,7 +538,7 @@ def test_run_uprn_polygon_join_query_golden(monkeypatch):
     assert captured["kwargs"]["lhs_view_name"] == "uprns"
 
 
-def test_run_usrn_line_join_phase1_template_golden(monkeypatch):
+def test_run_usrn_line_join_builds_expected_phase1_template(monkeypatch):
     """The exact (whitespace-normalised) Phase 1 template run_usrn_line_join builds.
 
     Placeholders survive unfilled here — .format() only happens later, inside
