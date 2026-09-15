@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, ClassVar
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
-import sedona.db
 
 from . import bboxes as _bboxes
 from .config import (
@@ -74,6 +73,12 @@ class GeoMatcher:
 
     def _connect(self) -> "SedonaContext":
         if self._sd is None:
+            # Imported here, not at module scope: `import sedona.db` loads
+            # sedonadb's native library, and geo_matcher is imported by callers
+            # that only ever call prepare(). Those paths drive GDAL hard, and the
+            # fewer native geo stacks resident in the process, the better.
+            import sedona.db
+
             sd: SedonaContext = sedona.db.connect()
             configure_sedona_session(sd, target_partitions=self._threads or 4)
             self._sd = sd

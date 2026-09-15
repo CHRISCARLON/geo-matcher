@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-15
+
+### Fixed
+
+- `prepare()` on a large OGR source (GeoPackage, shapefile) no longer drives
+  GDAL from inside the Hilbert-sort query. `_prepare_ogr` now stages the
+  `st_read` to a plain Parquet file first — a straight scan, no sort, no join,
+  geometry crossing as WKB — and the sort then runs from that staged file
+  before it is deleted. GDAL's GeoPackage driver sits on SQLite and is not
+  reliably thread-safe, and reading it from within a large parallel sort
+  segfaulted the process (exit 139) on national datasets such as the
+  1.77M-feature OS Open USRN GeoPackage on a CI runner. Output is unchanged:
+  same rows, same columns, same geometry, and the `bbox` covering column still
+  survives for row-group pruning.
+- `prepare()` no longer leaks its DuckDB database. Every `_prepare_*` function
+  opened a connection via `duckdb.connect()` and never closed it, so a process
+  calling `prepare()` several times accumulated one live in-memory instance per
+  call for its whole lifetime. All of them now go through a new `_connection()`
+  context manager that closes on the way out, including on failure. This
+  matters more than it looks: each `duckdb.connect()` is an *independent*
+  instance that defaults `memory_limit` to ~80% of system RAM, so several live
+  instances each believed they could use most of the machine.
+
+### Added
+
+- `prepare(..., memory_limit=...)` — an optional DuckDB `memory_limit` for the
+  call, e.g. `"3GB"`, threaded through every `_prepare_*` function. There was
+  previously no way for a caller to bound DuckDB's memory at all; on a
+  memory-constrained runner the default (~80% of RAM, per instance) is too
+  generous.
+- `pyproj` declared as an explicit dependency. `prepare.py` imports it directly
+  to write CRS PROJJSON into the GeoParquet metadata, but it was only arriving
+  transitively via `apache-sedona` → `geopandas`, so a change in that chain
+  would have broken `prepare()` at import.
+
+### Changed
+
+- `sedonadb` is no longer imported when `geo_matcher` is imported. `import
+  sedona.db` moved from `matcher.py`'s module scope into `GeoMatcher._connect()`,
+  and the annotation-only `SedonaContext` imports in `join.py` and `explain.py`
+  moved under `TYPE_CHECKING` (both modules gained
+  `from __future__ import annotations`). Callers that only ever call `prepare()`
+  no longer pay to load Sedona's native library, which keeps one fewer native
+  geo stack resident while GDAL is being driven hard.
+- `pyogrio` is no longer used. `_prepare_ogr` read layer metadata (CRS, feature
+  count, geometry type) via `pyogrio.read_info()`, which opened the source
+  through a *second* bundled GDAL alongside duckdb-spatial's. That is now a
+  `st_read_meta()` query on the connection already in hand, via the new
+  `_read_ogr_info()`, keeping the prepare path on a single GDAL. `pyogrio` was
+  also an undeclared dependency.
+
 ## [0.1.3] - 2026-09-01
 
 ### Changed

@@ -636,3 +636,128 @@ def test_prepare_csv_polygon_multipolygon_roundtrips(tiny_polygon_csv, tmp_path)
     prepare(cfg)
     gdf = gpd.read_parquet(out)
     assert set(gdf.geometry.geom_type) == {"Polygon", "MultiPolygon"}
+
+
+# ---------------------------------------------------------------------------
+# Connection lifecycle, memory limit, and OGR staging
+#
+# These cover the fix for the exit-139 (SIGSEGV) crashes seen preparing large
+# national GeoPackages on CI runners.
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_leaves_no_open_duckdb_connection(tiny_gpkg, tmp_path):
+    """prepare() must not leak its in-memory DuckDB database.
+
+    Each duckdb.connect() is an independent instance with its own memory budget
+    (~80% of RAM by default), so a process calling prepare() several times used to
+    accumulate one live instance per call.
+    """
+    import gc
+
+    import duckdb
+
+    before = sum(
+        1 for o in gc.get_objects() if isinstance(o, duckdb.DuckDBPyConnection)
+    )
+
+    cfg = DatasetConfig(
+        name="t",
+        source=OgrSource(path=tiny_gpkg),
+        parquet_path=tmp_path / "t.parquet",
+    )
+    prepare(cfg, force=True)
+
+    gc.collect()
+    after = sum(1 for o in gc.get_objects() if isinstance(o, duckdb.DuckDBPyConnection))
+    assert after == before
+
+
+def test_memory_limit_is_applied_to_the_connection(monkeypatch):
+    """A caller-supplied memory_limit reaches the DuckDB session."""
+    capped = prepare_module._open_connection(threads=1, memory_limit="512MB")
+    uncapped = prepare_module._open_connection(threads=1)
+    try:
+        # DuckDB restates the limit in MiB ("488.2 MiB" for 512MB), so compare the
+        # capped session against the default rather than matching on the string.
+        got = capped.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        default = uncapped.execute("SELECT current_setting('memory_limit')").fetchone()[
+            0
+        ]
+
+        assert "MiB" in got
+        assert float(got.split()[0]) < 600  # ~488 MiB
+        assert got != default
+    finally:
+        capped.close()
+        uncapped.close()
+
+
+def test_connection_context_manager_closes_on_error():
+    """_connection() closes even when the body raises."""
+    import duckdb
+
+    captured = {}
+    with pytest.raises(RuntimeError):
+        with prepare_module._connection(threads=1) as con:
+            captured["con"] = con
+            raise RuntimeError("boom")
+
+    with pytest.raises(duckdb.ConnectionException):
+        captured["con"].execute("SELECT 1")
+
+
+def test_ogr_staging_file_is_cleaned_up(tiny_gpkg, tmp_path):
+    """The intermediate staging parquet must not survive a successful prepare."""
+    out = tmp_path / "staged_out.parquet"
+    cfg = DatasetConfig(name="t", source=OgrSource(path=tiny_gpkg), parquet_path=out)
+    prepare(cfg, force=True)
+
+    assert out.exists()
+    assert not (out.parent / f"{out.stem}.staging.parquet").exists()
+    assert list(tmp_path.glob("*.staging.parquet")) == []
+
+
+def test_ogr_staging_preserves_rows_columns_and_geometry(tiny_gdf, tiny_gpkg, tmp_path):
+    """Routing the OGR read through a staging parquet must not change the output.
+
+    Geometry crosses the staging file as WKB, so this asserts the round trip is
+    lossless for both the attribute columns and the coordinates.
+    """
+    out = tmp_path / "t.parquet"
+    cfg = DatasetConfig(name="t", source=OgrSource(path=tiny_gpkg), parquet_path=out)
+    prepare(cfg, force=True)
+
+    got = gpd.read_parquet(out)
+
+    assert len(got) == len(tiny_gdf)
+    assert {"val", "category", "geometry"} <= set(got.columns)
+    assert sorted(got["val"].tolist()) == sorted(tiny_gdf["val"].tolist())
+
+    # geopandas consumes the bbox covering column on read, so assert it on the
+    # parquet schema instead — row-group pruning depends on it surviving staging.
+    assert "bbox" in pq.read_schema(out).names
+
+    # same geometries, regardless of the Hilbert ordering
+    expected_area = sorted(round(g.area, 6) for g in tiny_gdf.geometry)
+    actual_area = sorted(round(g.area, 6) for g in got.geometry)
+    assert actual_area == expected_area
+
+
+def test_importing_geo_matcher_does_not_load_native_geo_stacks():
+    """geo_matcher must be importable without pulling in sedonadb or pyogrio.
+
+    Those load their own GDAL/native libraries. The prepare path drives DuckDB's
+    GDAL hard, and co-resident native geo stacks are the suspected cause of the
+    SIGSEGV; callers that only prepare() should not pay for the matcher's deps.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, geo_matcher; "
+        "assert 'sedona.db' not in sys.modules, 'sedona.db imported'; "
+        "assert not any(m.startswith('sedonadb') for m in sys.modules), 'sedonadb imported'; "
+        "assert 'pyogrio' not in sys.modules, 'pyogrio imported'"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

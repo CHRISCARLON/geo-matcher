@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import json
 import re
 import sys
-from typing import Any
-
-from sedonadb.context import SedonaContext
+from typing import TYPE_CHECKING, Any
 
 from .logger import get_logger
+
+if TYPE_CHECKING:
+    from sedonadb.context import SedonaContext
 
 log = get_logger()
 

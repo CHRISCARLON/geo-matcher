@@ -1,13 +1,14 @@
+import contextlib
 import json
 import logging
 import pathlib
 import time
+from collections.abc import Generator
 from typing import Any, TypedDict
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyogrio
 from pyproj import CRS as ProjCRS
 
 from .config import (
@@ -174,13 +175,78 @@ def _should_skip(parquet_path: pathlib.Path, force: bool) -> bool:
     return False
 
 
-def _open_connection(threads: int | None = None) -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection with the spatial extension loaded."""
+def _open_connection(
+    threads: int | None = None, memory_limit: str | None = None
+) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with the spatial extension loaded.
+
+    ``duckdb.connect()`` with no path creates a *new, independent* in-memory
+    database each time, and DuckDB defaults ``memory_limit`` to ~80% of system RAM
+    **per instance**. Several live instances therefore each believe they may use
+    most of the machine. ``memory_limit`` lets the caller bound that; prefer
+    ``_connection()`` below so the instance is also released promptly.
+    """
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     if threads is not None:
         con.execute(f"SET threads = {threads};")
+    if memory_limit is not None:
+        con.execute(f"SET memory_limit = '{_sql_str(memory_limit)}';")
     return con
+
+
+@contextlib.contextmanager
+def _connection(
+    threads: int | None = None, memory_limit: str | None = None
+) -> Generator[duckdb.DuckDBPyConnection, None, None]:
+    """Open a configured DuckDB connection and always close it.
+
+    Without this, a process calling prepare() several times accumulates one live
+    in-memory DuckDB database per call for its whole lifetime, each holding its
+    own buffers and its own memory budget.
+    """
+    con = _open_connection(threads, memory_limit)
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+class _OgrInfo(TypedDict):
+    crs: str | None
+    feature_count: int
+    geometry_type: str
+
+
+def _read_ogr_info(con: duckdb.DuckDBPyConnection, source_path: str) -> _OgrInfo:
+    """Read layer metadata for an OGR source using DuckDB's own GDAL.
+
+    Deliberately not ``pyogrio.read_info``: pyogrio bundles its own GDAL build, so
+    using it here would open the same file through a *second* GDAL in the same
+    process, on top of duckdb-spatial's. Reading metadata through ``st_read_meta``
+    keeps the prepare path on one GDAL.
+    """
+    rows = con.execute(f"""
+        SELECT
+            l.feature_count,
+            g.type,
+            g.crs.auth_name,
+            g.crs.auth_code
+        FROM st_read_meta('{_sql_str(source_path)}'),
+             UNNEST(layers) AS _(l),
+             UNNEST(l.geometry_fields) AS __(g)
+        LIMIT 1
+    """).fetchall()
+    if not rows:
+        raise ValueError(f"No layers with geometry found in {source_path!r}")
+
+    feature_count, geometry_type, auth_name, auth_code = rows[0]
+    crs = f"{auth_name}:{auth_code}" if auth_name and auth_code else None
+    return {
+        "crs": crs,
+        "feature_count": feature_count if feature_count is not None else -1,
+        "geometry_type": geometry_type or "unknown",
+    }
 
 
 def _bbox_struct_sql(geom_col: str = "geometry") -> str:
@@ -249,41 +315,75 @@ def _prepare_ogr(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
+    """Prepare an OGR-readable source (GeoPackage, Shapefile, ...) as GeoParquet.
+
+    The OGR read is staged to a plain Parquet file first, and the Hilbert sort then
+    runs from that staged file rather than directly over ``st_read``. GDAL's
+    GeoPackage driver sits on SQLite and is not reliably thread-safe; driving it
+    from inside a large parallel sorting query segfaults the process (exit 139 on
+    a CI runner) on big national datasets. Staging keeps the GDAL read in the
+    simplest possible statement — a straight scan, no sort, no join — and leaves
+    the expensive part entirely in DuckDB's own formats.
+
+    Geometry crosses to the staging file as WKB and is rebuilt afterwards, which
+    is lossless for coordinates; the CRS is restated on the final write.
+    """
     if _should_skip(parquet_path, force):
         return parquet_path
 
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Preparing %s from %s", name, source.path)
 
-    info = pyogrio.read_info(str(source.path))
-    if info["crs"] != source.crs:
-        raise ValueError(
-            f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
+    staged_path = parquet_path.with_name(f"{parquet_path.stem}.staging.parquet")
+
+    with _connection(threads, memory_limit) as con:
+        info = _read_ogr_info(con, str(source.path))
+        if info["crs"] != source.crs:
+            raise ValueError(
+                f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
+            )
+        feature_count = info["feature_count"]
+        log.info(
+            "  CRS: %s | features: %s | geometry: %s",
+            info["crs"],
+            f"{feature_count:,}" if feature_count >= 0 else "unknown",
+            info["geometry_type"],
         )
-    feature_count: int = info.get("features", -1)
-    log.info(
-        "  CRS: %s | features: %s | geometry: %s",
-        info["crs"],
-        f"{feature_count:,}" if feature_count >= 0 else "unknown",
-        info.get("geometry_type", "unknown"),
-    )
 
-    con = _open_connection(threads)
+        src_geom: str = _get_src_geometry_col(con, str(source.path))
+        log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
 
-    src_geom: str = _get_src_geometry_col(con, str(source.path))
-    log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
+        try:
+            log.info("  Staging OGR source → %s ...", staged_path)
+            con.execute(f"""
+                COPY (
+                    SELECT
+                        * EXCLUDE "{src_geom}",
+                        ST_AsWKB("{src_geom}") AS _geom_wkb
+                    FROM st_read('{_sql_str(source.path)}')
+                ) TO '{_sql_str(staged_path)}'
+                (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
 
-    core_select_sql = f"""
-        SELECT
-            * EXCLUDE "{src_geom}",
-            "{src_geom}" AS geometry
-        FROM st_read('{_sql_str(source.path)}')
-    """
-    elapsed = _write_geoparquet(
-        con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
-    )
+            log.info("  Hilbert sort + write → %s ...", parquet_path)
+            core_select_sql = f"""
+                SELECT
+                    * EXCLUDE _geom_wkb,
+                    ST_GeomFromWKB(_geom_wkb) AS geometry
+                FROM read_parquet('{_sql_str(staged_path)}')
+            """
+            elapsed = _write_geoparquet(
+                con,
+                core_select_sql,
+                parquet_path,
+                source.row_group_size,
+                crs=source.crs,
+            )
+        finally:
+            staged_path.unlink(missing_ok=True)
+
     _log_prepared(parquet_path, elapsed)
     return parquet_path
 
@@ -319,6 +419,7 @@ def _prepare_csv(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     if _should_skip(parquet_path, force):
         return parquet_path
@@ -333,28 +434,27 @@ def _prepare_csv(
         source.crs,
     )
 
-    con = _open_connection(threads)
+    with _connection(threads, memory_limit) as con:
+        _count_row = con.sql(
+            f"SELECT COUNT(*) FROM read_csv('{_sql_str(source.path)}', auto_detect=true, nullstr=['NULL', ''])"
+        ).fetchone()
+        row_count: int = _count_row[0] if _count_row else 0
+        log.info("  Rows: %s", f"{row_count:,}")
+        log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-    _count_row = con.sql(
-        f"SELECT COUNT(*) FROM read_csv('{_sql_str(source.path)}', auto_detect=true, nullstr=['NULL', ''])"
-    ).fetchone()
-    row_count: int = _count_row[0] if _count_row else 0
-    log.info("  Rows: %s", f"{row_count:,}")
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-    # A subquery materialises the geometry column so the outer bbox struct and
-    # ORDER BY can reference it by name without repeating the geometry expression.
-    core_select_sql = f"""
-        SELECT
-            * EXCLUDE ({exclude_sql}),
-            {geom_sql} AS geometry
-        FROM read_csv('{_sql_str(source.path)}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
-    """
-    elapsed = _write_geoparquet(
-        con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
-    )
-    _log_prepared(parquet_path, elapsed)
-    return parquet_path
+        # A subquery materialises the geometry column so the outer bbox struct and
+        # ORDER BY can reference it by name without repeating the geometry expression.
+        core_select_sql = f"""
+            SELECT
+                * EXCLUDE ({exclude_sql}),
+                {geom_sql} AS geometry
+            FROM read_csv('{_sql_str(source.path)}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
+        """
+        elapsed = _write_geoparquet(
+            con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
+        )
+        _log_prepared(parquet_path, elapsed)
+        return parquet_path
 
 
 def _prepare_parquet(
@@ -363,6 +463,7 @@ def _prepare_parquet(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     if _should_skip(parquet_path, force):
         return parquet_path
@@ -370,70 +471,69 @@ def _prepare_parquet(
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Preparing %s from %s", name, source.path)
 
-    con = _open_connection(threads)
+    with _connection(threads, memory_limit) as con:
+        pq_src_meta = pq.read_metadata(str(source.path))
+        log.info(
+            "  Source: %s rows | %d row groups",
+            f"{pq_src_meta.num_rows:,}",
+            pq_src_meta.num_row_groups,
+        )
 
-    pq_src_meta = pq.read_metadata(str(source.path))
-    log.info(
-        "  Source: %s rows | %d row groups",
-        f"{pq_src_meta.num_rows:,}",
-        pq_src_meta.num_row_groups,
-    )
+        geom_col = source.geometry_col
+        if source.source_crs is not None:
+            # Native GEOMETRY column in a foreign CRS — reproject to target CRS.
+            # always_xy=true forces lon/lat (x/y) axis order, overriding PROJ 6+'s
+            # official axis order for EPSG:4326 (which is lat/lon). Without this,
+            # DuckDB interprets the first coordinate as latitude, swapping axes and
+            # producing completely wrong output coordinates.
+            geom_expr = f"ST_Transform({geom_col}, '{_sql_str(source.source_crs)}', '{_sql_str(source.crs)}', always_xy := true)"
+        elif geom_col == "geometry":
+            # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
+            geom_expr = "ST_GeomFromWKB(geometry)"
+        else:
+            # Native GEOMETRY column already in the target CRS (no reprojection needed).
+            geom_expr = geom_col
 
-    geom_col = source.geometry_col
-    if source.source_crs is not None:
-        # Native GEOMETRY column in a foreign CRS — reproject to target CRS.
-        # always_xy=true forces lon/lat (x/y) axis order, overriding PROJ 6+'s
-        # official axis order for EPSG:4326 (which is lat/lon). Without this,
-        # DuckDB interprets the first coordinate as latitude, swapping axes and
-        # producing completely wrong output coordinates.
-        geom_expr = f"ST_Transform({geom_col}, '{_sql_str(source.source_crs)}', '{_sql_str(source.crs)}', always_xy := true)"
-    elif geom_col == "geometry":
-        # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
-        geom_expr = "ST_GeomFromWKB(geometry)"
-    else:
-        # Native GEOMETRY column already in the target CRS (no reprojection needed).
-        geom_expr = geom_col
+        # Build the EXCLUDE list for the inner SELECT.
+        # For pipeline files (WKB geometry column) also drop the existing bbox so the
+        # outer query can rebuild it against the recomputed geometry.
+        # For external files, detect and drop all other geometry columns from the source
+        # so DuckDB only sees one geometry column in the output — otherwise it may pick
+        # a different column as the GeoParquet primary column and _patch_covering_metadata
+        # will patch the wrong entry, leaving our geometry with the wrong CRS in metadata.
+        if geom_col == "geometry" and source.source_crs is None:
+            exclude_cols = "geometry, bbox"
+        else:
+            src_describe = con.sql(
+                f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
+            ).fetchall()
+            src_col_names = {row[0] for row in src_describe}
+            extra_geom_cols = [
+                row[0]
+                for row in src_describe
+                if "GEOMETRY" in row[1].upper() and row[0] != geom_col
+            ]
+            cols_to_exclude = [geom_col] + extra_geom_cols
+            if "bbox" in src_col_names:
+                cols_to_exclude.append("bbox")
+            exclude_cols = ", ".join(f'"{c}"' for c in cols_to_exclude)
+            if extra_geom_cols:
+                log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
 
-    # Build the EXCLUDE list for the inner SELECT.
-    # For pipeline files (WKB geometry column) also drop the existing bbox so the
-    # outer query can rebuild it against the recomputed geometry.
-    # For external files, detect and drop all other geometry columns from the source
-    # so DuckDB only sees one geometry column in the output — otherwise it may pick
-    # a different column as the GeoParquet primary column and _patch_covering_metadata
-    # will patch the wrong entry, leaving our geometry with the wrong CRS in metadata.
-    if geom_col == "geometry" and source.source_crs is None:
-        exclude_cols = "geometry, bbox"
-    else:
-        src_describe = con.sql(
-            f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
-        ).fetchall()
-        src_col_names = {row[0] for row in src_describe}
-        extra_geom_cols = [
-            row[0]
-            for row in src_describe
-            if "GEOMETRY" in row[1].upper() and row[0] != geom_col
-        ]
-        cols_to_exclude = [geom_col] + extra_geom_cols
-        if "bbox" in src_col_names:
-            cols_to_exclude.append("bbox")
-        exclude_cols = ", ".join(f'"{c}"' for c in cols_to_exclude)
-        if extra_geom_cols:
-            log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
+        log.info("  Source geometry column: %r → output column: 'geometry'", geom_col)
+        log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-    log.info("  Source geometry column: %r → output column: 'geometry'", geom_col)
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-    core_select_sql = f"""
-        SELECT
-            * EXCLUDE ({exclude_cols}),
-            {geom_expr} AS geometry
-        FROM read_parquet('{_sql_str(source.path)}')
-    """
-    elapsed = _write_geoparquet(
-        con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
-    )
-    _log_prepared(parquet_path, elapsed)
-    return parquet_path
+        core_select_sql = f"""
+            SELECT
+                * EXCLUDE ({exclude_cols}),
+                {geom_expr} AS geometry
+            FROM read_parquet('{_sql_str(source.path)}')
+        """
+        elapsed = _write_geoparquet(
+            con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
+        )
+        _log_prepared(parquet_path, elapsed)
+        return parquet_path
 
 
 def _prepare_usrn_buffer(
@@ -442,6 +542,7 @@ def _prepare_usrn_buffer(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Buffer an already-prepared USRN centreline GeoParquet for line join Phase 2.
 
@@ -460,42 +561,43 @@ def _prepare_usrn_buffer(
 
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
 
-    con = _open_connection(threads)
+    with _connection(threads, memory_limit) as con:
+        pq_src = pq.read_metadata(str(source.path))
+        log.info(
+            "Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path
+        )
+        log.info(
+            "  Source: %s rows | %d row groups",
+            f"{pq_src.num_rows:,}",
+            pq_src.num_row_groups,
+        )
+        log.info(
+            "  Source geometry column: 'geometry' → output column: 'geometry' "
+            "(buffered %.0fm; original line kept as 'geometry_line')",
+            source.buffer_m,
+        )
+        log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-    pq_src = pq.read_metadata(str(source.path))
-    log.info("Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path)
-    log.info(
-        "  Source: %s rows | %d row groups",
-        f"{pq_src.num_rows:,}",
-        pq_src.num_row_groups,
-    )
-    log.info(
-        "  Source geometry column: 'geometry' → output column: 'geometry' "
-        "(buffered %.0fm; original line kept as 'geometry_line')",
-        source.buffer_m,
-    )
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-    # Materialise the buffer once here so the shared bbox struct (built against
-    # the already-computed `geometry` column) doesn't recompute ST_Buffer per corner.
-    core_select_sql = f"""
-        SELECT
-            usrn,
-            street_type,
-            geometry AS geometry_line,
-            ST_Buffer(geometry, {source.buffer_m}) AS geometry
-        FROM read_parquet('{_sql_str(source.path)}')
-    """
-    elapsed = _write_geoparquet(
-        con,
-        core_select_sql,
-        parquet_path,
-        source.row_group_size,
-        crs=source.crs,
-        primary_column="geometry",
-    )
-    _log_prepared(parquet_path, elapsed)
-    return parquet_path
+        # Materialise the buffer once here so the shared bbox struct (built against
+        # the already-computed `geometry` column) doesn't recompute ST_Buffer per corner.
+        core_select_sql = f"""
+            SELECT
+                usrn,
+                street_type,
+                geometry AS geometry_line,
+                ST_Buffer(geometry, {source.buffer_m}) AS geometry
+            FROM read_parquet('{_sql_str(source.path)}')
+        """
+        elapsed = _write_geoparquet(
+            con,
+            core_select_sql,
+            parquet_path,
+            source.row_group_size,
+            crs=source.crs,
+            primary_column="geometry",
+        )
+        _log_prepared(parquet_path, elapsed)
+        return parquet_path
 
 
 def _prepare_usrn(
@@ -504,6 +606,7 @@ def _prepare_usrn(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Dispatch a UsrnSource to plain (centreline) or buffered (corridor) preparation.
 
@@ -518,8 +621,12 @@ def _prepare_usrn(
         ogr_source = OgrSource(
             path=source.path, crs=source.crs, row_group_size=source.row_group_size
         )
-        return _prepare_ogr(ogr_source, parquet_path, name, force, threads)
-    return _prepare_usrn_buffer(source, parquet_path, name, force, threads)
+        return _prepare_ogr(
+            ogr_source, parquet_path, name, force, threads, memory_limit
+        )
+    return _prepare_usrn_buffer(
+        source, parquet_path, name, force, threads, memory_limit
+    )
 
 
 def _prepare_uprn_plain(
@@ -528,6 +635,7 @@ def _prepare_uprn_plain(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Prepare a raw OS Open UPRN GeoPackage into a plain address-point GeoParquet.
 
@@ -547,23 +655,22 @@ def _prepare_uprn_plain(
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Preparing %s from %s", name, source.path)
 
-    con = _open_connection(threads)
+    with _connection(threads, memory_limit) as con:
+        src_geom: str = _get_src_geometry_col(con, str(source.path))
+        log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
+        log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-    src_geom: str = _get_src_geometry_col(con, str(source.path))
-    log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-    core_select_sql = f"""
-        SELECT
-            UPRN AS uprn,
-            "{src_geom}" AS geometry
-        FROM st_read('{_sql_str(source.path)}')
-    """
-    elapsed = _write_geoparquet(
-        con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
-    )
-    _log_prepared(parquet_path, elapsed)
-    return parquet_path
+        core_select_sql = f"""
+            SELECT
+                UPRN AS uprn,
+                "{src_geom}" AS geometry
+            FROM st_read('{_sql_str(source.path)}')
+        """
+        elapsed = _write_geoparquet(
+            con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
+        )
+        _log_prepared(parquet_path, elapsed)
+        return parquet_path
 
 
 def _prepare_uprn_buffer(
@@ -572,6 +679,7 @@ def _prepare_uprn_buffer(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Buffer an already-prepared UPRN point GeoParquet into catchment polygons.
 
@@ -591,42 +699,43 @@ def _prepare_uprn_buffer(
 
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
 
-    con = _open_connection(threads)
+    with _connection(threads, memory_limit) as con:
+        pq_src = pq.read_metadata(str(source.path))
+        log.info(
+            "Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path
+        )
+        log.info(
+            "  Source: %s rows | %d row groups",
+            f"{pq_src.num_rows:,}",
+            pq_src.num_row_groups,
+        )
+        log.info(
+            "  Source geometry column: 'geometry' → output column: 'geometry' "
+            "(buffered %.0fm; original point kept as 'geometry_point')",
+            source.buffer_m,
+        )
+        log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-    pq_src = pq.read_metadata(str(source.path))
-    log.info("Preparing %s (buffer=%.0fm) from %s", name, source.buffer_m, source.path)
-    log.info(
-        "  Source: %s rows | %d row groups",
-        f"{pq_src.num_rows:,}",
-        pq_src.num_row_groups,
-    )
-    log.info(
-        "  Source geometry column: 'geometry' → output column: 'geometry' "
-        "(buffered %.0fm; original point kept as 'geometry_point')",
-        source.buffer_m,
-    )
-    log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-    # Only uprn carries through — x/y/lat/lon are redundant with geometry_point
-    # and this file's row count is large enough that dropping four doubles per
-    # row is worth it.
-    core_select_sql = f"""
-        SELECT
-            uprn,
-            geometry AS geometry_point,
-            ST_Buffer(geometry, {source.buffer_m}) AS geometry
-        FROM read_parquet('{_sql_str(source.path)}')
-    """
-    elapsed = _write_geoparquet(
-        con,
-        core_select_sql,
-        parquet_path,
-        source.row_group_size,
-        crs=source.crs,
-        primary_column="geometry",
-    )
-    _log_prepared(parquet_path, elapsed)
-    return parquet_path
+        # Only uprn carries through — x/y/lat/lon are redundant with geometry_point
+        # and this file's row count is large enough that dropping four doubles per
+        # row is worth it.
+        core_select_sql = f"""
+            SELECT
+                uprn,
+                geometry AS geometry_point,
+                ST_Buffer(geometry, {source.buffer_m}) AS geometry
+            FROM read_parquet('{_sql_str(source.path)}')
+        """
+        elapsed = _write_geoparquet(
+            con,
+            core_select_sql,
+            parquet_path,
+            source.row_group_size,
+            crs=source.crs,
+            primary_column="geometry",
+        )
+        _log_prepared(parquet_path, elapsed)
+        return parquet_path
 
 
 def _prepare_uprn(
@@ -635,6 +744,7 @@ def _prepare_uprn(
     name: str,
     force: bool,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Dispatch a UprnSource to plain (address-point) or buffered (catchment) prep.
 
@@ -646,14 +756,19 @@ def _prepare_uprn(
     buffered catchment polygons.
     """
     if source.buffer_m is None:
-        return _prepare_uprn_plain(source, parquet_path, name, force, threads)
-    return _prepare_uprn_buffer(source, parquet_path, name, force, threads)
+        return _prepare_uprn_plain(
+            source, parquet_path, name, force, threads, memory_limit
+        )
+    return _prepare_uprn_buffer(
+        source, parquet_path, name, force, threads, memory_limit
+    )
 
 
 def prepare(
     config: DatasetConfig,
     force: bool = False,
     threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> pathlib.Path:
     """Read a spatial data source and write an optimised GeoParquet 1.1 file.
 
@@ -682,6 +797,10 @@ def prepare(
     threads:
         Number of DuckDB threads to use. ``None`` lets DuckDB use all available
         cores (default). Set to a lower value to reduce CPU pressure.
+    memory_limit:
+        DuckDB ``memory_limit`` for this call, e.g. ``"3GB"``. ``None`` leaves
+        DuckDB's default of ~80% of system RAM. That default is applied *per
+        instance*, so on a memory-constrained runner set this explicitly.
 
     Returns
     -------

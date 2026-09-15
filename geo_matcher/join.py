@@ -1,15 +1,25 @@
+from __future__ import annotations
+
 import functools
 import logging
 import pathlib
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    cast,
+    runtime_checkable,
+)
 
 import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from sedonadb.context import SedonaContext
 
 from .config import BBox, DatasetConfig, GeometryType, LhsKind
 from .explain import log_plan
@@ -23,6 +33,12 @@ from .join_sql import (
     usrn_spatial_filter,
 )
 from .logger import get_logger
+
+if TYPE_CHECKING:
+    # Annotation-only: importing sedonadb at module scope would load its native
+    # library into every process that merely imports geo_matcher, including the
+    # prepare-only paths that never build a Sedona session.
+    from sedonadb.context import SedonaContext
 
 log: logging.Logger = get_logger()
 

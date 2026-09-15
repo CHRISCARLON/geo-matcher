@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "geo-matcher"
-version = "0.1.3"
+version = "0.1.4"
 description = "A library to spatially join USRNs and UPRNs to other spatial datasets"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,11 @@ classifiers = [
 dependencies = [
     "apache-sedona[db]==1.8.1",
     "duckdb==1.5.2",
+    # Used directly by prepare.py to write CRS PROJJSON into the GeoParquet
+    # metadata. Previously relied on arriving transitively via
+    # apache-sedona -> geopandas, which would break prepare() if that chain
+    # ever changed.
+    "pyproj>=3.6",
 ]
 
 [project.urls]
