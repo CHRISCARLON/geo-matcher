@@ -272,11 +272,12 @@ wheels = [
 
 [[package]]
 name = "geo-matcher"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "apache-sedona", extra = ["db"] },
     { name = "duckdb" },
+    { name = "pyproj" },
 ]
 
 [package.dev-dependencies]
@@ -301,6 +302,7 @@ typechecking = [
 requires-dist = [
     { name = "apache-sedona", extras = ["db"], specifier = "==1.8.1" },
     { name = "duckdb", specifier = "==1.5.2" },
+    { name = "pyproj", specifier = ">=3.6" },
 ]
 
 [package.metadata.requires-dev]

@@ -744,6 +744,142 @@ def test_ogr_staging_preserves_rows_columns_and_geometry(tiny_gdf, tiny_gpkg, tm
     assert actual_area == expected_area
 
 
+@pytest.fixture
+def curve_gpkg(tmp_path):
+    """A GeoPackage carrying one CircularString alongside three usable features.
+
+    DuckDB's GEOMETRY cannot represent the curve WKB types, so this is the shape
+    that used to abort the whole staging scan with "Unsupported geometry type in
+    WKB". GDAL will not write a curve from DuckDB or GeoPandas, so the feature is
+    inserted as a raw GPKG blob through SQLite (the GPKG validation triggers call
+    spatialite functions that plain SQLite lacks, hence dropping them first).
+    """
+    import sqlite3
+    import struct
+
+    import duckdb
+
+    p = tmp_path / "curves.gpkg"
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    con.execute(f"""
+        COPY (
+            SELECT 1 AS usrn, ST_GeomFromText('LINESTRING Z (0 0 5, 1 1 6)') AS geom
+            UNION ALL SELECT 2, ST_GeomFromText('MULTILINESTRING ZM ((0 0 1 2, 1 1 3 4))')
+            UNION ALL SELECT 3, ST_GeomFromText('LINESTRING (0 0, 1 1)')
+        ) TO '{p}' WITH (FORMAT GDAL, DRIVER 'GPKG', SRS 'EPSG:27700')
+    """)
+    con.close()
+
+    # WKB type code 8 == CircularString, wrapped in the GPKG blob header.
+    wkb = b"\x01" + struct.pack("<I", 8) + struct.pack("<I", 3)
+    for x, y in [(0, 0), (1, 1), (2, 0)]:
+        wkb += struct.pack("<dd", x, y)
+    blob = b"GP" + bytes([0, 1]) + struct.pack("<i", 27700) + wkb
+
+    db = sqlite3.connect(p)
+    for (trigger,) in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'"
+    ).fetchall():
+        db.execute(f'DROP TRIGGER "{trigger}"')
+    db.execute("INSERT INTO curves (usrn, geom) VALUES (?, ?)", (99, blob))
+    db.commit()
+    db.close()
+    return p
+
+
+def test_unsupported_curve_geometry_is_dropped_not_fatal(curve_gpkg, tmp_path, caplog):
+    """One curve feature must not abort the prepare of a whole national file.
+
+    DuckDB has no representation for the curve/surface WKB types and no function
+    that linearises them, so they cannot reach GeoParquet at all. They are dropped
+    and reported rather than raising, which is what a single such feature in an OS
+    "Unknown (any)" layer used to do to the entire staging scan.
+    """
+    out = tmp_path / "curves.parquet"
+    cfg = DatasetConfig(
+        name="curves", source=OgrSource(path=curve_gpkg), parquet_path=out
+    )
+
+    with caplog.at_level("WARNING"):
+        prepare(cfg, force=True)
+
+    got = gpd.read_parquet(out)
+    assert sorted(got["usrn"].tolist()) == [1, 2, 3]  # the curve feature (99) dropped
+
+    warning = "\n".join(r.getMessage() for r in caplog.records)
+    assert "1 of 4 features" in warning
+    assert "CircularString" in warning
+    assert "CONVERT_TO_LINEAR" in warning
+
+
+def test_ogr_geometry_is_forced_to_2d(curve_gpkg, tmp_path):
+    """Z/M ordinates are dropped so one column never mixes XY and XYZ geometries."""
+    out = tmp_path / "flat.parquet"
+    cfg = DatasetConfig(
+        name="flat", source=OgrSource(path=curve_gpkg), parquet_path=out
+    )
+    prepare(cfg, force=True)
+
+    got = gpd.read_parquet(out)
+    assert not got.geometry.has_z.any()
+
+
+def test_wkb_type_name_decodes_both_dialects():
+    """_wkb_type_name must read ISO and old-OGC/EWKB type codes, and both endians."""
+    name = prepare_module._wkb_type_name
+
+    assert name("0102000000") == "LineString"  # little-endian ISO
+    assert name("01ea030000") == "LineString Z"  # ISO 1002
+    assert name("01ba0b0000") == "LineString ZM"  # ISO 3002
+    assert name("0102000080") == "LineString Z"  # EWKB high-bit Z
+    assert name("0108000000") == "CircularString"
+    assert name("0000000002") == "LineString"  # big-endian
+    assert name("zz") == "unknown"
+
+
+@pytest.mark.parametrize(
+    "source_factory",
+    [
+        pytest.param(lambda p: OgrSource(path=p), id="ogr"),
+        pytest.param(lambda p: UsrnSource(path=p), id="usrn"),
+        pytest.param(lambda p: UprnSource(path=p), id="uprn"),
+    ],
+)
+def test_memory_limit_is_forwarded_through_dispatch(
+    tiny_gpkg, tmp_path, monkeypatch, source_factory
+):
+    """prepare()'s memory_limit must survive dispatch to every _prepare_* branch.
+
+    It used to be accepted and silently dropped, so a caller capping DuckDB on a
+    constrained runner still got the default budget of ~80% of system RAM.
+    """
+    seen = {}
+    original = prepare_module._open_connection
+
+    def spy(threads=None, memory_limit=None):
+        seen["threads"] = threads
+        seen["memory_limit"] = memory_limit
+        return original(threads, memory_limit)
+
+    monkeypatch.setattr(prepare_module, "_open_connection", spy)
+
+    # UPRN's plain path needs the uppercase UPRN id column the OS source ships.
+    gdf = gpd.read_file(tiny_gpkg)
+    gdf["UPRN"] = range(len(gdf))
+    src_path = tmp_path / "with_uprn.gpkg"
+    gdf.to_file(str(src_path), driver="GPKG")
+
+    cfg = DatasetConfig(
+        name="t",
+        source=source_factory(src_path),
+        parquet_path=tmp_path / "mem.parquet",
+    )
+    prepare(cfg, force=True, threads=2, memory_limit="512MB")
+
+    assert seen == {"threads": 2, "memory_limit": "512MB"}
+
+
 def test_importing_geo_matcher_does_not_load_native_geo_stacks():
     """geo_matcher must be importable without pulling in sedonadb or pyogrio.
 

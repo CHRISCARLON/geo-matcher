@@ -309,6 +309,114 @@ def _log_prepared(parquet_path: pathlib.Path, elapsed: float) -> None:
     )
 
 
+_WKB_TYPE_NAMES: dict[int, str] = {
+    1: "Point",
+    2: "LineString",
+    3: "Polygon",
+    4: "MultiPoint",
+    5: "MultiLineString",
+    6: "MultiPolygon",
+    7: "GeometryCollection",
+    8: "CircularString",
+    9: "CompoundCurve",
+    10: "CurvePolygon",
+    11: "MultiCurve",
+    12: "MultiSurface",
+    13: "Curve",
+    14: "Surface",
+    15: "PolyhedralSurface",
+    16: "TIN",
+    17: "Triangle",
+}
+
+
+def _wkb_type_name(prefix_hex: str) -> str:
+    """Name the geometry type encoded in the first five bytes of a WKB value.
+
+    ``prefix_hex`` is the hex of ``[byte order][uint32 type code]``. Both WKB
+    dialects GDAL emits are handled: ISO (``1002`` = LineString Z) and the older
+    OGC/EWKB high-bit flags (``0x80000002``).
+    """
+    try:
+        raw = bytes.fromhex(prefix_hex)
+    except ValueError:
+        return "unknown"
+    if len(raw) < 5:
+        return "unknown"
+
+    code = int.from_bytes(raw[1:5], "little" if raw[0] == 1 else "big")
+
+    # EWKB signals extra dimensions with high bits; ISO adds 1000/2000/3000.
+    has_z = bool(code & 0x80000000)
+    has_m = bool(code & 0x40000000)
+    base = code & 0x0FFFFFFF
+    if base >= 1000:
+        base, marker = base % 1000, base // 1000
+        has_z = has_z or marker in (1, 3)
+        has_m = has_m or marker in (2, 3)
+
+    suffix = f" {'Z' if has_z else ''}{'M' if has_m else ''}".rstrip()
+    return f"{_WKB_TYPE_NAMES.get(base, f'type {code}')}{suffix}"
+
+
+def _log_dropped_geometries(
+    con: duckdb.DuckDBPyConnection,
+    staged_path: pathlib.Path,
+    source_path: pathlib.Path,
+    staged_rows: int,
+    written_rows: int,
+) -> None:
+    """Warn about features that could not be converted out of the staging file.
+
+    DuckDB's GEOMETRY has no representation for the curve and surface WKB types
+    (CircularString, CompoundCurve, CurvePolygon, …), and no DuckDB function
+    linearises them, so such features cannot cross into GeoParquet at all — the
+    writer drops them rather than failing a national run over a handful of rows.
+    This reports what went missing and how to convert it properly.
+
+    The diagnostic query re-parses every staged geometry, so it only runs when
+    the row counts actually disagree; a clean prepare pays nothing for it.
+    """
+    dropped = staged_rows - written_rows
+    if dropped <= 0:
+        return
+
+    row = con.execute(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE _geom_wkb IS NULL),
+            list(DISTINCT hex(_geom_wkb)[1:10]) FILTER (
+                WHERE _geom_wkb IS NOT NULL
+                  AND TRY(ST_GeomFromWKB(_geom_wkb)) IS NULL
+            )
+        FROM read_parquet('{_sql_str(staged_path)}')
+    """).fetchone()
+    null_geoms: int = row[0] if row else 0
+    prefixes: list[str] = (row[1] if row and row[1] else []) or []
+
+    if null_geoms:
+        log.warning(
+            "  %s of %s features in %s have no geometry and were dropped.",
+            f"{null_geoms:,}",
+            f"{staged_rows:,}",
+            source_path,
+        )
+
+    unsupported = dropped - null_geoms
+    if unsupported > 0:
+        types = ", ".join(sorted({_wkb_type_name(p) for p in prefixes})) or "unknown"
+        log.warning(
+            "  %s of %s features (%.4f%%) in %s use geometry DuckDB cannot "
+            "represent (%s) and were dropped. Pre-convert the source to keep them: "
+            "ogr2ogr -nlt CONVERT_TO_LINEAR converted.gpkg %s",
+            f"{unsupported:,}",
+            f"{staged_rows:,}",
+            100 * unsupported / staged_rows if staged_rows else 0.0,
+            source_path,
+            types,
+            source_path,
+        )
+
+
 def _prepare_ogr(
     source: OgrSource,
     parquet_path: pathlib.Path,
@@ -329,6 +437,18 @@ def _prepare_ogr(
 
     Geometry crosses to the staging file as WKB and is rebuilt afterwards, which
     is lossless for coordinates; the CRS is restated on the final write.
+
+    The staging read uses ``keep_wkb=true`` so GDAL's bytes land in the file
+    untouched, without DuckDB parsing them into GEOMETRY mid-scan. A single
+    feature of a type DuckDB has no representation for — the curve and surface
+    WKB types, which OS national GeoPackages declare as "Unknown (any)" and do
+    occasionally contain — otherwise aborts the whole scan with "Unsupported
+    geometry type in WKB". Parsing instead happens on the rebuild, per row and
+    under ``TRY``, so those features are dropped (and reported by
+    ``_log_dropped_geometries``) rather than killing the run.
+
+    Geometry is forced to 2D on the way out: this pipeline matches in the plane,
+    and keeping Z/M would mix XY and XYZ geometries in one GeoParquet column.
     """
     if _should_skip(parquet_path, force):
         return parquet_path
@@ -361,18 +481,25 @@ def _prepare_ogr(
                 COPY (
                     SELECT
                         * EXCLUDE "{src_geom}",
-                        ST_AsWKB("{src_geom}") AS _geom_wkb
-                    FROM st_read('{_sql_str(source.path)}')
+                        "{src_geom}" AS _geom_wkb
+                    FROM st_read('{_sql_str(source.path)}', keep_wkb=true)
                 ) TO '{_sql_str(staged_path)}'
                 (FORMAT PARQUET, COMPRESSION ZSTD)
             """)
+            staged_rows: int = pq.read_metadata(str(staged_path)).num_rows
 
             log.info("  Hilbert sort + write → %s ...", parquet_path)
+            # TRY() turns a geometry DuckDB cannot parse into NULL instead of an
+            # error; the outer filter then drops it. The alias can't be used in
+            # its own WHERE, hence the wrapping SELECT.
             core_select_sql = f"""
-                SELECT
-                    * EXCLUDE _geom_wkb,
-                    ST_GeomFromWKB(_geom_wkb) AS geometry
-                FROM read_parquet('{_sql_str(staged_path)}')
+                SELECT * FROM (
+                    SELECT
+                        * EXCLUDE _geom_wkb,
+                        ST_Force2D(TRY(ST_GeomFromWKB(_geom_wkb))) AS geometry
+                    FROM read_parquet('{_sql_str(staged_path)}')
+                )
+                WHERE geometry IS NOT NULL
             """
             elapsed = _write_geoparquet(
                 con,
@@ -380,6 +507,13 @@ def _prepare_ogr(
                 parquet_path,
                 source.row_group_size,
                 crs=source.crs,
+            )
+            _log_dropped_geometries(
+                con,
+                staged_path,
+                source.path,
+                staged_rows,
+                pq.read_metadata(str(parquet_path)).num_rows,
             )
         finally:
             staged_path.unlink(missing_ok=True)
@@ -814,14 +948,22 @@ def prepare(
         )
     match config.source:
         case OgrSource() as src:
-            return _prepare_ogr(src, config.parquet_path, config.name, force, threads)
+            return _prepare_ogr(
+                src, config.parquet_path, config.name, force, threads, memory_limit
+            )
         case CsvSource() as src:
-            return _prepare_csv(src, config.parquet_path, config.name, force, threads)
+            return _prepare_csv(
+                src, config.parquet_path, config.name, force, threads, memory_limit
+            )
         case ParquetSource() as src:
             return _prepare_parquet(
-                src, config.parquet_path, config.name, force, threads
+                src, config.parquet_path, config.name, force, threads, memory_limit
             )
         case UsrnSource() as src:
-            return _prepare_usrn(src, config.parquet_path, config.name, force, threads)
+            return _prepare_usrn(
+                src, config.parquet_path, config.name, force, threads, memory_limit
+            )
         case UprnSource() as src:
-            return _prepare_uprn(src, config.parquet_path, config.name, force, threads)
+            return _prepare_uprn(
+                src, config.parquet_path, config.name, force, threads, memory_limit
+            )

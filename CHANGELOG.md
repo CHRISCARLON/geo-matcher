@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `prepare(..., memory_limit=...)` now actually reaches DuckDB. The argument was
+  accepted, documented and forwarded correctly by every `_prepare_*` function,
+  but `prepare()` itself dropped it on all five dispatch branches — each one
+  called through as `(src, parquet_path, name, force, threads)` and stopped
+  there. A caller capping DuckDB on a constrained runner silently got the
+  default budget of ~80% of system RAM instead. This makes good on the
+  `memory_limit` entry added in 0.1.4.
+- `_prepare_ogr` no longer aborts on a source containing curve geometry.
+  DuckDB's `GEOMETRY` has no representation for the curve and surface WKB types
+  (`CircularString`, `CompoundCurve`, `CurvePolygon`, …), and a single such
+  feature killed the entire staging scan with `Invalid Input Error: Unsupported
+  geometry type in WKB` — hit in the wild on the OS Open USRN GeoPackage, whose
+  layer is declared `Unknown (any)`. The staging read now uses
+  `st_read(..., keep_wkb=true)`, so GDAL's bytes land in the staging file
+  without DuckDB parsing them mid-scan; parsing happens on the rebuild instead,
+  per row and under `TRY`. Features DuckDB cannot represent are dropped with a
+  warning naming the count, the geometry types involved and the `ogr2ogr -nlt
+  CONVERT_TO_LINEAR` remedy, rather than failing a national run over a handful
+  of rows. No DuckDB function linearises these types, so they cannot reach
+  GeoParquet by any route — the source has to be converted first to keep them.
+
+### Changed
+
+- OGR geometry is forced to 2D on write (`ST_Force2D`). The matching pipeline
+  works in the plane, and carrying Z/M through left one GeoParquet column
+  mixing XY and XYZ geometries.
+
 ## [0.1.4] - 2026-09-15
 
 ### Fixed
