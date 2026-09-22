@@ -496,6 +496,16 @@ class GeoMatcher:
             help="CRS of the coordinate columns (default: EPSG:27700).",
         )
         p_prepare_csv.add_argument(
+            "--source-crs",
+            default=None,
+            metavar="CRS",
+            help=(
+                "CRS of the coordinate/WKT columns, e.g. 'EPSG:4326'. "
+                "Set when the source is in a different CRS than --crs. "
+                "The geometry will be reprojected to --crs during prepare."
+            ),
+        )
+        p_prepare_csv.add_argument(
             "--row-group-size",
             type=int,
             default=10_000,
@@ -885,6 +895,7 @@ class GeoMatcher:
                 wkt_col=args.wkt_col,
                 crs=args.crs,
                 row_group_size=args.row_group_size,
+                source_crs=args.source_crs,
             )
             rhs_config = DatasetConfig(
                 name=args.name,

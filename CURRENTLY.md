@@ -1,4 +1,3 @@
 # Current Focus
 
-- Working towards release on pypi
-- Documenation site
+- Improve prepare speed and introduce better logging for it

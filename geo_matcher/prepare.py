@@ -64,6 +64,12 @@ class _GeoMeta(TypedDict):
     columns: dict[str, _GeomColumnMeta]
 
 
+class _OgrInfo(TypedDict):
+    crs: str | None
+    feature_count: int
+    geometry_type: str
+
+
 _EXPECTED_COVERING_METADATA: _Covering = {
     "bbox": {
         "xmin": ["bbox", "xmin"],
@@ -74,6 +80,28 @@ _EXPECTED_COVERING_METADATA: _Covering = {
 }
 
 
+_WKB_TYPE_NAMES: dict[int, str] = {
+    1: "Point",
+    2: "LineString",
+    3: "Polygon",
+    4: "MultiPoint",
+    5: "MultiLineString",
+    6: "MultiPolygon",
+    7: "GeometryCollection",
+    8: "CircularString",
+    9: "CompoundCurve",
+    10: "CurvePolygon",
+    11: "MultiCurve",
+    12: "MultiSurface",
+    13: "Curve",
+    14: "Surface",
+    15: "PolyhedralSurface",
+    16: "TIN",
+    17: "Triangle",
+}
+
+
+# HELPERS
 def _patch_covering_metadata(
     path: pathlib.Path,
     row_group_size: int,
@@ -130,15 +158,7 @@ def _patch_covering_metadata(
 
 
 def _get_src_geometry_col(con: duckdb.DuckDBPyConnection, source_path: str) -> str:
-    """Return the geometry column name as exposed by DuckDB's ``st_read``.
-
-    This looks directly for "GEOMETRY".
-
-    The column name in the output of ``st_read`` is determined by the source
-    file's internal metadata (e.g. GeoPackage layers typically expose ``"geom"``
-    regardless of the original column name).  This helper queries the schema
-    so the caller can rename it to ``"geometry"`` in the ``SELECT``.
-    """
+    """Return the geometry column name as exposed by DuckDB's ``st_read``."""
     rows = con.sql(
         f"DESCRIBE SELECT * FROM st_read('{_sql_str(source_path)}')"
     ).fetchall()
@@ -153,15 +173,29 @@ def _get_src_geometry_col(con: duckdb.DuckDBPyConnection, source_path: str) -> s
     )
 
 
-# ---------------------------------------------------------------------------
-# Shared writer helpers
-#
-# Every _prepare_* function below funnels through the same shape: skip if the
-# output already exists, open a DuckDB connection, build a *core* SELECT that
-# is unique to that source type (must materialise a `geometry` column), then
-# hand it to _write_geoparquet to add the bbox covering struct, Hilbert-sort,
-# write the GeoParquet file, and patch its metadata.
-# ---------------------------------------------------------------------------
+def _csv_geometry_sql(source: CsvSource) -> tuple[str, str]:
+    """Return ``(geometry_expr_sql, exclude_cols_sql)`` for building a CsvSource's geometry.
+
+    ``geometry_expr_sql`` is a DuckDB expression producing a GEOMETRY value;
+    ``exclude_cols_sql`` names the raw source column(s) consumed to build it, ready to
+    drop from the output via ``* EXCLUDE (...)``.
+    """
+    # CsvSource.__post_init__ already normalises geometry_type to a real GeometryType
+    # member at construction time; re-wrapping here just re-narrows the static type
+    # (the field itself is typed GeometryType | str to accept plain strings from the
+    # CLI).
+    geometry_type: GeometryType = GeometryType(source.geometry_type)
+    match geometry_type:
+        case GeometryType.POINT:
+            return (
+                f'ST_Point("{source.x_col}", "{source.y_col}")',
+                f'"{source.x_col}", "{source.y_col}"',
+            )
+        case GeometryType.LINE | GeometryType.POLYGON:
+            # CsvSource.__post_init__ guarantees wkt_col is set whenever
+            # geometry_type is LINE/POLYGON.
+            assert source.wkt_col is not None
+            return f'ST_GeomFromText("{source.wkt_col}")', f'"{source.wkt_col}"'
 
 
 def _should_skip(parquet_path: pathlib.Path, force: bool) -> bool:
@@ -178,14 +212,7 @@ def _should_skip(parquet_path: pathlib.Path, force: bool) -> bool:
 def _open_connection(
     threads: int | None = None, memory_limit: str | None = None
 ) -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection with the spatial extension loaded.
-
-    ``duckdb.connect()`` with no path creates a *new, independent* in-memory
-    database each time, and DuckDB defaults ``memory_limit`` to ~80% of system RAM
-    **per instance**. Several live instances therefore each believe they may use
-    most of the machine. ``memory_limit`` lets the caller bound that; prefer
-    ``_connection()`` below so the instance is also released promptly.
-    """
+    """Open a DuckDB connection with the spatial extension loaded."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     if threads is not None:
@@ -199,12 +226,7 @@ def _open_connection(
 def _connection(
     threads: int | None = None, memory_limit: str | None = None
 ) -> Generator[duckdb.DuckDBPyConnection, None, None]:
-    """Open a configured DuckDB connection and always close it.
-
-    Without this, a process calling prepare() several times accumulates one live
-    in-memory DuckDB database per call for its whole lifetime, each holding its
-    own buffers and its own memory budget.
-    """
+    """Open a configured DuckDB connection and always close it."""
     con = _open_connection(threads, memory_limit)
     try:
         yield con
@@ -212,20 +234,8 @@ def _connection(
         con.close()
 
 
-class _OgrInfo(TypedDict):
-    crs: str | None
-    feature_count: int
-    geometry_type: str
-
-
 def _read_ogr_info(con: duckdb.DuckDBPyConnection, source_path: str) -> _OgrInfo:
-    """Read layer metadata for an OGR source using DuckDB's own GDAL.
-
-    Deliberately not ``pyogrio.read_info``: pyogrio bundles its own GDAL build, so
-    using it here would open the same file through a *second* GDAL in the same
-    process, on top of duckdb-spatial's. Reading metadata through ``st_read_meta``
-    keeps the prepare path on one GDAL.
-    """
+    """Read layer metadata for an OGR source using DuckDB's own GDAL."""
     rows = con.execute(f"""
         SELECT
             l.feature_count,
@@ -256,6 +266,21 @@ def _bbox_struct_sql(geom_col: str = "geometry") -> str:
         f"'xmin': ST_XMin({geom_col}), 'ymin': ST_YMin({geom_col}), "
         f"'xmax': ST_XMax({geom_col}), 'ymax': ST_YMax({geom_col})"
         "}"
+    )
+
+
+def _crs_transform_expr(geom_expr: str, source_crs: str | None, target_crs: str) -> str:
+    """Wrap ``geom_expr`` in ``ST_Transform`` if ``source_crs`` is set and differs
+    from ``target_crs``; otherwise return it unchanged.
+
+    ``always_xy=true`` forces lon/lat (x/y) axis order, matching the one existing
+    transform call this generalises (formerly inline in ``_prepare_parquet``).
+    """
+    if source_crs is None or source_crs == target_crs:
+        return geom_expr
+    return (
+        f"ST_Transform({geom_expr}, '{_sql_str(source_crs)}', "
+        f"'{_sql_str(target_crs)}', always_xy := true)"
     )
 
 
@@ -309,27 +334,6 @@ def _log_prepared(parquet_path: pathlib.Path, elapsed: float) -> None:
     )
 
 
-_WKB_TYPE_NAMES: dict[int, str] = {
-    1: "Point",
-    2: "LineString",
-    3: "Polygon",
-    4: "MultiPoint",
-    5: "MultiLineString",
-    6: "MultiPolygon",
-    7: "GeometryCollection",
-    8: "CircularString",
-    9: "CompoundCurve",
-    10: "CurvePolygon",
-    11: "MultiCurve",
-    12: "MultiSurface",
-    13: "Curve",
-    14: "Surface",
-    15: "PolyhedralSurface",
-    16: "TIN",
-    17: "Triangle",
-}
-
-
 def _wkb_type_name(prefix_hex: str) -> str:
     """Name the geometry type encoded in the first five bytes of a WKB value.
 
@@ -366,17 +370,7 @@ def _log_dropped_geometries(
     staged_rows: int,
     written_rows: int,
 ) -> None:
-    """Warn about features that could not be converted out of the staging file.
-
-    DuckDB's GEOMETRY has no representation for the curve and surface WKB types
-    (CircularString, CompoundCurve, CurvePolygon, …), and no DuckDB function
-    linearises them, so such features cannot cross into GeoParquet at all — the
-    writer drops them rather than failing a national run over a handful of rows.
-    This reports what went missing and how to convert it properly.
-
-    The diagnostic query re-parses every staged geometry, so it only runs when
-    the row counts actually disagree; a clean prepare pays nothing for it.
-    """
+    """Warn about features that could not be converted out of the staging file."""
     dropped = staged_rows - written_rows
     if dropped <= 0:
         return
@@ -417,6 +411,7 @@ def _log_dropped_geometries(
         )
 
 
+# PREPARE DISPATCHERS
 def _prepare_ogr(
     source: OgrSource,
     parquet_path: pathlib.Path,
@@ -424,31 +419,23 @@ def _prepare_ogr(
     force: bool,
     threads: int | None = None,
     memory_limit: str | None = None,
+    columns_sql: str | None = None,
 ) -> pathlib.Path:
-    """Prepare an OGR-readable source (GeoPackage, Shapefile, ...) as GeoParquet.
+    """Prepare an OGR-readable source (GeoPackage, Shapefile, etc) as a
+    hilbert sorted GeoParquet.
 
     The OGR read is staged to a plain Parquet file first, and the Hilbert sort then
-    runs from that staged file rather than directly over ``st_read``. GDAL's
-    GeoPackage driver sits on SQLite and is not reliably thread-safe; driving it
-    from inside a large parallel sorting query segfaults the process (exit 139 on
-    a CI runner) on big national datasets. Staging keeps the GDAL read in the
-    simplest possible statement — a straight scan, no sort, no join — and leaves
-    the expensive part entirely in DuckDB's own formats.
+    runs from that staged file.
 
-    Geometry crosses to the staging file as WKB and is rebuilt afterwards, which
-    is lossless for coordinates; the CRS is restated on the final write.
+    The staging read uses ``keep_wkb=true``.
 
-    The staging read uses ``keep_wkb=true`` so GDAL's bytes land in the file
-    untouched, without DuckDB parsing them into GEOMETRY mid-scan. A single
-    feature of a type DuckDB has no representation for — the curve and surface
-    WKB types, which OS national GeoPackages declare as "Unknown (any)" and do
-    occasionally contain — otherwise aborts the whole scan with "Unsupported
-    geometry type in WKB". Parsing instead happens on the rebuild, per row and
-    under ``TRY``, so those features are dropped (and reported by
-    ``_log_dropped_geometries``) rather than killing the run.
+    Geometry is forced to 2D.
 
-    Geometry is forced to 2D on the way out: this pipeline matches in the plane,
-    and keeping Z/M would mix XY and XYZ geometries in one GeoParquet column.
+    ``columns_sql`` overrides the non-geometry projection, which defaults to every
+    source column but the geometry. It is applied to the *staging* SELECT rather
+    than the rebuild so unwanted columns never reach the staging file at all —
+    ``_prepare_uprn`` uses it to keep only the id, and at 40M+ rows the
+    columns it drops are four doubles per row.
     """
     if _should_skip(parquet_path, force):
         return parquet_path
@@ -460,14 +447,17 @@ def _prepare_ogr(
 
     with _connection(threads, memory_limit) as con:
         info = _read_ogr_info(con, str(source.path))
-        if info["crs"] != source.crs:
+        source_crs = info["crs"]
+        if source_crs is None:
             raise ValueError(
-                f"Expected CRS {source.crs}, got {info['crs']} for {source.path}"
+                f"Could not detect source CRS for {source.path} — cannot verify "
+                f"or transform to expected CRS {source.crs}."
             )
         feature_count = info["feature_count"]
         log.info(
-            "  CRS: %s | features: %s | geometry: %s",
-            info["crs"],
+            "  CRS: %s%s | features: %s | geometry: %s",
+            source_crs,
+            f" → {source.crs}" if source_crs != source.crs else "",
             f"{feature_count:,}" if feature_count >= 0 else "unknown",
             info["geometry_type"],
         )
@@ -475,28 +465,33 @@ def _prepare_ogr(
         src_geom: str = _get_src_geometry_col(con, str(source.path))
         log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
 
+        staged_columns_sql = columns_sql or f'* EXCLUDE "{src_geom}"'
+
         try:
             log.info("  Staging OGR source → %s ...", staged_path)
             con.execute(f"""
                 COPY (
                     SELECT
-                        * EXCLUDE "{src_geom}",
+                        {staged_columns_sql},
                         "{src_geom}" AS _geom_wkb
                     FROM st_read('{_sql_str(source.path)}', keep_wkb=true)
                 ) TO '{_sql_str(staged_path)}'
                 (FORMAT PARQUET, COMPRESSION ZSTD)
             """)
+
             staged_rows: int = pq.read_metadata(str(staged_path)).num_rows
 
             log.info("  Hilbert sort + write → %s ...", parquet_path)
-            # TRY() turns a geometry DuckDB cannot parse into NULL instead of an
-            # error; the outer filter then drops it. The alias can't be used in
-            # its own WHERE, hence the wrapping SELECT.
+
+            # Ensure geometries are 2D only here.
+            geom_expr = _crs_transform_expr(
+                "ST_Force2D(TRY(ST_GeomFromWKB(_geom_wkb)))", source_crs, source.crs
+            )
             core_select_sql = f"""
                 SELECT * FROM (
                     SELECT
                         * EXCLUDE _geom_wkb,
-                        ST_Force2D(TRY(ST_GeomFromWKB(_geom_wkb))) AS geometry
+                        {geom_expr} AS geometry
                     FROM read_parquet('{_sql_str(staged_path)}')
                 )
                 WHERE geometry IS NOT NULL
@@ -522,31 +517,6 @@ def _prepare_ogr(
     return parquet_path
 
 
-def _csv_geometry_sql(source: CsvSource) -> tuple[str, str]:
-    """Return ``(geometry_expr_sql, exclude_cols_sql)`` for building a CsvSource's geometry.
-
-    ``geometry_expr_sql`` is a DuckDB expression producing a GEOMETRY value;
-    ``exclude_cols_sql`` names the raw source column(s) consumed to build it, ready to
-    drop from the output via ``* EXCLUDE (...)``.
-    """
-    # CsvSource.__post_init__ already normalises geometry_type to a real GeometryType
-    # member at construction time; re-wrapping here just re-narrows the static type
-    # (the field itself is typed GeometryType | str to accept plain strings from the
-    # CLI).
-    geometry_type: GeometryType = GeometryType(source.geometry_type)
-    match geometry_type:
-        case GeometryType.POINT:
-            return (
-                f'ST_Point("{source.x_col}", "{source.y_col}")',
-                f'"{source.x_col}", "{source.y_col}"',
-            )
-        case GeometryType.LINE | GeometryType.POLYGON:
-            # CsvSource.__post_init__ guarantees wkt_col is set whenever
-            # geometry_type is LINE/POLYGON.
-            assert source.wkt_col is not None
-            return f'ST_GeomFromText("{source.wkt_col}")', f'"{source.wkt_col}"'
-
-
 def _prepare_csv(
     source: CsvSource,
     parquet_path: pathlib.Path,
@@ -555,6 +525,7 @@ def _prepare_csv(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
+    """Prepare CSV source"""
     if _should_skip(parquet_path, force):
         return parquet_path
 
@@ -562,10 +533,14 @@ def _prepare_csv(
     log.info("Preparing CSV → GeoParquet: %s", source.path)
 
     geom_sql, exclude_sql = _csv_geometry_sql(source)
+    geom_sql = _crs_transform_expr(geom_sql, source.source_crs, source.crs)
     log.info(
-        "  Source geometry: %s → output column: 'geometry' | CRS: %s",
+        "  Source geometry: %s → output column: 'geometry' | CRS: %s%s",
         geom_sql,
-        source.crs,
+        source.source_crs or source.crs,
+        f" → {source.crs}"
+        if source.source_crs and source.source_crs != source.crs
+        else "",
     )
 
     with _connection(threads, memory_limit) as con:
@@ -599,6 +574,7 @@ def _prepare_parquet(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
+    """Pepare a parquet file as a hilbert sorted geoparquet."""
     if _should_skip(parquet_path, force):
         return parquet_path
 
@@ -616,11 +592,7 @@ def _prepare_parquet(
         geom_col = source.geometry_col
         if source.source_crs is not None:
             # Native GEOMETRY column in a foreign CRS — reproject to target CRS.
-            # always_xy=true forces lon/lat (x/y) axis order, overriding PROJ 6+'s
-            # official axis order for EPSG:4326 (which is lat/lon). Without this,
-            # DuckDB interprets the first coordinate as latitude, swapping axes and
-            # producing completely wrong output coordinates.
-            geom_expr = f"ST_Transform({geom_col}, '{_sql_str(source.source_crs)}', '{_sql_str(source.crs)}', always_xy := true)"
+            geom_expr = _crs_transform_expr(geom_col, source.source_crs, source.crs)
         elif geom_col == "geometry":
             # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
             geom_expr = "ST_GeomFromWKB(geometry)"
@@ -629,12 +601,6 @@ def _prepare_parquet(
             geom_expr = geom_col
 
         # Build the EXCLUDE list for the inner SELECT.
-        # For pipeline files (WKB geometry column) also drop the existing bbox so the
-        # outer query can rebuild it against the recomputed geometry.
-        # For external files, detect and drop all other geometry columns from the source
-        # so DuckDB only sees one geometry column in the output — otherwise it may pick
-        # a different column as the GeoParquet primary column and _patch_covering_metadata
-        # will patch the wrong entry, leaving our geometry with the wrong CRS in metadata.
         if geom_col == "geometry" and source.source_crs is None:
             exclude_cols = "geometry, bbox"
         else:
@@ -683,6 +649,10 @@ def _prepare_usrn_buffer(
     Private helper — only reachable with ``source.buffer_m`` set. Call
     ``_prepare_usrn`` instead, which dispatches correctly based on ``source.buffer_m``.
     """
+
+    if not isinstance(source, UsrnSource):
+        raise ValueError("Source is of incorrect type")
+
     if source.buffer_m is None:
         raise ValueError(
             "_prepare_usrn_buffer requires UsrnSource.buffer_m to be set; got None. "
@@ -742,7 +712,7 @@ def _prepare_usrn(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
-    """Dispatch a UsrnSource to plain (centreline) or buffered (corridor) preparation.
+    """Dispatch a UsrnSource to normal or buffered file.
 
     ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable USRN source;
     delegates to ``_prepare_ogr`` via a transient ``OgrSource`` built from the
@@ -751,6 +721,9 @@ def _prepare_usrn(
     ``source.buffer_m`` set — ``source.path`` is an already-prepared USRN centreline
     GeoParquet; delegates to ``_prepare_usrn_buffer`` to build the buffered corridor.
     """
+    if not isinstance(source, UsrnSource):
+        raise ValueError("Source is of incorrect type")
+
     if source.buffer_m is None:
         ogr_source = OgrSource(
             path=source.path, crs=source.crs, row_group_size=source.row_group_size
@@ -763,50 +736,6 @@ def _prepare_usrn(
     )
 
 
-def _prepare_uprn_plain(
-    source: UprnSource,
-    parquet_path: pathlib.Path,
-    name: str,
-    force: bool,
-    threads: int | None = None,
-    memory_limit: str | None = None,
-) -> pathlib.Path:
-    """Prepare a raw OS Open UPRN GeoPackage into a plain address-point GeoParquet.
-
-    Unlike ``UsrnSource``'s plain mode, this can't just delegate to
-    ``_prepare_ogr`` unchanged: the OS Open UPRN source ships an uppercase
-    ``UPRN`` id column, and every other id column in this pipeline is
-    lowercase (``usrn``). This renames it to match on the way in.
-
-    Only ``uprn`` and ``geometry`` are carried through — ``X_COORDINATE``/
-    ``Y_COORDINATE``/``LATITUDE``/``LONGITUDE`` are dropped as redundant with
-    ``geometry`` (same point, two encodings), and at 40M+ rows that's four
-    fewer doubles per row across the whole file.
-    """
-    if _should_skip(parquet_path, force):
-        return parquet_path
-
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Preparing %s from %s", name, source.path)
-
-    with _connection(threads, memory_limit) as con:
-        src_geom: str = _get_src_geometry_col(con, str(source.path))
-        log.info("  Source geometry column: %r → output column: 'geometry'", src_geom)
-        log.info("  Hilbert sort + write → %s ...", parquet_path)
-
-        core_select_sql = f"""
-            SELECT
-                UPRN AS uprn,
-                "{src_geom}" AS geometry
-            FROM st_read('{_sql_str(source.path)}')
-        """
-        elapsed = _write_geoparquet(
-            con, core_select_sql, parquet_path, source.row_group_size, crs=source.crs
-        )
-        _log_prepared(parquet_path, elapsed)
-        return parquet_path
-
-
 def _prepare_uprn_buffer(
     source: UprnSource,
     parquet_path: pathlib.Path,
@@ -815,12 +744,15 @@ def _prepare_uprn_buffer(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
-    """Buffer an already-prepared UPRN point GeoParquet into catchment polygons.
+    """Buffer an already-prepared UPRN point GeoParquet into buffered polygons.
 
     Private helper — only reachable with ``source.buffer_m`` set. Call
     ``_prepare_uprn`` instead, which dispatches correctly based on
     ``source.buffer_m``.
     """
+    if not isinstance(source, UprnSource):
+        raise ValueError("Source is of incorrect type")
+
     if source.buffer_m is None:
         raise ValueError(
             "_prepare_uprn_buffer requires UprnSource.buffer_m to be set; got None. "
@@ -880,18 +812,33 @@ def _prepare_uprn(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
-    """Dispatch a UprnSource to plain (address-point) or buffered (catchment) prep.
+    """Dispatch a UprnSource to normal or buffered file.
 
     ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable UPRN
-    source; delegates to ``_prepare_uprn_plain``.
+    source; delegates to ``_prepare_ogr`` via a transient ``OgrSource`` built from
+    the ``path``/``crs``/``row_group_size`` fields shared by both structs. Only
+    ``uprn`` and ``geometry`` are carried through — the source's uppercase
+    ``UPRN`` id is renamed to match this pipeline's lowercase convention.
 
     ``source.buffer_m`` set — ``source.path`` is an already-prepared plain
     UPRN GeoParquet; delegates to ``_prepare_uprn_buffer`` to build the
     buffered catchment polygons.
     """
+    if not isinstance(source, UprnSource):
+        raise ValueError("Source is of incorrect type")
+
     if source.buffer_m is None:
-        return _prepare_uprn_plain(
-            source, parquet_path, name, force, threads, memory_limit
+        ogr_source = OgrSource(
+            path=source.path, crs=source.crs, row_group_size=source.row_group_size
+        )
+        return _prepare_ogr(
+            ogr_source,
+            parquet_path,
+            name,
+            force,
+            threads,
+            memory_limit,
+            columns_sql="UPRN AS uprn",
         )
     return _prepare_uprn_buffer(
         source, parquet_path, name, force, threads, memory_limit

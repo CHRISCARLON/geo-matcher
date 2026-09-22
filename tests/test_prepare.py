@@ -137,18 +137,68 @@ def test_prepare_geometry_renamed(tiny_gpkg, tmp_path):
     assert "geom" not in schema.names
 
 
-def test_prepare_wrong_crs_raises(tiny_gdf, tmp_path):
-    """ValueError raised when the source CRS doesn't match OgrSource.crs."""
-    wrong_crs_gdf = tiny_gdf.to_crs("EPSG:4326")
-    src_gpkg = tmp_path / "wrong_crs.gpkg"
-    wrong_crs_gdf.to_file(str(src_gpkg), driver="GPKG")
-    out = tmp_path / "wrong_crs.parquet"
+def test_prepare_ogr_reprojects_mismatched_crs(tmp_path):
+    """A source in a different (but detectable) CRS is reprojected to OgrSource.crs."""
+    import duckdb
+
+    # Small boxes near central London, expressed in real-world WGS84 lon/lat —
+    # away from the BNG grid origin, where round-trip transform error is largest.
+    base_lon, base_lat = -0.1276, 51.5074
+    geoms = [
+        box(
+            base_lon + i * 0.001,
+            base_lat + i * 0.001,
+            base_lon + i * 0.001 + 0.0005,
+            base_lat + i * 0.001 + 0.0005,
+        )
+        for i in range(10)
+    ]
+    wgs84_gdf = gpd.GeoDataFrame({"val": range(10), "geometry": geoms}, crs="EPSG:4326")
+    src_gpkg = tmp_path / "wgs84.gpkg"
+    wgs84_gdf.to_file(str(src_gpkg), driver="GPKG")
+    out = tmp_path / "wgs84_27700.parquet"
     cfg = DatasetConfig(
-        name="bad",
+        name="reprojected",
         source=OgrSource(path=src_gpkg, crs="EPSG:27700"),
         parquet_path=out,
     )
-    with pytest.raises(ValueError, match="EPSG:27700"):
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    # Reprojected into the BNG extent around central London (~530000, ~180000),
+    # not left in WGS84 lon/lat degrees (which would be ~ -0.13 / ~51.5).
+    assert 500_000 <= xmin <= 560_000
+    assert 150_000 <= ymin <= 210_000
+
+    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+    crs_meta = geo["columns"]["geometry"].get("crs")
+    assert crs_meta is not None
+    assert "27700" in str(crs_meta)
+
+
+def test_prepare_ogr_undetectable_crs_raises(tiny_gdf, tmp_path, monkeypatch):
+    """ValueError raised when the source CRS cannot be detected at all."""
+    src_gpkg = tmp_path / "tiny.gpkg"
+    tiny_gdf.to_file(str(src_gpkg), driver="GPKG")
+    out = tmp_path / "undetectable.parquet"
+    cfg = DatasetConfig(
+        name="undetectable",
+        source=OgrSource(path=src_gpkg, crs="EPSG:27700"),
+        parquet_path=out,
+    )
+
+    def _fake_read_ogr_info(con, source_path):
+        return {"crs": None, "feature_count": 10, "geometry_type": "Polygon"}
+
+    monkeypatch.setattr(prepare_module, "_read_ogr_info", _fake_read_ogr_info)
+    with pytest.raises(ValueError, match="Could not detect source CRS"):
         prepare(cfg, force=True)
 
 
@@ -496,6 +546,53 @@ def test_prepare_csv_crs_in_metadata(tiny_csv, tmp_path):
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
     assert crs_meta is not None, "CRS should be present in geometry column metadata"
+    assert "27700" in str(crs_meta)
+
+
+@pytest.fixture
+def tiny_lonlat_csv(tmp_path):
+    """10-row CSV with lon/lat coordinate columns in EPSG:4326 (near the UK)."""
+    p = tmp_path / "tiny_lonlat.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "lon", "lat"])
+        writer.writeheader()
+        for i in range(10):
+            writer.writerow({"id": i, "lon": -1.0 + i * 0.01, "lat": 51.0 + i * 0.01})
+    return p
+
+
+def test_prepare_csv_reprojects_source_crs(tiny_lonlat_csv, tmp_path):
+    """A CsvSource.source_crs different from crs is reprojected during prepare()."""
+    import duckdb
+
+    out = tmp_path / "csv_lonlat_27700.parquet"
+    cfg = DatasetConfig(
+        name="lonlat",
+        source=CsvSource(
+            path=tiny_lonlat_csv,
+            x_col="lon",
+            y_col="lat",
+            source_crs="EPSG:4326",
+            crs="EPSG:27700",
+        ),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    assert 0 <= xmin <= 700_000
+    assert 0 <= ymin <= 1_300_000
+
+    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+    crs_meta = geo["columns"]["geometry"].get("crs")
+    assert crs_meta is not None
     assert "27700" in str(crs_meta)
 
 

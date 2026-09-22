@@ -38,7 +38,12 @@ class OgrSource:
 
 @dataclass(frozen=True)
 class CsvSource:
-    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries."""
+    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries.
+
+    If the coordinate/WKT values are in a different CRS than ``crs`` (the target,
+    EPSG:27700 by default), set ``source_crs`` to that CRS; the prepare step will
+    transform to ``crs``.
+    """
 
     path: pathlib.Path
     x_col: str = "Easting"
@@ -47,15 +52,9 @@ class CsvSource:
     wkt_col: str | None = None
     crs: str = "EPSG:27700"
     row_group_size: int = 20_000
+    source_crs: str | None = None
 
     def __post_init__(self) -> None:
-        # Normalise a plain string ("point") into the enum member so downstream
-        # match statements can rely on GeometryType members. object.__setattr__
-        # because the dataclass is frozen. geometry_type is kept as a local (rather
-        # than re-reading self.geometry_type below) because mypy doesn't narrow
-        # through object.__setattr__ — the field's declared type is
-        # `GeometryType | str`, so a later `self.geometry_type.value` would still
-        # be checked against `str`, which has no `.value`.
         geometry_type: GeometryType = GeometryType(self.geometry_type)
         object.__setattr__(self, "geometry_type", geometry_type)
 
@@ -72,7 +71,7 @@ class CsvSource:
 
 @dataclass(frozen=True)
 class ParquetSource:
-    """Existing GeoParquet (or any geometry-bearing Parquet) to re-sort and re-compress.
+    """Existing GeoParquet to re-sort and re-compress.
 
     For files produced by this pipeline the geometry column is always named
     ``"geometry"`` and stored as WKB — the defaults handle that automatically.
