@@ -12,12 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `prepare(..., memory_limit=...)` now actually reaches DuckDB.
 - `prepare_uprn` now follows same dispatch path as `prepare_usrn`.
 
+### Added
+
+- `nadgrids_path` on `OgrSource`/`CsvSource`/`ParquetSource`/`UsrnSource`/
+  `UprnSource` — point at an OS OSTN15 NTv2 `.gsb` grid for accurate
+  transforms into/out of EPSG:27700; without it, DuckDB's default transform
+  can be off by 10m or more, and a warning now says so.
+- DuckDB's compiled PROJ version is logged at the start of every prepare run.
+
 ### Changed
 
 - OGR geometry is forced to 2D on write (`ST_Force2D`).
 - `prepare-uprns` now shares the OGR read path.
 - `prepare-uprns` validates the source CRS.
 - Better handling of non 27700 CRS.
+- All `_prepare_*` dispatchers now share one `_prepare_common` skeleton
+  (should_skip → mkdir → connect → write → log), replacing duplicated
+  per-function logging that had drifted out of sync.
 
 ## [0.1.4] - 2026-09-15
 
