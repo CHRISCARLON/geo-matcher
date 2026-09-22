@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 from . import bboxes
 from .config import (
     AnySource,
@@ -23,8 +25,14 @@ from .join import (
 )
 from .matcher import GeoMatcher
 
+try:
+    __version__ = version("geo-matcher")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
 __all__ = [
     "GeoMatcher",
+    "__version__",
     "AnySource",
     "BBox",
     "CsvSource",
