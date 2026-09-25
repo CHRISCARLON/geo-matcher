@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.5] - 2026-09-25
 
 ### Fixed
 
@@ -38,7 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacing duplicated per-function logging that had drifted out of sync.
 - `_prepare_ogr`/`_prepare_csv`/`_prepare_parquet` now share one
   `_crs_log_desc` helper for their CRS log line and OSTN15 decision.
+- `_prepare_parquet` now always detects/transforms CRS and raises if it
+  can't.
 - Kept only critical tests and deleted redundant ones.
+- Merged `join.py`'s two join dispatchers into one `execute_join`; the public
+  `execute_line_join` is gone, replaced by the exported `LineJoinPhases`.
+- Renamed `_national_single_phase`/`_filtered_single_phase` to
+  `_national_spatial_join`/`_filtered_spatial_join` to describe intent.
+- Extracted `_materialise_national`, deduplicating stream-to-output-or-tempfile
+  logic shared by both `NationalMode` branches.
 
 ## [0.1.4] - 2026-09-15
 
@@ -60,17 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import moved into `GeoMatcher._connect()` and behind `TYPE_CHECKING`.
 - `pyogrio` removed; OGR layer metadata now reads through DuckDB's own GDAL
   (`_read_ogr_info`) instead of a second bundled GDAL.
-
-## [0.1.5] - 2026-09-20
-
-### Changed
-
-- Merged `join.py`'s two join dispatchers into one `execute_join`; the public
-  `execute_line_join` is gone, replaced by the exported `LineJoinPhases`.
-- Renamed `_national_single_phase`/`_filtered_single_phase` to
-  `_national_spatial_join`/`_filtered_spatial_join` to describe intent.
-- Extracted `_materialise_national`, deduplicating stream-to-output-or-tempfile
-  logic shared by both `NationalMode` branches.
 
 ## [0.1.2] - 2026-08-31
 
