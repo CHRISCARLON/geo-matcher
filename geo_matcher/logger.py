@@ -13,13 +13,7 @@ _RESET = "\033[0m"
 
 
 class _ColorFormatter(logging.Formatter):
-    """Colors ``levelname`` by level when writing to a TTY; plain text otherwise.
-
-    Padding (``%(levelname)-8s`` in the old plain formatter) has to be applied
-    to the levelname *before* it's wrapped in ANSI codes — the escape sequence
-    characters would otherwise count toward the field width and break column
-    alignment in the terminal.
-    """
+    """Colors ``levelname`` by level when writing to a TTY; plain text otherwise."""
 
     def __init__(self, *args: object, use_color: bool, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
@@ -38,7 +32,7 @@ class _ColorFormatter(logging.Formatter):
 
 def _get_log_level() -> int:
     """Set the logging level"""
-    level_name = os.getenv("GEO_MATCHER_DEBUG_LEVEL", "INFO").upper()
+    level_name = os.getenv("GEO_MATCHER_DEBUG_LEVEL", "DEBUG").upper()
     level = getattr(logging, level_name, None)
 
     if not isinstance(level, int):

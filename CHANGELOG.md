@@ -11,14 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `prepare(..., memory_limit=...)` now actually reaches DuckDB.
 - `prepare_uprn` now follows same dispatch path as `prepare_usrn`.
+- `_prepare_parquet` re-preparing the pipeline's own output no longer fails
+  with a DuckDB binder error from `ST_GeomFromWKB` rejecting `GEOMETRY`.
 
 ### Added
 
-- `nadgrids_path` on `OgrSource`/`CsvSource`/`ParquetSource`/`UsrnSource`/
-  `UprnSource` — point at an OS OSTN15 NTv2 `.gsb` grid for accurate
-  transforms into/out of EPSG:27700; without it, DuckDB's default transform
-  can be off by 10m or more, and a warning now says so.
+- `nadgrids_path` on every `*Source` — points at an OS OSTN15 NTv2 `.gsb`
+  grid for accurate EPSG:27700 transforms; without it a warning now fires.
 - DuckDB's compiled PROJ version is logged at the start of every prepare run.
+- `_prepare_parquet` now detects external sources' CRS from GeoParquet `geo`
+  metadata, raising if it can't, instead of assuming it matches `target_crs`.
+- `OgrSource`/`CsvSource`/`ParquetSource`: `crs` renamed to `target_crs`,
+  plus a new optional `source_crs` — what you declare the file is in.
+- Prepare auto-detects each source's CRS (file metadata for OGR/Parquet,
+  coordinate extent for CSV) and warns if a declared `source_crs` disagrees.
+- `prepare-gpkg` gained `--crs`/`--source-crs` CLI flags (previously only on
+  `prepare-csv`/`prepare-parquet`), so GPKG sources can use both from the CLI.
 
 ### Changed
 
@@ -26,9 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `prepare-uprns` now shares the OGR read path.
 - `prepare-uprns` validates the source CRS.
 - Better handling of non 27700 CRS.
-- All `_prepare_*` dispatchers now share one `_prepare_common` skeleton
-  (should_skip → mkdir → connect → write → log), replacing duplicated
-  per-function logging that had drifted out of sync.
+- All `_prepare_*` dispatchers now share one `_prepare_common` skeleton,
+  replacing duplicated per-function logging that had drifted out of sync.
+- `_prepare_ogr`/`_prepare_csv`/`_prepare_parquet` now share one
+  `_crs_log_desc` helper for their CRS log line and OSTN15 decision.
+- Kept only critical tests and deleted redundant ones.
 
 ## [0.1.4] - 2026-09-15
 
@@ -88,9 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corridors for line joins).
 - UPRN preparation: `prepare-uprns` and `prepare-uprns-buffer` (buffered
   catchment polygons).
-- Prepare pipeline for arbitrary RHS datasets (`prepare-gpkg`, `prepare-csv`,
-  `prepare-parquet`) — all output Hilbert-sorted, ZSTD GeoParquet 1.1 with a
-  `bbox` covering column.
+- Prepare pipeline for arbitrary RHS datasets (`prepare-gpkg/-csv/-parquet`)
+  — Hilbert-sorted, ZSTD GeoParquet 1.1 with a `bbox` covering column.
 - Spatial joins via `match`: USRN polygon/point/line joins and the UPRN
   polygon join, each with `FilteredMode` and `NationalMode` execution.
 - CLI (`geo-matcher`) and Python API (`GeoMatcher`, `DatasetConfig`,

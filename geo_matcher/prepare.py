@@ -30,56 +30,20 @@ log: logging.Logger = get_logger()
 # so spatially nearby features get consecutive indices and land in the same row groups.
 # Shared by every _prepare_* writer (via _write_geoparquet) as the ORDER BY envelope.
 _BNG_BOX = "{'min_x': 0.0, 'min_y': 0.0, 'max_x': 700000.0, 'max_y': 1300000.0}::BOX_2D"
+_BNG_EPSG = "EPSG:27700"
+_OGC_CRS84 = (
+    "OGC:CRS84"  # GeoParquet spec's default CRS when a column entry omits "crs"
+)
+_BNG_PROJ4_TEMPLATE = (
+    "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 "
+    "+ellps=airy +units=m +no_defs +nadgrids={nadgrids_path} +type=crs"
+)
 
-
-def _sql_str(value: object) -> str:
-    """Escape a value for safe interpolation inside a single-quoted SQL string literal.
-
-    DuckDB paths/CRS strings are inlined into SQL (no parameter binding in ``COPY``
-    statements), so a value containing ``'`` would otherwise break or inject the query.
-    """
-    return str(value).replace("'", "''")
-
-
-class _CoveringColumn(TypedDict):
-    xmin: list[str]
-    ymin: list[str]
-    xmax: list[str]
-    ymax: list[str]
-
-
-class _Covering(TypedDict):
-    bbox: _CoveringColumn
-
-
-class _GeomColumnMeta(TypedDict, total=False):
-    encoding: str
-    geometry_types: list[str]
-    crs: dict[str, Any]
-    covering: _Covering
-
-
-class _GeoMeta(TypedDict):
-    version: str
-    primary_column: str
-    columns: dict[str, _GeomColumnMeta]
-
-
-class _OgrInfo(TypedDict):
-    crs: str | None
-    feature_count: int
-    geometry_type: str
-
-
-_EXPECTED_COVERING_METADATA: _Covering = {
-    "bbox": {
-        "xmin": ["bbox", "xmin"],
-        "ymin": ["bbox", "ymin"],
-        "xmax": ["bbox", "xmax"],
-        "ymax": ["bbox", "ymax"],
-    }
-}
-
+_LONLAT_EPSG = "EPSG:4326"
+# GB + NI lon/lat envelope, used by _detect_csv_crs. Tight on purpose so
+# small-magnitude local/planar coordinates (e.g. toy test data near the
+# origin) aren't misread as WGS84.
+_GB_LONLAT_ENVELOPE = "ST_MakeEnvelope(-9.0, 49.5, 2.5, 61.0)"
 
 _WKB_TYPE_NAMES: dict[int, str] = {
     1: "Point",
@@ -102,25 +66,66 @@ _WKB_TYPE_NAMES: dict[int, str] = {
 }
 
 
+class _CoveringColumn(TypedDict):
+    xmin: list[str]
+    ymin: list[str]
+    xmax: list[str]
+    ymax: list[str]
+
+
+class _Covering(TypedDict):
+    bbox: _CoveringColumn
+
+
+_EXPECTED_COVERING_METADATA: _Covering = {
+    "bbox": {
+        "xmin": ["bbox", "xmin"],
+        "ymin": ["bbox", "ymin"],
+        "xmax": ["bbox", "xmax"],
+        "ymax": ["bbox", "ymax"],
+    }
+}
+
+
+class _GeomColumnMeta(TypedDict, total=False):
+    encoding: str
+    geometry_types: list[str]
+    crs: dict[str, Any]
+    covering: _Covering
+
+
+class _GeoMeta(TypedDict):
+    version: str
+    primary_column: str
+    columns: dict[str, _GeomColumnMeta]
+
+
+class _OgrInfo(TypedDict):
+    crs: str | None
+    feature_count: int
+    geometry_type: str
+
+
 # HELPERS
+def _sql_str(value: object) -> str:
+    """Escape a value for safe interpolation inside a single-quoted SQL string literal.
+
+    DuckDB paths/CRS strings are inlined into SQL (no parameter binding in ``COPY``
+    statements), so a value containing ``'`` would otherwise break or inject the query.
+    """
+    return str(value).replace("'", "''")
+
+
 def _patch_covering_metadata(
     path: pathlib.Path,
     row_group_size: int,
     crs: str | None = None,
     primary_column: str | None = None,
 ) -> None:
-    """Patch a GeoParquet file's geo metadata to add the GeoParquet 1.1 covering key.
-
-    DuckDB writes GeoParquet 1.0.0 metadata (no covering key, no CRS) when using
-    ``COPY ... TO ... (FORMAT PARQUET)``.  This function:
-
-    - Upgrades ``version`` to ``"1.1.0"``
-    - Adds the ``covering`` key pointing at the ``bbox`` struct column
-      (which DuckDB already wrote into the file via SQL)
-    - Optionally patches the CRS PROJJSON into the geometry column metadata
-      (always needed for DuckDB-written files; ``write_geoparquet``.
-    - Normalises ``Utf8View`` → ``Utf8`` for downstream compatibility
-    - Rewrites the file in-place with ZSTD compression
+    """Patch a GeoParquet file's metadata to add the GeoParquet 1.1 covering key,
+    the CRS, and normalised types — DuckDB's own ``COPY ... TO ... (FORMAT
+    PARQUET)`` writes plain 1.0.0 metadata with neither. Rewrites the file
+    in-place with ZSTD compression.
     """
     # Read the data in here
     table = pq.read_table(str(path))
@@ -181,10 +186,6 @@ def _csv_geometry_sql(source: CsvSource) -> tuple[str, str]:
     ``exclude_cols_sql`` names the raw source column(s) consumed to build it, ready to
     drop from the output via ``* EXCLUDE (...)``.
     """
-    # CsvSource.__post_init__ already normalises geometry_type to a real GeometryType
-    # member at construction time; re-wrapping here just re-narrows the static type
-    # (the field itself is typed GeometryType | str to accept plain strings from the
-    # CLI).
     geometry_type: GeometryType = GeometryType(source.geometry_type)
     match geometry_type:
         case GeometryType.POINT:
@@ -193,8 +194,6 @@ def _csv_geometry_sql(source: CsvSource) -> tuple[str, str]:
                 f'"{source.x_col}", "{source.y_col}"',
             )
         case GeometryType.LINE | GeometryType.POLYGON:
-            # CsvSource.__post_init__ guarantees wkt_col is set whenever
-            # geometry_type is LINE/POLYGON.
             assert source.wkt_col is not None
             return f'ST_GeomFromText("{source.wkt_col}")', f'"{source.wkt_col}"'
 
@@ -236,18 +235,19 @@ def _connection(
 
 
 def _read_ogr_info(con: duckdb.DuckDBPyConnection, source_path: str) -> _OgrInfo:
-    """Read layer metadata for an OGR source using DuckDB's own GDAL."""
+    """Read layer metadata for an OGR source using DuckDB."""
     rows = con.execute(f"""
         SELECT
-            l.feature_count,
-            g.type,
-            g.crs.auth_name,
-            g.crs.auth_code
+            layer.feature_count,
+            geo.type,
+            geo.crs.auth_name,
+            geo.crs.auth_code
         FROM st_read_meta('{_sql_str(source_path)}'),
-             UNNEST(layers) AS _(l),
-             UNNEST(l.geometry_fields) AS __(g)
+             UNNEST(layers) AS _(layer),
+             UNNEST(layer.geometry_fields) AS __(geo)
         LIMIT 1
     """).fetchall()
+    log.debug(f"OGR metadata fields: {rows}")
     if not rows:
         raise ValueError(f"No layers with geometry found in {source_path!r}")
 
@@ -260,8 +260,65 @@ def _read_ogr_info(con: duckdb.DuckDBPyConnection, source_path: str) -> _OgrInfo
     }
 
 
+def _read_parquet_geo_crs(
+    schema_metadata: dict[bytes, bytes] | None, geom_col: str
+) -> str | None:
+    """Read a GeoParquet file's declared CRS for ``geom_col`` from its ``geo``
+    metadata — the Parquet-side analogue of ``_read_ogr_info``'s CRS detection.
+
+    Returns ``None`` if there's no ``geo`` metadata or ``geom_col`` isn't listed.
+    Returns ``"OGC:CRS84"`` (the GeoParquet spec's default) if listed but the
+    entry omits ``crs``. Otherwise resolves the embedded PROJJSON to
+    ``"AUTHORITY:CODE"``, or its WKT if no authority code exists.
+    """
+    if not schema_metadata or b"geo" not in schema_metadata:
+        return None
+    geo_meta: _GeoMeta = json.loads(schema_metadata[b"geo"])
+    col_meta = geo_meta.get("columns", {}).get(geom_col)
+    if col_meta is None:
+        return None
+    crs_json = col_meta.get("crs")
+    if crs_json is None:
+        return _OGC_CRS84
+    crs = ProjCRS.from_json_dict(crs_json)
+    authority = crs.to_authority()
+    return f"{authority[0]}:{authority[1]}" if authority else crs.to_wkt()
+
+
+def _detect_csv_crs(
+    con: duckdb.DuckDBPyConnection, source: CsvSource, geom_sql: str
+) -> str | None:
+    """Best-effort CRS detection for a CSV/WKT source, from coordinate extent.
+
+    CSVs carry no CRS metadata, but WGS84 lon/lat and British National Grid
+    eastings/northings occupy distinct areas over Great Britain, so testing
+    the data's own extent against each candidate envelope directly in DuckDB
+    is usually enough to tell them apart.
+    """
+
+    row = con.sql(f"""
+        SELECT
+            ST_Within(ST_Extent_Agg(g), {_GB_LONLAT_ENVELOPE}),
+            ST_Within(ST_Extent_Agg(g), {_BNG_BOX}::GEOMETRY)
+        FROM (
+            SELECT {geom_sql} AS g
+            FROM read_csv('{_sql_str(source.path)}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
+        ) WHERE g IS NOT NULL
+    """).fetchone()
+    if row is None:
+        return None
+    is_lonlat, is_bng = row
+    if is_lonlat:
+        log.debug(f"CSV is: {_LONLAT_EPSG}")
+        return _LONLAT_EPSG
+    if is_bng:
+        log.debug(f"CSV is: {_BNG_EPSG}")
+        return _BNG_EPSG
+    return None
+
+
 def _bbox_struct_sql(geom_col: str = "geometry") -> str:
-    """Return the ``{'xmin': ..., ...} AS bbox``-ready struct expression for ``geom_col``."""
+    """Return the ``{'xmin': ..., ...} AS bbox`` ready struct expression for ``geom_col``."""
     return (
         "{"
         f"'xmin': ST_XMin({geom_col}), 'ymin': ST_YMin({geom_col}), "
@@ -270,23 +327,13 @@ def _bbox_struct_sql(geom_col: str = "geometry") -> str:
     )
 
 
-_BNG_EPSG = "EPSG:27700"
-_BNG_PROJ4_TEMPLATE = (
-    "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 "
-    "+ellps=airy +units=m +no_defs +nadgrids={nadgrids_path} +type=crs"
-)
-
-
 def _crs_arg(crs: str, nadgrids_path: pathlib.Path | None) -> str:
     """Return the CRS argument to hand ``ST_Transform`` for ``crs``.
 
-    Plain EPSG codes go through DuckDB's own default coordinate operation
-    search, which DuckDB's docs say can be off by "about 10m and possibly much
-    more" for EPSG:27700. The only way to get OSTN15/NTv2 accuracy is to embed
-    a ``+nadgrids=`` PROJ4 pipeline directly, in place of the plain EPSG code —
-    there's no "grid installed" state to detect instead (DuckDB vendors its own
-    static PROJ, separate from any system/pyproj install, and exposes no way to
-    query its operation/grid choice).
+    Plain EPSG:27700 goes through DuckDB's default coordinate operation, which
+    can be off by 10m or more. The only way to get OSTN15/NTv2 accuracy is to
+    embed a ``+nadgrids=`` PROJ4 pipeline in place of the EPSG code — DuckDB
+    exposes no "grid installed" state to detect instead.
     """
     if nadgrids_path is not None and crs.upper() == _BNG_EPSG:
         if not nadgrids_path.exists():
@@ -309,10 +356,8 @@ def _crs_transform_expr(
     nadgrids_path: pathlib.Path | None = None,
 ) -> str:
     """Wrap ``geom_expr`` in ``ST_Transform`` if ``source_crs`` is set and differs
-    from ``target_crs``; otherwise return it unchanged.
-
-    ``always_xy=true`` forces lon/lat (x/y) axis order, matching the one existing
-    transform call this generalises (formerly inline in ``_prepare_parquet``).
+    from ``target_crs``; otherwise return it unchanged. ``always_xy=true`` forces
+    lon/lat (x/y) axis order.
     """
     if source_crs is None or source_crs == target_crs:
         return geom_expr
@@ -327,15 +372,7 @@ def _crs_transform_expr(
 def _crs_transform_note(
     source_crs: str | None, target_crs: str, nadgrids_path: pathlib.Path | None
 ) -> str:
-    """Flag, deterministically, whether this transform has an OSTN15/NTv2 grid
-    configured — not by querying any PROJ library (DuckDB vendors its own,
-    separate from pyproj's; neither exposes operation/grid introspection), but
-    from the plain fact of whether ``nadgrids_path`` was set for a transform
-    touching EPSG:27700 (see ``_crs_arg``).
-
-    Returns a short suffix for the caller's CRS log line; ``""`` if no
-    transform is needed or it doesn't touch EPSG:27700.
-    """
+    """Flag whether this transform has an OSTN15/NTv2 grid configured."""
     if source_crs is None or source_crs == target_crs:
         return ""
     if _BNG_EPSG not in (source_crs.upper(), target_crs.upper()):
@@ -356,6 +393,58 @@ def _crs_transform_note(
     return " [no OSTN15 grid configured]"
 
 
+def _crs_equal(crs_a: str, crs_b: str) -> bool:
+    """Compare two CRS strings for equivalence, tolerant of differing forms
+    (``"EPSG:27700"`` vs ``"27700"`` vs WKT).
+
+    Falls back to a case-insensitive string comparison if either value can't
+    be parsed by pyproj — ``_read_parquet_geo_crs`` can return raw WKT for a
+    CRS with no authority code.
+    """
+    try:
+        return ProjCRS.from_user_input(crs_a) == ProjCRS.from_user_input(crs_b)
+    except Exception:
+        return crs_a.strip().upper() == crs_b.strip().upper()
+
+
+def _warn_crs_mismatch(
+    declared_crs: str | None, detected_crs: str, source_path: pathlib.Path
+) -> None:
+    """Warn when a user-declared ``source_crs`` disagrees with the CRS actually
+    detected in the file. The detected CRS always wins for the transform —
+    this only flags the disagreement.
+    """
+    if declared_crs is None or _crs_equal(declared_crs, detected_crs):
+        return
+    log.warning(
+        "  %s: declared source_crs=%s but detected %s from the file — using "
+        "the detected CRS for the transform (declared value ignored).",
+        source_path,
+        declared_crs,
+        detected_crs,
+    )
+
+
+def _crs_log_desc(
+    source_crs: str | None,
+    target_crs: str,
+    nadgrids_path: pathlib.Path | None,
+    verb: str,
+) -> str:
+    """Build the CRS clause shared by every ``_prepare_*`` dispatcher's log line.
+
+    Returns ``target_crs`` unchanged when no transform will happen; otherwise
+    ``"<verb> <source_crs> → target <target_crs>[OSTN15 note]"``, via
+    ``_crs_transform_note`` for the bracketed suffix.
+    """
+    if source_crs is None or source_crs == target_crs:
+        return target_crs
+    return (
+        f"{verb} {source_crs} → target {target_crs}"
+        f"{_crs_transform_note(source_crs, target_crs, nadgrids_path)}"
+    )
+
+
 def _write_geoparquet(
     con: duckdb.DuckDBPyConnection,
     core_select_sql: str,
@@ -364,13 +453,11 @@ def _write_geoparquet(
     crs: str | None = None,
     primary_column: str | None = None,
 ) -> float:
-    """Wrap ``core_select_sql`` with the bbox covering struct + Hilbert sort, write it
-    out as GeoParquet, and patch the covering/CRS metadata.
+    """Wrap ``core_select_sql`` with the bbox covering struct + Hilbert sort, write
+    it as GeoParquet, and patch the covering/CRS metadata.
 
-    ``core_select_sql`` must be a full ``SELECT ...`` statement that already produces
-    a materialised ``geometry`` column — this function only adds the bbox struct
-    (computed once, against that materialised column) and the ``ORDER BY
-    ST_Hilbert(...)`` envelope around it.
+    ``core_select_sql`` must already produce a materialised ``geometry`` column —
+    this only adds the bbox struct and ``ORDER BY ST_Hilbert(...)`` around it.
     """
     copy_sql = f"""
         COPY (
@@ -484,7 +571,7 @@ def _log_dropped_geometries(
 
 
 @dataclass
-class _PreparedOutput:
+class _StagedOutput:
     """What a ``_prepare_*`` dispatcher's ``build(con)`` closure hands back to
     ``_prepare_common`` to finish the job."""
 
@@ -496,12 +583,7 @@ class _PreparedOutput:
 
 
 def _log_duckdb_proj_version(con: duckdb.DuckDBPyConnection) -> None:
-    """Log the PROJ version DuckDB's spatial extension is actually compiled
-    against — separate from, and not necessarily the same as, any system or
-    pyproj-bundled PROJ (see ``_crs_arg``/``_crs_transform_note``, which had to
-    stop assuming those match). Logged once per prepare run so a divergence
-    between environments is visible without having to query it manually.
-    """
+    """Log the PROJ version DuckDB's spatial extension is using"""
     row = con.sql("SELECT DuckDB_PROJ_Compiled_Version()").fetchone()
     log.info("  DuckDB PROJ: %s", row[0] if row else "unknown")
 
@@ -511,16 +593,14 @@ def _prepare_common(
     force: bool,
     threads: int | None,
     memory_limit: str | None,
-    build: Callable[[duckdb.DuckDBPyConnection], _PreparedOutput],
+    build: Callable[[duckdb.DuckDBPyConnection], _StagedOutput],
 ) -> pathlib.Path:
     """Shared skeleton every ``_prepare_*`` dispatcher follows: should_skip -> mkdir
     -> open connection -> build() the source-specific SELECT -> write -> log -> return.
 
-    ``build`` does everything source-specific — reading/validating source metadata,
-    logging what it found, and returning the ``core_select_sql`` (+ ``crs``/
-    ``primary_column`` for ``_write_geoparquet``, + an optional ``post_write`` hook
-    for diagnostics that must run after the file is written, e.g. OGR's
-    dropped-geometry report).
+    ``build`` returns ``core_select_sql`` plus ``crs``/``primary_column`` for
+    ``_write_geoparquet``, and an optional ``post_write`` hook for diagnostics
+    that must run after the file is written (e.g. OGR's dropped-geometry report).
     """
     if _should_skip(parquet_path, force):
         return parquet_path
@@ -553,36 +633,28 @@ def _prepare_ogr(
     columns_sql: str | None = None,
 ) -> pathlib.Path:
     """Prepare an OGR-readable source (GeoPackage, Shapefile, etc) as a
-    hilbert sorted GeoParquet.
+    Hilbert-sorted GeoParquet: staged to a plain Parquet file first
+    (``keep_wkb=true``), then Hilbert-sorted with geometry forced to 2D.
 
-    The OGR read is staged to a plain Parquet file first and then is hilbert sorted.
-
-    The staging read uses ``keep_wkb=true``.
-
-    Geometry is forced to 2D.
-
-    ``columns_sql`` overrides the non-geometry projection, which defaults to every
-    source column but the geometry. It is applied to the *staging* SELECT rather
-    than the rebuild so unwanted columns never reach the staging file at all —
-    ``_prepare_uprn`` uses it to keep only the id, and at 40M+ rows the
-    columns it drops are four doubles per row.
+    ``columns_sql`` overrides the non-geometry projection (default: every
+    source column but geometry), applied to the staging SELECT so unwanted
+    columns never reach the staging file — ``_prepare_uprn`` uses this to
+    keep only the id, dropping four doubles per row at 40M+ rows.
     """
     staged_path = parquet_path.with_name(f"{parquet_path.stem}.staging.parquet")
 
-    def build(con: duckdb.DuckDBPyConnection) -> _PreparedOutput:
+    def build(con: duckdb.DuckDBPyConnection) -> _StagedOutput:
         info = _read_ogr_info(con, str(source.path))
         detected_crs = info["crs"]
         if detected_crs is None:
             raise ValueError(
                 f"Could not detect source CRS for {source.path} — cannot verify "
-                f"or transform to expected CRS {source.crs}."
+                f"or transform to expected CRS {source.target_crs}."
             )
+        _warn_crs_mismatch(source.source_crs, detected_crs, source.path)
         feature_count = info["feature_count"]
-        crs_desc = (
-            detected_crs
-            if detected_crs == source.crs
-            else f"detected {detected_crs} → target {source.crs}"
-            f"{_crs_transform_note(detected_crs, source.crs, source.nadgrids_path)}"
+        crs_desc = _crs_log_desc(
+            detected_crs, source.target_crs, source.nadgrids_path, verb="detected"
         )
         log.info(
             "  CRS: %s | features: %s | geometry: %s",
@@ -612,7 +684,7 @@ def _prepare_ogr(
         geom_expr = _crs_transform_expr(
             "ST_Force2D(TRY(ST_GeomFromWKB(_geom_wkb)))",
             detected_crs,
-            source.crs,
+            source.target_crs,
             source.nadgrids_path,
         )
         core_select_sql = f"""
@@ -634,10 +706,10 @@ def _prepare_ogr(
                 pq.read_metadata(str(parquet_path)).num_rows,
             )
 
-        return _PreparedOutput(
+        return _StagedOutput(
             core_select_sql,
             source.row_group_size,
-            crs=source.crs,
+            crs=source.target_crs,
             post_write=post_write,
         )
 
@@ -657,16 +729,20 @@ def _prepare_csv(
 ) -> pathlib.Path:
     """Prepare CSV source"""
 
-    def build(con: duckdb.DuckDBPyConnection) -> _PreparedOutput:
+    def build(con: duckdb.DuckDBPyConnection) -> _StagedOutput:
         geom_sql, exclude_sql = _csv_geometry_sql(source)
+        detected_crs = _detect_csv_crs(con, source, geom_sql)
+        if detected_crs is not None:
+            _warn_crs_mismatch(source.source_crs, detected_crs, source.path)
+        effective_crs = detected_crs if detected_crs is not None else source.source_crs
         geom_sql = _crs_transform_expr(
-            geom_sql, source.source_crs, source.crs, source.nadgrids_path
+            geom_sql, effective_crs, source.target_crs, source.nadgrids_path
         )
-        crs_desc = (
-            source.crs
-            if not source.source_crs or source.source_crs == source.crs
-            else f"declared {source.source_crs} → target {source.crs}"
-            f"{_crs_transform_note(source.source_crs, source.crs, source.nadgrids_path)}"
+        crs_desc = _crs_log_desc(
+            effective_crs,
+            source.target_crs,
+            source.nadgrids_path,
+            verb="detected" if detected_crs is not None else "declared",
         )
         log.info(
             "  Source geometry: %s → output column: 'geometry' | CRS: %s",
@@ -681,15 +757,15 @@ def _prepare_csv(
         log.info("  Rows: %s", f"{row_count:,}")
         log.info("  Hilbert sort + write → %s ...", parquet_path)
 
-        # A subquery materialises the geometry column so the outer bbox struct and
-        # ORDER BY can reference it by name without repeating the geometry expression.
         core_select_sql = f"""
             SELECT
                 * EXCLUDE ({exclude_sql}),
                 {geom_sql} AS geometry
             FROM read_csv('{_sql_str(source.path)}', auto_detect=true, null_padding=true, nullstr=['NULL', ''])
         """
-        return _PreparedOutput(core_select_sql, source.row_group_size, crs=source.crs)
+        return _StagedOutput(
+            core_select_sql, source.row_group_size, crs=source.target_crs
+        )
 
     return _prepare_common(parquet_path, force, threads, memory_limit, build)
 
@@ -702,9 +778,9 @@ def _prepare_parquet(
     threads: int | None = None,
     memory_limit: str | None = None,
 ) -> pathlib.Path:
-    """Pepare a parquet file as a hilbert sorted geoparquet."""
+    """Prepare a Parquet file as a Hilbert-sorted GeoParquet."""
 
-    def build(con: duckdb.DuckDBPyConnection) -> _PreparedOutput:
+    def build(con: duckdb.DuckDBPyConnection) -> _StagedOutput:
         pq_src_meta = pq.read_metadata(str(source.path))
         log.info(
             "  Source: %s rows | %d row groups",
@@ -713,46 +789,45 @@ def _prepare_parquet(
         )
 
         geom_col = source.geometry_col
-        if source.source_crs is not None:
-            # Native GEOMETRY column in a foreign CRS — reproject to target CRS.
-            geom_expr = _crs_transform_expr(
-                geom_col, source.source_crs, source.crs, source.nadgrids_path
-            )
-            log.info(
-                "  CRS: declared %s → target %s%s",
-                source.source_crs,
-                source.crs,
-                _crs_transform_note(
-                    source.source_crs, source.crs, source.nadgrids_path
-                ),
-            )
-        elif geom_col == "geometry":
-            # WKB blob written by this pipeline — must promote to GEOMETRY explicitly.
-            geom_expr = "ST_GeomFromWKB(geometry)"
-        else:
-            # Native GEOMETRY column already in the target CRS (no reprojection needed).
-            geom_expr = geom_col
 
-        # Build the EXCLUDE list for the inner SELECT.
-        if geom_col == "geometry" and source.source_crs is None:
-            exclude_cols = "geometry, bbox"
-        else:
-            src_describe = con.sql(
-                f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
-            ).fetchall()
-            src_col_names = {row[0] for row in src_describe}
-            extra_geom_cols = [
-                row[0]
-                for row in src_describe
-                if "GEOMETRY" in row[1].upper() and row[0] != geom_col
-            ]
-            cols_to_exclude = [geom_col] + extra_geom_cols
-            if "bbox" in src_col_names:
-                cols_to_exclude.append("bbox")
-            exclude_cols = ", ".join(f'"{c}"' for c in cols_to_exclude)
-            if extra_geom_cols:
-                log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
+        detected_crs = _read_parquet_geo_crs(pq_src_meta.metadata, geom_col)
+        if detected_crs is None:
+            raise ValueError(
+                f"Could not detect source CRS for column {geom_col!r} in "
+                f"{source.path} (no GeoParquet 'geo' metadata found) — cannot "
+                f"verify or transform to expected CRS {source.target_crs}."
+            )
 
+        src_describe = con.sql(
+            f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
+        ).fetchall()
+        src_col_types = {row[0]: row[1] for row in src_describe}
+        already_geometry_typed = "GEOMETRY" in src_col_types[geom_col].upper()
+        extra_geom_cols = [
+            name
+            for name, typ in src_col_types.items()
+            if "GEOMETRY" in typ.upper() and name != geom_col
+        ]
+        cols_to_exclude = [geom_col] + extra_geom_cols
+        if "bbox" in src_col_types:
+            cols_to_exclude.append("bbox")
+        exclude_cols = ", ".join(f'"{c}"' for c in cols_to_exclude)
+        if extra_geom_cols:
+            log.info("  Excluding extra geometry columns: %s", extra_geom_cols)
+        geom_expr = (
+            geom_col if already_geometry_typed else f"ST_GeomFromWKB({geom_col})"
+        )
+
+        _warn_crs_mismatch(source.source_crs, detected_crs, source.path)
+        geom_expr = _crs_transform_expr(
+            geom_expr, detected_crs, source.target_crs, source.nadgrids_path
+        )
+        log.info(
+            "  CRS: %s",
+            _crs_log_desc(
+                detected_crs, source.target_crs, source.nadgrids_path, verb="detected"
+            ),
+        )
         log.info("  Source geometry column: %r → output column: 'geometry'", geom_col)
         log.info("  Hilbert sort + write → %s ...", parquet_path)
 
@@ -762,7 +837,9 @@ def _prepare_parquet(
                 {geom_expr} AS geometry
             FROM read_parquet('{_sql_str(source.path)}')
         """
-        return _PreparedOutput(core_select_sql, source.row_group_size, crs=source.crs)
+        return _StagedOutput(
+            core_select_sql, source.row_group_size, crs=source.target_crs
+        )
 
     return _prepare_common(parquet_path, force, threads, memory_limit, build)
 
@@ -791,7 +868,7 @@ def _prepare_usrn_buffer(
             "OGR path when buffer_m is None."
         )
 
-    def build(con: duckdb.DuckDBPyConnection) -> _PreparedOutput:
+    def build(con: duckdb.DuckDBPyConnection) -> _StagedOutput:
         pq_src = pq.read_metadata(str(source.path))
         log.info(
             "  Source: %s rows | %d row groups",
@@ -815,7 +892,7 @@ def _prepare_usrn_buffer(
                 ST_Buffer(geometry, {source.buffer_m}) AS geometry
             FROM read_parquet('{_sql_str(source.path)}')
         """
-        return _PreparedOutput(
+        return _StagedOutput(
             core_select_sql,
             source.row_group_size,
             crs=source.crs,
@@ -835,20 +912,19 @@ def _prepare_usrn(
 ) -> pathlib.Path:
     """Dispatch a UsrnSource to normal or buffered file.
 
-    ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable USRN source;
-    delegates to ``_prepare_ogr`` via a transient ``OgrSource`` built from the
-    ``path``/``crs``/``row_group_size`` fields shared by both structs.
-
-    ``source.buffer_m`` set — ``source.path`` is an already-prepared USRN centreline
-    GeoParquet; delegates to ``_prepare_usrn_buffer`` to build the buffered corridor.
+    ``buffer_m is None`` — raw OGR-readable USRN source; delegates to
+    ``_prepare_ogr`` via a transient ``OgrSource``. ``buffer_m`` set —
+    already-prepared USRN centreline GeoParquet; delegates to
+    ``_prepare_usrn_buffer`` to build the buffered corridor.
     """
+
     if not isinstance(source, UsrnSource):
         raise ValueError("Source is of incorrect type")
 
     if source.buffer_m is None:
         ogr_source = OgrSource(
             path=source.path,
-            crs=source.crs,
+            target_crs=source.crs,
             row_group_size=source.row_group_size,
             nadgrids_path=source.nadgrids_path,
         )
@@ -884,7 +960,7 @@ def _prepare_uprn_buffer(
             "OGR-derived path when buffer_m is None."
         )
 
-    def build(con: duckdb.DuckDBPyConnection) -> _PreparedOutput:
+    def build(con: duckdb.DuckDBPyConnection) -> _StagedOutput:
         pq_src = pq.read_metadata(str(source.path))
         log.info(
             "  Source: %s rows | %d row groups",
@@ -908,7 +984,7 @@ def _prepare_uprn_buffer(
                 ST_Buffer(geometry, {source.buffer_m}) AS geometry
             FROM read_parquet('{_sql_str(source.path)}')
         """
-        return _PreparedOutput(
+        return _StagedOutput(
             core_select_sql,
             source.row_group_size,
             crs=source.crs,
@@ -928,15 +1004,11 @@ def _prepare_uprn(
 ) -> pathlib.Path:
     """Dispatch a UprnSource to normal or buffered file.
 
-    ``source.buffer_m is None`` — ``source.path`` is a raw OGR-readable UPRN
-    source; delegates to ``_prepare_ogr`` via a transient ``OgrSource`` built from
-    the ``path``/``crs``/``row_group_size`` fields shared by both structs. Only
-    ``uprn`` and ``geometry`` are carried through — the source's uppercase
-    ``UPRN`` id is renamed to match this pipeline's lowercase convention.
-
-    ``source.buffer_m`` set — ``source.path`` is an already-prepared plain
-    UPRN GeoParquet; delegates to ``_prepare_uprn_buffer`` to build the
-    buffered catchment polygons.
+    ``buffer_m is None`` — raw OGR-readable UPRN source; delegates to
+    ``_prepare_ogr`` via a transient ``OgrSource``, keeping only ``uprn``
+    (renamed from the source's uppercase ``UPRN``) and ``geometry``.
+    ``buffer_m`` set — already-prepared UPRN GeoParquet; delegates to
+    ``_prepare_uprn_buffer`` to build the buffered catchment polygons.
     """
     if not isinstance(source, UprnSource):
         raise ValueError("Source is of incorrect type")
@@ -944,7 +1016,7 @@ def _prepare_uprn(
     if source.buffer_m is None:
         ogr_source = OgrSource(
             path=source.path,
-            crs=source.crs,
+            target_crs=source.crs,
             row_group_size=source.row_group_size,
             nadgrids_path=source.nadgrids_path,
         )
@@ -970,35 +1042,29 @@ def prepare(
 ) -> pathlib.Path:
     """Read a spatial data source and write an optimised GeoParquet 1.1 file.
 
-    Dispatches to the correct reader based on ``config.source`` type:
+    Dispatches on ``config.source`` type:
 
     - ``OgrSource`` — any GDAL-readable vector format (GeoPackage, Shapefile, …)
     - ``CsvSource`` — CSV with explicit x/y coordinate columns, or a WKT text column
     - ``ParquetSource`` — existing GeoParquet to re-sort and re-compress
-    - ``UsrnSource`` — USRN prep: plain centrelines (``buffer_m=None``) or
-      buffered corridors for line-join Phase 2 (``buffer_m=<float>``)
-    - ``UprnSource`` — UPRN prep: plain address points (``buffer_m=None``) or
-      buffered catchment polygons (``buffer_m=<float>``)
+    - ``UsrnSource``/``UprnSource`` — USRN/UPRN prep: plain (``buffer_m=None``)
+      or buffered corridors/catchments (``buffer_m=<float>``)
 
-    A ``config.source`` must always be provided.
-
-    The output is always Hilbert-sorted, ZSTD-compressed GeoParquet 1.1 with
-    bbox covering columns for SedonaDB row-group pruning.
+    Output is always Hilbert-sorted, ZSTD-compressed GeoParquet 1.1 with bbox
+    covering columns for SedonaDB row-group pruning.
 
     Parameters
     ----------
     config:
-        Dataset configuration. The ``source`` field drives dispatch; all other
-        fields describe the output (name, parquet_path, columns).
+        Dataset configuration; ``source`` (required) drives dispatch.
     force:
-        If ``True``, re-prepare even if ``config.parquet_path`` already exists.
+        Re-prepare even if ``config.parquet_path`` already exists.
     threads:
-        Number of DuckDB threads to use. ``None`` lets DuckDB use all available
-        cores (default). Set to a lower value to reduce CPU pressure.
+        DuckDB thread count. ``None`` uses all available cores.
     memory_limit:
         DuckDB ``memory_limit`` for this call, e.g. ``"3GB"``. ``None`` leaves
-        DuckDB's default of ~80% of system RAM. That default is applied *per
-        instance*, so on a memory-constrained runner set this explicitly.
+        DuckDB's default of ~80% of system RAM, applied *per instance* — set
+        this explicitly on a memory-constrained runner.
 
     Returns
     -------
