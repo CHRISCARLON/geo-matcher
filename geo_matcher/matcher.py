@@ -430,6 +430,23 @@ class GeoMatcher:
             help="Row group size for the RHS GeoParquet (default: 10000).",
         )
         p_prepare.add_argument(
+            "--crs",
+            default="EPSG:27700",
+            metavar="CRS",
+            help="CRS to reproject the RHS source into (default: EPSG:27700).",
+        )
+        p_prepare.add_argument(
+            "--source-crs",
+            default=None,
+            metavar="CRS",
+            help=(
+                "CRS you believe the RHS source is in, e.g. 'EPSG:4326'. "
+                "The actual CRS is always detected from the file itself; if it "
+                "disagrees with this value, a warning is logged and the "
+                "detected CRS is used."
+            ),
+        )
+        p_prepare.add_argument(
             "--cache-dir",
             default=DEFAULT_OUTPUT_DIR,
             metavar="DIR",
@@ -493,7 +510,18 @@ class GeoMatcher:
             "--crs",
             default="EPSG:27700",
             metavar="CRS",
-            help="CRS of the coordinate columns (default: EPSG:27700).",
+            help="CRS to reproject the coordinate columns into (default: EPSG:27700).",
+        )
+        p_prepare_csv.add_argument(
+            "--source-crs",
+            default=None,
+            metavar="CRS",
+            help=(
+                "CRS you believe the coordinate/WKT columns are in, e.g. "
+                "'EPSG:4326'. CSV files carry no CRS metadata to detect, so "
+                "this value is taken as given and used to reproject to --crs "
+                "when it differs."
+            ),
         )
         p_prepare_csv.add_argument(
             "--row-group-size",
@@ -555,7 +583,7 @@ class GeoMatcher:
             "--crs",
             default="EPSG:27700",
             metavar="CRS",
-            help="CRS to record in the output GeoParquet metadata (default: EPSG:27700).",
+            help="CRS to reproject the source geometry into (default: EPSG:27700).",
         )
         p_prepare_parquet.add_argument(
             "--row-group-size",
@@ -584,9 +612,10 @@ class GeoMatcher:
             default=None,
             metavar="CRS",
             help=(
-                "CRS of the source geometry column, e.g. 'EPSG:4326'. "
-                "Required when the source column is in a different CRS than --crs. "
-                "The geometry will be reprojected to --crs during prepare."
+                "CRS you believe the source geometry column is in, e.g. "
+                "'EPSG:4326'. The actual CRS is always detected from the "
+                "file's GeoParquet metadata; if it disagrees with this "
+                "value, a warning is logged and the detected CRS is used."
             ),
         )
         p_prepare_parquet.add_argument(
@@ -862,6 +891,8 @@ class GeoMatcher:
             match_source: MatchSource = OgrSource(
                 path=rhs_gpkg,
                 row_group_size=args.rhs_row_group_size,
+                target_crs=args.crs,
+                source_crs=args.source_crs,
             )
             rhs_config: DatasetConfig = DatasetConfig(
                 name=args.rhs_name,
@@ -883,8 +914,9 @@ class GeoMatcher:
                 y_col=args.y_col,
                 geometry_type=args.geometry_type,
                 wkt_col=args.wkt_col,
-                crs=args.crs,
+                target_crs=args.crs,
                 row_group_size=args.row_group_size,
+                source_crs=args.source_crs,
             )
             rhs_config = DatasetConfig(
                 name=args.name,
@@ -903,7 +935,7 @@ class GeoMatcher:
             _validate_input_file(src_parquet)
             match_source = ParquetSource(
                 path=src_parquet,
-                crs=args.crs,
+                target_crs=args.crs,
                 row_group_size=args.row_group_size,
                 geometry_col=args.geometry_col,
                 source_crs=args.source_crs,

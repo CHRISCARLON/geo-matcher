@@ -1,12 +1,5 @@
 """Integration test: runs a real join through a real SedonaContext against tiny
-synthetic GeoParquet files built by the actual prepare() pipeline.
-
-Unlike test_join.py's query-text tests (which monkeypatch execute_join and never touch
-Sedona), this exercises the real thing end-to-end: prepare() -> real SedonaContext ->
-run_usrn_polygon_join -> real SQL execution -> real matched rows.
-
-Slower and heavier than the unit suite, so it's marked `integration` and excluded
-from `pytest -m unit`. Run explicitly with `pytest -m integration`.
+synthetic GeoParquet files built by the prepare() pipeline.
 """
 
 import pathlib

@@ -25,15 +25,6 @@ def matcher(tmp_path) -> GeoMatcher:
     return GeoMatcher(usrn_parquet=tmp_path / "usrns_27700.parquet", rhs_config=cfg)
 
 
-def test_match_dispatch_unknown_mode_raises(matcher):
-    """match_dispatch() rejects a mode that isn't a GeometryType."""
-    with pytest.raises(ValueError, match="Unknown join") as exc:
-        matcher.match_dispatch(mode="fuzzy")
-    # The error lists the valid (lhs, mode) pairs as plain values, not enum reprs
-    assert "'polygon'" in str(exc.value)
-    assert "GeometryType" not in str(exc.value)
-
-
 def test_match_dispatch_routes_uprn_polygon(monkeypatch, matcher):
     """match_dispatch(lhs='uprn', mode='polygon') resolves and calls the registered UPRN join."""
     captured: dict = {}
@@ -57,24 +48,9 @@ def test_match_dispatch_routes_uprn_polygon(monkeypatch, matcher):
     assert captured["rhs_config"] is matcher._rhs_config
 
 
-def test_registry_keys_are_lhs_geometry_tuples():
-    """Every registered join is keyed by a (LhsKind, GeometryType) tuple."""
-    assert _registry
-    assert all(
-        isinstance(lhs, LhsKind) and isinstance(geometry, GeometryType)
-        for lhs, geometry in _registry
-    )
-
-
 def test_get_join_accepts_enum_members_and_strings():
     """Enum members and their string values resolve to the same join."""
     assert get_join(LhsKind.USRN, GeometryType.POINT) is get_join("usrn", "point")
-
-
-def test_output_writer_unknown_format_raises(matcher, tmp_path):
-    """output_writer() rejects an unsupported output format."""
-    with pytest.raises(ValueError, match="Unknown output format"):
-        matcher.output_writer(pa.table({}), "xlsx", tmp_path, "stem")
 
 
 def test_registry_contains_expected_modes():

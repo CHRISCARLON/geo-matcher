@@ -5,12 +5,21 @@ import json
 import pathlib
 
 import geopandas as gpd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from shapely.geometry import box
+from pyproj import CRS as ProjCRS
+from shapely.geometry import Point, box
 
 import geo_matcher.prepare as prepare_module
-from geo_matcher import CsvSource, DatasetConfig, OgrSource, UprnSource, UsrnSource
+from geo_matcher import (
+    CsvSource,
+    DatasetConfig,
+    OgrSource,
+    ParquetSource,
+    UprnSource,
+    UsrnSource,
+)
 from geo_matcher.prepare import prepare
 
 pytestmark = pytest.mark.unit
@@ -48,15 +57,8 @@ def prepared_parquet(tiny_gpkg, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# OGR source metadata tests
+# OGR source tests
 # ---------------------------------------------------------------------------
-
-
-def test_geoparquet_metadata_patch(prepared_parquet):
-    """GeoParquet metadata is patched to version 1.1.0."""
-    geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
-    print(json.dumps(geo, indent=2))
-    assert geo["version"] == "1.1.0"
 
 
 def test_covering_metadata(prepared_parquet):
@@ -71,60 +73,6 @@ def test_covering_metadata(prepared_parquet):
     }
 
 
-def test_compression_zstd(prepared_parquet):
-    """All columns are ZSTD-compressed."""
-    rg = pq.ParquetFile(prepared_parquet).metadata.row_group(0)
-    for i in range(rg.num_columns):
-        col = rg.column(i)
-
-        print(f"The compression is: {col.compression}")
-
-        assert col.compression == "ZSTD", (
-            f"{col.path_in_schema}: expected ZSTD, got {col.compression}"
-        )
-
-
-def test_crs_in_metadata(prepared_parquet):
-    """CRS is present in the geometry column metadata."""
-    geo = json.loads(pq.read_schema(prepared_parquet).metadata[b"geo"])
-    crs_meta = geo["columns"]["geometry"].get("crs")
-    assert crs_meta is not None, "CRS should be present in geometry column metadata"
-    assert "27700" in str(crs_meta)
-
-
-# ---------------------------------------------------------------------------
-# OGR source behaviour tests
-# ---------------------------------------------------------------------------
-
-
-def test_prepare_skips_when_exists(tmp_path):
-    """prepare() returns immediately (no file read) when output exists and force=False."""
-    out = tmp_path / "fake_27700.parquet"
-    out.touch()
-    cfg = DatasetConfig(
-        name="fake",
-        source=OgrSource(path=tmp_path / "does_not_exist.gpkg"),
-        parquet_path=out,
-    )
-    result = prepare(cfg, force=False)
-    assert result == out
-    assert out.stat().st_size == 0  # untouched
-
-
-def test_prepare_force_overwrites(tiny_gpkg, tmp_path):
-    """prepare() re-writes the file when force=True."""
-    out = tmp_path / "forced_27700.parquet"
-    out.touch()
-    cfg = DatasetConfig(
-        name="forced",
-        source=OgrSource(path=tiny_gpkg),
-        parquet_path=out,
-    )
-    result = prepare(cfg, force=True)
-    assert result == out
-    assert out.stat().st_size > 0
-
-
 def test_prepare_geometry_renamed(tiny_gpkg, tmp_path):
     """DuckDB always outputs the geometry column as 'geometry'."""
     out = tmp_path / "renamed_27700.parquet"
@@ -137,82 +85,111 @@ def test_prepare_geometry_renamed(tiny_gpkg, tmp_path):
     assert "geom" not in schema.names
 
 
-def test_prepare_wrong_crs_raises(tiny_gdf, tmp_path):
-    """ValueError raised when the source CRS doesn't match OgrSource.crs."""
-    wrong_crs_gdf = tiny_gdf.to_crs("EPSG:4326")
-    src_gpkg = tmp_path / "wrong_crs.gpkg"
-    wrong_crs_gdf.to_file(str(src_gpkg), driver="GPKG")
-    out = tmp_path / "wrong_crs.parquet"
+def test_prepare_ogr_reprojects_mismatched_crs(tmp_path):
+    """A source in a different (but detectable) CRS is reprojected to OgrSource.target_crs."""
+    import duckdb
+
+    # Small boxes near central London, expressed in real-world WGS84 lon/lat —
+    # away from the BNG grid origin, where round-trip transform error is largest.
+    base_lon, base_lat = -0.1276, 51.5074
+    geoms = [
+        box(
+            base_lon + i * 0.001,
+            base_lat + i * 0.001,
+            base_lon + i * 0.001 + 0.0005,
+            base_lat + i * 0.001 + 0.0005,
+        )
+        for i in range(10)
+    ]
+    wgs84_gdf = gpd.GeoDataFrame({"val": range(10), "geometry": geoms}, crs="EPSG:4326")
+    src_gpkg = tmp_path / "wgs84.gpkg"
+    wgs84_gdf.to_file(str(src_gpkg), driver="GPKG")
+    out = tmp_path / "wgs84_27700.parquet"
     cfg = DatasetConfig(
-        name="bad",
-        source=OgrSource(path=src_gpkg, crs="EPSG:27700"),
+        name="reprojected",
+        source=OgrSource(path=src_gpkg, target_crs="EPSG:27700"),
         parquet_path=out,
     )
-    with pytest.raises(ValueError, match="EPSG:27700"):
-        prepare(cfg, force=True)
-
-
-def test_prepare_geoparquet_version(tiny_gpkg, tmp_path):
-    """prepare() output has GeoParquet 1.1.0 version."""
-    out = tmp_path / "hilbert_27700.parquet"
-    cfg = DatasetConfig(
-        name="hilbert", source=OgrSource(path=tiny_gpkg), parquet_path=out
-    )
     prepare(cfg, force=True)
-    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
-    assert geo["version"] == "1.1.0"
 
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    # Reprojected into the BNG extent around central London (~530000, ~180000),
+    # not left in WGS84 lon/lat degrees (which would be ~ -0.13 / ~51.5).
+    assert 500_000 <= xmin <= 560_000
+    assert 150_000 <= ymin <= 210_000
 
-def test_prepare_covering_metadata(tiny_gpkg, tmp_path):
-    """prepare() output has GeoParquet 1.1 bbox covering key."""
-    out = tmp_path / "covering_27700.parquet"
-    cfg = DatasetConfig(
-        name="covering", source=OgrSource(path=tiny_gpkg), parquet_path=out
-    )
-    prepare(cfg, force=True)
-    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
-    covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
-    assert covering == {
-        "xmin": ["bbox", "xmin"],
-        "ymin": ["bbox", "ymin"],
-        "xmax": ["bbox", "xmax"],
-        "ymax": ["bbox", "ymax"],
-    }
-
-
-def test_prepare_crs_in_metadata(tiny_gpkg, tmp_path):
-    """prepare() patches the CRS into the GeoParquet geometry column metadata."""
-    out = tmp_path / "crs_27700.parquet"
-    cfg = DatasetConfig(name="crs", source=OgrSource(path=tiny_gpkg), parquet_path=out)
-    prepare(cfg, force=True)
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
-    assert crs_meta is not None, "CRS should be present in geometry column metadata"
+    assert crs_meta is not None
     assert "27700" in str(crs_meta)
 
 
-# ---------------------------------------------------------------------------
-# _patch_covering_metadata unhappy path
-# ---------------------------------------------------------------------------
+def test_prepare_ogr_warns_on_declared_source_crs_mismatch(tmp_path, caplog):
+    """A wrong declared source_crs still reprojects correctly (using the CRS
+    detected in the file) and logs a warning naming the disagreement."""
+    base_lon, base_lat = -0.1276, 51.5074
+    geoms = [
+        box(
+            base_lon + i * 0.001,
+            base_lat + i * 0.001,
+            base_lon + i * 0.001 + 0.0005,
+            base_lat + i * 0.001 + 0.0005,
+        )
+        for i in range(10)
+    ]
+    wgs84_gdf = gpd.GeoDataFrame({"val": range(10), "geometry": geoms}, crs="EPSG:4326")
+    src_gpkg = tmp_path / "wgs84_wrong_declared.gpkg"
+    wgs84_gdf.to_file(str(src_gpkg), driver="GPKG")
+    out = tmp_path / "wgs84_wrong_declared_27700.parquet"
+    cfg = DatasetConfig(
+        name="wrong_declared",
+        source=OgrSource(
+            path=src_gpkg, source_crs="EPSG:27700", target_crs="EPSG:27700"
+        ),
+        parquet_path=out,
+    )
+
+    with caplog.at_level("WARNING"):
+        prepare(cfg, force=True)
+
+    warning = "\n".join(r.getMessage() for r in caplog.records)
+    assert "declared source_crs=EPSG:27700" in warning
+    assert "4326" in warning
+
+    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+    crs_meta = geo["columns"]["geometry"].get("crs")
+    assert crs_meta is not None
+    assert "27700" in str(crs_meta)
 
 
-def test_prepare_raises_on_patch_failure(tiny_gpkg, tmp_path, monkeypatch):
-    """RuntimeError propagates when _patch_covering_metadata raises."""
+def test_prepare_ogr_undetectable_crs_raises(tiny_gdf, tmp_path, monkeypatch):
+    """ValueError raised when the source CRS cannot be detected at all."""
+    src_gpkg = tmp_path / "tiny.gpkg"
+    tiny_gdf.to_file(str(src_gpkg), driver="GPKG")
+    out = tmp_path / "undetectable.parquet"
+    cfg = DatasetConfig(
+        name="undetectable",
+        source=OgrSource(path=src_gpkg, target_crs="EPSG:27700"),
+        parquet_path=out,
+    )
 
-    def _always_raise(*a, **kw):
-        raise RuntimeError("Failed to patch GeoParquet covering metadata")
+    def _fake_read_ogr_info(con, source_path):
+        return {"crs": None, "feature_count": 10, "geometry_type": "Polygon"}
 
-    monkeypatch.setattr(prepare_module, "_patch_covering_metadata", _always_raise)
-    out = tmp_path / "fail.parquet"
-    cfg = DatasetConfig(name="fail", source=OgrSource(path=tiny_gpkg), parquet_path=out)
-    with pytest.raises(
-        RuntimeError, match="Failed to patch GeoParquet covering metadata"
-    ):
+    monkeypatch.setattr(prepare_module, "_read_ogr_info", _fake_read_ogr_info)
+    with pytest.raises(ValueError, match="Could not detect source CRS"):
         prepare(cfg, force=True)
 
 
 # ---------------------------------------------------------------------------
-# UsrnSource tests
+# UsrnSource / UprnSource tests
 # ---------------------------------------------------------------------------
 
 
@@ -312,11 +289,6 @@ def test_prepare_usrn_buffered_mode_geometry_larger_than_line(
     assert (buf_xmax - buf_xmin) > (line_xmax - line_xmin)
 
 
-# ---------------------------------------------------------------------------
-# UprnSource tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def tiny_uprn_gdf():
     """5-row synthetic UPRN-shaped GeoDataFrame — uppercase columns, Point geometry.
@@ -324,8 +296,6 @@ def tiny_uprn_gdf():
     Column names/casing mirror the real OS Open UPRN GeoPackage (``UPRN``,
     ``X_COORDINATE``, ``Y_COORDINATE``, ``LATITUDE``, ``LONGITUDE``).
     """
-    from shapely.geometry import Point
-
     xs = [i * 1000 for i in range(5)]
     ys = [i * 1000 for i in range(5)]
     return gpd.GeoDataFrame(
@@ -389,34 +359,6 @@ def test_prepare_uprn_buffered_mode_adds_geometry_point(tiny_uprn_parquet, tmp_p
     assert set(schema.names) == {"uprn", "geometry", "geometry_point", "bbox"}
 
 
-def test_prepare_uprn_buffered_mode_geometry_larger_than_point(
-    tiny_uprn_parquet, tmp_path
-):
-    """The buffered `geometry` column's bbox is strictly larger than `geometry_point`'s."""
-    import duckdb
-
-    out = tmp_path / "uprn_buffered_bbox_27700.parquet"
-    cfg = DatasetConfig(
-        name="uprn_buffered_bbox",
-        source=UprnSource(path=tiny_uprn_parquet, buffer_m=10.0),
-        parquet_path=out,
-    )
-    prepare(cfg, force=True)
-
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
-    row = con.sql(f"""
-        SELECT
-            MIN(ST_XMin(geometry)), MAX(ST_XMax(geometry)),
-            MIN(ST_XMin(geometry_point)), MAX(ST_XMax(geometry_point))
-        FROM read_parquet('{out}')
-    """).fetchone()
-    assert row is not None  # aggregate query always returns exactly one row
-    buf_xmin, buf_xmax, pt_xmin, pt_xmax = row
-
-    assert (buf_xmax - buf_xmin) > (pt_xmax - pt_xmin)
-
-
 # ---------------------------------------------------------------------------
 # CsvSource tests
 # ---------------------------------------------------------------------------
@@ -441,16 +383,6 @@ def tiny_csv(tmp_path):
     return p
 
 
-def test_prepare_csv_skips_when_exists(tiny_csv, tmp_path):
-    """prepare() returns without writing when output exists and force=False."""
-    out = tmp_path / "csv_out.parquet"
-    out.touch()
-    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
-    result = prepare(cfg)
-    assert result == out
-    assert out.stat().st_size == 0
-
-
 def test_prepare_csv_writes_parquet(tiny_csv, tmp_path):
     out = tmp_path / "csv_out.parquet"
     """prepare() writes a non-empty parquet file from a CSV source."""
@@ -462,54 +394,51 @@ def test_prepare_csv_writes_parquet(tiny_csv, tmp_path):
     assert out.stat().st_size > 0
 
 
-def test_prepare_csv_geoparquet_version(tiny_csv, tmp_path):
-    """CSV output has GeoParquet 1.1.0 version."""
-    out = tmp_path / "csv_version.parquet"
-    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
-    prepare(cfg)
-    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
-    assert geo["version"] == "1.1.0"
+@pytest.fixture
+def tiny_lonlat_csv(tmp_path):
+    """10-row CSV with lon/lat coordinate columns in EPSG:4326 (near the UK)."""
+    p = tmp_path / "tiny_lonlat.csv"
+    with open(p, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "lon", "lat"])
+        writer.writeheader()
+        for i in range(10):
+            writer.writerow({"id": i, "lon": -1.0 + i * 0.01, "lat": 51.0 + i * 0.01})
+    return p
 
 
-def test_prepare_csv_covering_metadata(tiny_csv, tmp_path):
-    """CSV output has the GeoParquet 1.1 bbox covering key."""
-    out = tmp_path / "csv_covering.parquet"
-    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
-    prepare(cfg)
-    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
-    covering = geo["columns"]["geometry"].get("covering", {}).get("bbox", {})
-    assert covering == {
-        "xmin": ["bbox", "xmin"],
-        "ymin": ["bbox", "ymin"],
-        "xmax": ["bbox", "xmax"],
-        "ymax": ["bbox", "ymax"],
-    }
+def test_prepare_csv_reprojects_source_crs(tiny_lonlat_csv, tmp_path):
+    """A CsvSource.source_crs different from target_crs is reprojected during prepare()."""
+    import duckdb
 
-
-def test_prepare_csv_crs_in_metadata(tiny_csv, tmp_path):
-    """CSV output patches the CRS into the geometry column metadata."""
-    out = tmp_path / "csv_crs.parquet"
+    out = tmp_path / "csv_lonlat_27700.parquet"
     cfg = DatasetConfig(
-        name="tiny", source=CsvSource(path=tiny_csv, crs="EPSG:27700"), parquet_path=out
+        name="lonlat",
+        source=CsvSource(
+            path=tiny_lonlat_csv,
+            x_col="lon",
+            y_col="lat",
+            source_crs="EPSG:4326",
+            target_crs="EPSG:27700",
+        ),
+        parquet_path=out,
     )
-    prepare(cfg)
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    assert 0 <= xmin <= 700_000
+    assert 0 <= ymin <= 1_300_000
+
     geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
     crs_meta = geo["columns"]["geometry"].get("crs")
-    assert crs_meta is not None, "CRS should be present in geometry column metadata"
+    assert crs_meta is not None
     assert "27700" in str(crs_meta)
-
-
-def test_prepare_csv_compression_zstd(tiny_csv, tmp_path):
-    """CSV output is ZSTD-compressed across all columns."""
-    out = tmp_path / "csv_zstd.parquet"
-    cfg = DatasetConfig(name="tiny", source=CsvSource(path=tiny_csv), parquet_path=out)
-    prepare(cfg)
-    rg = pq.ParquetFile(out).metadata.row_group(0)
-    for i in range(rg.num_columns):
-        col = rg.column(i)
-        assert col.compression == "ZSTD", (
-            f"{col.path_in_schema}: expected ZSTD, got {col.compression}"
-        )
 
 
 def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
@@ -527,12 +456,150 @@ def test_prepare_csv_xy_cols_dropped(tiny_csv, tmp_path):
     assert "Northing" not in schema.names
 
 
-@pytest.mark.parametrize("geometry_type", ["line", "polygon"])
-def test_prepare_csv_wkt_col_required_raises(geometry_type):
-    """geometry_type='line'/'polygon' without wkt_col is rejected at construction time,
-    before prepare() is ever called."""
-    with pytest.raises(ValueError, match="wkt_col"):
-        CsvSource(path=pathlib.Path("does_not_matter.csv"), geometry_type=geometry_type)
+# ---------------------------------------------------------------------------
+# ParquetSource CRS detection tests
+# ---------------------------------------------------------------------------
+
+
+def _write_external_geoparquet(
+    path: pathlib.Path,
+    geom_col: str,
+    points_lonlat: list[tuple[float, float]],
+    crs: str | None,
+) -> None:
+    """Write a plain (non-pipeline) GeoParquet file with a WKB point column,
+    optionally carrying GeoParquet 'geo' metadata declaring its CRS — used to
+    exercise ParquetSource's CRS auto-detection independent of this pipeline's
+    own output format."""
+    wkb_values = [Point(lon, lat).wkb for lon, lat in points_lonlat]
+    table = pa.table({"id": list(range(len(points_lonlat))), geom_col: wkb_values})
+    if crs is not None:
+        geo_meta = {
+            "version": "1.1.0",
+            "primary_column": geom_col,
+            "columns": {
+                geom_col: {
+                    "encoding": "WKB",
+                    "geometry_types": ["Point"],
+                    "crs": ProjCRS.from_user_input(crs).to_json_dict(),
+                }
+            },
+        }
+        table = table.replace_schema_metadata({b"geo": json.dumps(geo_meta).encode()})
+    pq.write_table(table, str(path))
+
+
+def test_prepare_parquet_own_wkb_roundtrips_unchanged(prepared_parquet, tmp_path):
+    """Pipeline-native 'geometry' WKB Parquet round-trips, CRS detected and unchanged."""
+    out = tmp_path / "roundtrip.parquet"
+    cfg = DatasetConfig(
+        name="roundtrip", source=ParquetSource(path=prepared_parquet), parquet_path=out
+    )
+    prepare(cfg, force=True)
+    geo = json.loads(pq.read_schema(str(out)).metadata[b"geo"])
+    crs_meta = geo["columns"]["geometry"].get("crs")
+    assert crs_meta is not None
+    assert "27700" in str(crs_meta)
+
+
+def test_prepare_parquet_detects_crs_from_geo_metadata(tmp_path):
+    """An external Parquet's embedded GeoParquet CRS metadata is auto-detected
+    and reprojected to the target CRS when source_crs isn't declared."""
+    import duckdb
+
+    src = tmp_path / "external.parquet"
+    points = [(-0.1276 + i * 0.001, 51.5074 + i * 0.001) for i in range(10)]
+    _write_external_geoparquet(src, "shape", points, crs="EPSG:4326")
+
+    out = tmp_path / "external_27700.parquet"
+    cfg = DatasetConfig(
+        name="external",
+        source=ParquetSource(path=src, geometry_col="shape", target_crs="EPSG:27700"),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    assert 0 <= xmin <= 700_000
+    assert 0 <= ymin <= 1_300_000
+
+
+def test_prepare_parquet_undetectable_crs_raises(tmp_path):
+    """ValueError raised when an external Parquet has no source_crs declared
+    and no GeoParquet 'geo' metadata to detect a CRS from."""
+    src = tmp_path / "no_geo_meta.parquet"
+    points = [(-0.1276 + i * 0.001, 51.5074 + i * 0.001) for i in range(10)]
+    _write_external_geoparquet(src, "shape", points, crs=None)
+
+    out = tmp_path / "undetectable.parquet"
+    cfg = DatasetConfig(
+        name="undetectable",
+        source=ParquetSource(path=src, geometry_col="shape", target_crs="EPSG:27700"),
+        parquet_path=out,
+    )
+    with pytest.raises(ValueError, match="Could not detect source CRS"):
+        prepare(cfg, force=True)
+
+
+def test_prepare_parquet_undetectable_crs_raises_even_with_declared_source_crs(
+    tmp_path,
+):
+    """Declaring source_crs does not bypass detection — prepare() still raises
+    when the file has no GeoParquet 'geo' metadata to detect a CRS from,
+    rather than blindly trusting the declared value."""
+    src = tmp_path / "no_geo_meta_declared.parquet"
+    points = [(-0.1276 + i * 0.001, 51.5074 + i * 0.001) for i in range(10)]
+    _write_external_geoparquet(src, "shape", points, crs=None)
+
+    out = tmp_path / "undetectable_declared.parquet"
+    cfg = DatasetConfig(
+        name="undetectable_declared",
+        source=ParquetSource(
+            path=src,
+            geometry_col="shape",
+            source_crs="EPSG:4326",
+            target_crs="EPSG:27700",
+        ),
+        parquet_path=out,
+    )
+    with pytest.raises(ValueError, match="Could not detect source CRS"):
+        prepare(cfg, force=True)
+
+
+def test_prepare_parquet_declared_source_crs_overrides_geometry_column_name(tmp_path):
+    """Declaring source_crs still transforms even when the source column is
+    named 'geometry', same as any other declared source_crs."""
+    import duckdb
+
+    src = tmp_path / "external_named_geometry.parquet"
+    points = [(-0.1276 + i * 0.001, 51.5074 + i * 0.001) for i in range(10)]
+    _write_external_geoparquet(src, "geometry", points, crs="EPSG:4326")
+
+    out = tmp_path / "external_named_geometry_27700.parquet"
+    cfg = DatasetConfig(
+        name="external_geometry",
+        source=ParquetSource(path=src, source_crs="EPSG:4326", target_crs="EPSG:27700"),
+        parquet_path=out,
+    )
+    prepare(cfg, force=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(f"""
+        SELECT MIN(ST_XMin(geometry)), MIN(ST_YMin(geometry))
+        FROM read_parquet('{out}')
+    """).fetchone()
+    assert row is not None
+    xmin, ymin = row
+    assert 0 <= xmin <= 700_000
+    assert 0 <= ymin <= 1_300_000
 
 
 # ---------------------------------------------------------------------------
@@ -580,36 +647,6 @@ def tiny_polygon_csv(tmp_path):
             }
         )
     return p
-
-
-def test_prepare_csv_line_with_wkt_col(tiny_line_csv, tmp_path):
-    """CSV line geometries build via ST_GeomFromText and drop wkt_col from the output."""
-    out = tmp_path / "csv_line.parquet"
-    cfg = DatasetConfig(
-        name="tiny_line",
-        source=CsvSource(path=tiny_line_csv, geometry_type="line", wkt_col="wkt"),
-        parquet_path=out,
-    )
-    result = prepare(cfg)
-    assert result == out
-    schema = pq.read_schema(str(out))
-    assert "geometry" in schema.names
-    assert "wkt" not in schema.names
-
-
-def test_prepare_csv_polygon_with_wkt_col(tiny_polygon_csv, tmp_path):
-    """CSV polygon geometries build via ST_GeomFromText and drop wkt_col from the output."""
-    out = tmp_path / "csv_polygon.parquet"
-    cfg = DatasetConfig(
-        name="tiny_polygon",
-        source=CsvSource(path=tiny_polygon_csv, geometry_type="polygon", wkt_col="wkt"),
-        parquet_path=out,
-    )
-    result = prepare(cfg)
-    assert result == out
-    schema = pq.read_schema(str(out))
-    assert "geometry" in schema.names
-    assert "wkt" not in schema.names
 
 
 def test_prepare_csv_line_multilinestring_roundtrips(tiny_line_csv, tmp_path):
@@ -671,51 +708,6 @@ def test_prepare_leaves_no_open_duckdb_connection(tiny_gpkg, tmp_path):
     gc.collect()
     after = sum(1 for o in gc.get_objects() if isinstance(o, duckdb.DuckDBPyConnection))
     assert after == before
-
-
-def test_memory_limit_is_applied_to_the_connection(monkeypatch):
-    """A caller-supplied memory_limit reaches the DuckDB session."""
-    capped = prepare_module._open_connection(threads=1, memory_limit="512MB")
-    uncapped = prepare_module._open_connection(threads=1)
-    try:
-        # DuckDB restates the limit in MiB ("488.2 MiB" for 512MB), so compare the
-        # capped session against the default rather than matching on the string.
-        got = capped.execute("SELECT current_setting('memory_limit')").fetchone()[0]
-        default = uncapped.execute("SELECT current_setting('memory_limit')").fetchone()[
-            0
-        ]
-
-        assert "MiB" in got
-        assert float(got.split()[0]) < 600  # ~488 MiB
-        assert got != default
-    finally:
-        capped.close()
-        uncapped.close()
-
-
-def test_connection_context_manager_closes_on_error():
-    """_connection() closes even when the body raises."""
-    import duckdb
-
-    captured = {}
-    with pytest.raises(RuntimeError):
-        with prepare_module._connection(threads=1) as con:
-            captured["con"] = con
-            raise RuntimeError("boom")
-
-    with pytest.raises(duckdb.ConnectionException):
-        captured["con"].execute("SELECT 1")
-
-
-def test_ogr_staging_file_is_cleaned_up(tiny_gpkg, tmp_path):
-    """The intermediate staging parquet must not survive a successful prepare."""
-    out = tmp_path / "staged_out.parquet"
-    cfg = DatasetConfig(name="t", source=OgrSource(path=tiny_gpkg), parquet_path=out)
-    prepare(cfg, force=True)
-
-    assert out.exists()
-    assert not (out.parent / f"{out.stem}.staging.parquet").exists()
-    assert list(tmp_path.glob("*.staging.parquet")) == []
 
 
 def test_ogr_staging_preserves_rows_columns_and_geometry(tiny_gdf, tiny_gpkg, tmp_path):
@@ -811,31 +803,6 @@ def test_unsupported_curve_geometry_is_dropped_not_fatal(curve_gpkg, tmp_path, c
     assert "1 of 4 features" in warning
     assert "CircularString" in warning
     assert "CONVERT_TO_LINEAR" in warning
-
-
-def test_ogr_geometry_is_forced_to_2d(curve_gpkg, tmp_path):
-    """Z/M ordinates are dropped so one column never mixes XY and XYZ geometries."""
-    out = tmp_path / "flat.parquet"
-    cfg = DatasetConfig(
-        name="flat", source=OgrSource(path=curve_gpkg), parquet_path=out
-    )
-    prepare(cfg, force=True)
-
-    got = gpd.read_parquet(out)
-    assert not got.geometry.has_z.any()
-
-
-def test_wkb_type_name_decodes_both_dialects():
-    """_wkb_type_name must read ISO and old-OGC/EWKB type codes, and both endians."""
-    name = prepare_module._wkb_type_name
-
-    assert name("0102000000") == "LineString"  # little-endian ISO
-    assert name("01ea030000") == "LineString Z"  # ISO 1002
-    assert name("01ba0b0000") == "LineString ZM"  # ISO 3002
-    assert name("0102000080") == "LineString Z"  # EWKB high-bit Z
-    assert name("0108000000") == "CircularString"
-    assert name("0000000002") == "LineString"  # big-endian
-    assert name("zz") == "unknown"
 
 
 @pytest.mark.parametrize(

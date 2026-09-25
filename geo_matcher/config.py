@@ -29,33 +29,63 @@ class LhsKind(StrEnum):
 
 @dataclass(frozen=True)
 class OgrSource:
-    """Any GDAL-readable vector format (GeoPackage, Shapefile, etc.)."""
+    """Any GDAL-readable vector format (GeoPackage, Shapefile, etc.).
+
+    If a transform into/out of EPSG:27700 is needed, set ``nadgrids_path`` to the
+    ``.gsb`` binary grid extracted from the OS OSTN15 "NTv2 format files" ZIP
+    (https://www.ordnancesurvey.co.uk/products/os-net/for-developers — not the
+    ZIP itself, the ``.gsb`` file inside it, e.g. ``OSTN15_NTv2_OSGBtoETRS.gsb``)
+    for full accuracy; otherwise DuckDB falls back to its own default
+    (grid-less) coordinate operation search.
+
+    ``target_crs`` is the CRS this source is prepared into (EPSG:27700 by
+    default). The prepare step always detects the file's actual CRS itself
+    (from the OGR source's own metadata) and transforms from that detected
+    CRS to ``target_crs`` when they differ. ``source_crs`` is optional — what
+    you believe the file is in; if it disagrees with what's detected, prepare
+    logs a warning and uses the detected CRS anyway (the file wins).
+    """
 
     path: pathlib.Path
-    crs: str = "EPSG:27700"
+    source_crs: str | None = None
+    target_crs: str = "EPSG:27700"
     row_group_size: int = 20_000
+    nadgrids_path: pathlib.Path | None = None
 
 
 @dataclass(frozen=True)
 class CsvSource:
-    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries."""
+    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries.
+
+    If the coordinate/WKT values are in a different CRS than ``target_crs`` (the
+    target, EPSG:27700 by default), set ``source_crs`` to that CRS; the prepare
+    step will transform to ``target_crs``. If that transform is into/out of
+    EPSG:27700, also set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for
+    full accuracy — see ``OgrSource`` for where to get it.
+
+    Unlike ``OgrSource``/``ParquetSource``, a CSV carries no CRS metadata to
+    read. Prepare instead makes a best-effort guess from the coordinates
+    themselves: values within Great Britain's WGS84 lon/lat extent
+    are detected as ``EPSG:4326``, values within the British National Grid's
+    valid eastings/northings as ``EPSG:27700``. When detection succeeds it's
+    used for the transform, exactly like ``OgrSource``/``ParquetSource`` — and
+    if it disagrees with a declared ``source_crs``, prepare logs a warning and
+    uses the detected CRS anyway. When the extent doesn't clearly fall in
+    either range, detection is skipped and ``source_crs`` is used as declared,
+    with no warning.
+    """
 
     path: pathlib.Path
     x_col: str = "Easting"
     y_col: str = "Northing"
     geometry_type: GeometryType | str = GeometryType.POINT
     wkt_col: str | None = None
-    crs: str = "EPSG:27700"
     row_group_size: int = 20_000
+    target_crs: str = "EPSG:27700"
+    source_crs: str | None = None
+    nadgrids_path: pathlib.Path | None = None
 
     def __post_init__(self) -> None:
-        # Normalise a plain string ("point") into the enum member so downstream
-        # match statements can rely on GeometryType members. object.__setattr__
-        # because the dataclass is frozen. geometry_type is kept as a local (rather
-        # than re-reading self.geometry_type below) because mypy doesn't narrow
-        # through object.__setattr__ — the field's declared type is
-        # `GeometryType | str`, so a later `self.geometry_type.value` would still
-        # be checked against `str`, which has no `.value`.
         geometry_type: GeometryType = GeometryType(self.geometry_type)
         object.__setattr__(self, "geometry_type", geometry_type)
 
@@ -72,22 +102,32 @@ class CsvSource:
 
 @dataclass(frozen=True)
 class ParquetSource:
-    """Existing GeoParquet (or any geometry-bearing Parquet) to re-sort and re-compress.
+    """Existing GeoParquet to re-sort and re-compress.
 
     For files produced by this pipeline the geometry column is always named
     ``"geometry"`` and stored as WKB — the defaults handle that automatically.
 
     For external Parquet files where the geometry column has a different name or
     is stored as a native GEOMETRY type (e.g. ``GEOMETRY('OGC:CRS84')``), set
-    ``geometry_col`` to the source column name and ``source_crs`` to the CRS of
-    that column; the prepare step will transform to ``crs`` (EPSG:27700).
+    ``geometry_col`` to the source column name; the prepare step will transform
+    to ``target_crs`` (EPSG:27700) if needed. If that transform is into/out of
+    EPSG:27700, also set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for
+    full accuracy — see ``OgrSource`` for where to get it.
+
+    Prepare always auto-detects the CRS from the file's own GeoParquet ``geo``
+    metadata (mirroring ``OgrSource``'s auto-detection from the source file),
+    and raises if that metadata is absent — regardless of whether
+    ``source_crs`` is set. ``source_crs`` is optional — what you believe the
+    file is in; if it disagrees with what's detected, prepare logs a warning
+    and uses the detected CRS anyway (the file wins).
     """
 
     path: pathlib.Path
-    crs: str = "EPSG:27700"
+    source_crs: str | None = None
+    target_crs: str = "EPSG:27700"
     row_group_size: int = 20_000
     geometry_col: str = "geometry"
-    source_crs: str | None = None
+    nadgrids_path: pathlib.Path | None = None
 
 
 @dataclass(frozen=True)
@@ -105,12 +145,19 @@ class UsrnSource:
     and ``geometry_line`` is the original centreline WKB (used for distance
     and overlap calculations). ``buffer_m`` must be >= ``--distance`` at
     match time.
+
+    When ``buffer_m is None`` and the raw source needs a transform into
+    EPSG:27700, set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for full
+    accuracy — see ``OgrSource`` for where to get it. Forwarded to the
+    transient ``OgrSource`` this delegates to; unused in buffered mode (no
+    transform happens there).
     """
 
     path: pathlib.Path
     crs: str = "EPSG:27700"
     buffer_m: float | None = None
     row_group_size: int = 20_000
+    nadgrids_path: pathlib.Path | None = None
 
 
 @dataclass(frozen=True)
@@ -130,12 +177,19 @@ class UprnSource:
     buffered catchment-polygon GeoParquet, where ``geometry`` is
     ``ST_Buffer(point, buffer_m)`` (the join predicate) and ``geometry_point``
     is the original point WKB, alongside ``uprn``.
+
+    When ``buffer_m is None`` and the raw source needs a transform into
+    EPSG:27700, set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for full
+    accuracy — see ``OgrSource`` for where to get it. Forwarded to the
+    transient ``OgrSource`` this delegates to; unused in buffered mode (no
+    transform happens there).
     """
 
     path: pathlib.Path
     crs: str = "EPSG:27700"
     buffer_m: float | None = None
     row_group_size: int = 20_000
+    nadgrids_path: pathlib.Path | None = None
 
 
 MatchSource: TypeAlias = OgrSource | CsvSource | ParquetSource

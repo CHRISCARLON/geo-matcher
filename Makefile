@@ -1,6 +1,8 @@
 # geo-matcher — task runner
 # Usage: make <target>
 
+GEO_MATCHER ?= uv run geo-matcher
+
 .PHONY: \
 	init \
 	prepare-usrns prepare-usrns-line \
@@ -19,17 +21,17 @@
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 init:
-	geo-matcher init
+	$(GEO_MATCHER) init
 
 # ── Prepare USRNs ─────────────────────────────────────────────────────────────
 
 prepare-usrns:
-	geo-matcher prepare-usrns \
+	$(GEO_MATCHER) prepare-usrns \
 		--usrn-gpkg input_data/osopenusrn_202607.gpkg \
 		--force
 
 prepare-usrns-line:
-	geo-matcher prepare-usrns-line \
+	$(GEO_MATCHER) prepare-usrns-line \
 		--buffer-m 10 \
 		--force \
 		--threads 4
@@ -37,13 +39,13 @@ prepare-usrns-line:
 # ── Prepare UPRNs ─────────────────────────────────────────────────────────────
 
 prepare-uprns:
-	geo-matcher prepare-uprns \
+	$(GEO_MATCHER) prepare-uprns \
 		--uprn-gpkg input_data/osopenuprn_202608.gpkg \
 		--force \
 		--threads 4
 
 prepare-uprns-buffer:
-	geo-matcher prepare-uprns-buffer \
+	$(GEO_MATCHER) prepare-uprns-buffer \
 		--buffer-m 10 \
 		--force \
 		--threads 4
@@ -51,33 +53,33 @@ prepare-uprns-buffer:
 # ── Prepare ───────────────────────────────────────────────────────────────────
 
 prepare-soil:
-	geo-matcher prepare-gpkg \
+	$(GEO_MATCHER) prepare-gpkg \
 		--rhs-name soil \
 		--rhs-row-group-size 100 \
 		--force
 
 prepare-built:
-	geo-matcher prepare-gpkg \
+	$(GEO_MATCHER) prepare-gpkg \
 		--rhs-name os_open_built_up_areas \
 		--rhs-row-group-size 100 \
 		--force
 
 prepare-stops:
-	geo-matcher prepare-csv \
+	$(GEO_MATCHER) prepare-csv \
 		--name   stops \
 		--x-col  Easting \
 		--y-col  Northing \
 		--force
 
 prepare-counts:
-	geo-matcher prepare-csv \
+	$(GEO_MATCHER) prepare-csv \
 		--name   count_points \
 		--x-col  easting \
 		--y-col  northing \
 		--force
 
 prepare-gas-pipe:
-	geo-matcher prepare-parquet \
+	$(GEO_MATCHER) prepare-parquet \
 		--name         gas_pipe \
 		--parquet      downloads/gas-pipe-infrastructure-gpi_open.parquet \
 		--geometry-col geo_shape \
@@ -86,7 +88,7 @@ prepare-gas-pipe:
 		--force
 
 prepare-ngn-mains:
-	geo-matcher prepare-gpkg \
+	$(GEO_MATCHER) prepare-gpkg \
 		--rhs-name  ngn_mains \
 		--rhs-gpkg  input_data/ngn_mains.gpkg \
 		--threads   4 \
@@ -97,13 +99,13 @@ prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
 # ── Match — National (no bbox) ────────────────────────────────────────────────
 
 match-soil-national:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name   soil \
 		--mode       polygon \
 		--output     parquet
 
 match-soil-uprn:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--lhs-name   uprn \
 		--rhs-name   soil \
 		--mode       polygon \
@@ -111,7 +113,7 @@ match-soil-uprn:
 		--output     parquet
 
 match-soil-uprn-leeds:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--lhs-name   uprn \
 		--rhs-name   soil \
 		--mode       polygon \
@@ -119,7 +121,7 @@ match-soil-uprn-leeds:
 		--output     parquet
 
 match-built-uprn:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--lhs-name   uprn \
 		--rhs-name   os_open_built_up_areas \
 		--mode       polygon \
@@ -127,14 +129,14 @@ match-built-uprn:
 		--output     parquet
 
 match-stops-national:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
 		--output   parquet
 
 match-stops-london:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
@@ -142,21 +144,21 @@ match-stops-london:
 		--city     LONDON
 
 match-counts-national:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name count_points \
 		--mode     point \
 		--distance 10 \
 		--output   csv
 
 match-soil-leeds:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
 		--output   csv
 
 match-soil-leeds-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
@@ -164,7 +166,7 @@ match-soil-leeds-explain:
 		--explain
 
 match-soil-national-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name soil \
 		--mode     polygon \
 		--output   csv \
@@ -174,7 +176,7 @@ match-soil-national-explain:
 # Kept out of the default targets; use the -explain variants when you want a plan.
 
 match-gas-pipe-sample:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -186,7 +188,7 @@ match-gas-pipe-sample:
 		--output           csv
 
 match-gas-pipe-sample-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -199,7 +201,7 @@ match-gas-pipe-sample-explain:
 		--explain
 
 match-gas-pipe-national:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -210,7 +212,7 @@ match-gas-pipe-national:
 		--output           parquet
 
 match-gas-pipe-national-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -222,7 +224,7 @@ match-gas-pipe-national-explain:
 		--explain
 
 match-ngn-mains-sample:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -234,7 +236,7 @@ match-ngn-mains-sample:
 		--output           csv
 
 match-ngn-mains-sample-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -247,7 +249,7 @@ match-ngn-mains-sample-explain:
 		--explain
 
 match-ngn-mains-national:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -258,7 +260,7 @@ match-ngn-mains-national:
 		--output           parquet
 
 match-ngn-mains-national-explain:
-	geo-matcher match \
+	$(GEO_MATCHER) match \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
