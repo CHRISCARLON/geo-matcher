@@ -602,6 +602,52 @@ def test_prepare_parquet_declared_source_crs_overrides_geometry_column_name(tmp_
     assert 0 <= ymin <= 1_300_000
 
 
+def test_prepare_parquet_declared_source_crs_overrides_ambiguous_ogc_crs84(
+    tmp_path, caplog
+):
+    """A column whose geo metadata omits `crs` entirely resolves to the spec's
+    OGC:CRS84 fallback (DuckDB's own raw COPY auto-writes exactly this for any
+    native GEOMETRY column, regardless of its real CRS) — declaring source_crs
+    must override that weak signal, not get silently (mis)transformed as if
+    the data were really WGS84 lon/lat."""
+    import duckdb
+
+    src = tmp_path / "raw_native_geometry.parquet"
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    con.execute(f"""
+        COPY (
+            SELECT 1 AS id, ST_GeomFromText('POINT(530000 180000)') AS geometry
+        ) TO '{src}' (FORMAT PARQUET)
+    """)
+    con.close()
+
+    out = tmp_path / "raw_native_geometry_27700.parquet"
+    cfg = DatasetConfig(
+        name="raw_native",
+        source=ParquetSource(
+            path=src, source_crs="EPSG:27700", target_crs="EPSG:27700"
+        ),
+        parquet_path=out,
+    )
+    with caplog.at_level("INFO"):
+        prepare(cfg, force=True)
+
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "OGC:CRS84 assumed" in log_text
+    assert "source_crs=EPSG:27700" in log_text
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    row = con.sql(
+        f"SELECT ST_X(geometry), ST_Y(geometry) FROM read_parquet('{out}')"
+    ).fetchone()
+    assert row is not None
+    x, y = row
+    assert x == pytest.approx(530000.0)
+    assert y == pytest.approx(180000.0)
+
+
 # ---------------------------------------------------------------------------
 # CsvSource LINE/POLYGON (WKT) tests
 # ---------------------------------------------------------------------------

@@ -797,6 +797,21 @@ def _prepare_parquet(
                 f"{source.path} (no GeoParquet 'geo' metadata found) — cannot "
                 f"verify or transform to expected CRS {source.target_crs}."
             )
+        if detected_crs == _OGC_CRS84 and source.source_crs is not None:
+            # OGC:CRS84 is the GeoParquet spec's fallback when a column's geo
+            # metadata omits `crs` entirely (e.g. DuckDB's own COPY ... FORMAT
+            # PARQUET writes this for any native GEOMETRY column, regardless
+            # of its real CRS) — the weakest possible signal. Trust an
+            # explicit source_crs over it rather than risk silently
+            # transforming data that's already correct.
+            log.info(
+                "  %s: column %r has no recorded CRS (GeoParquet default "
+                "OGC:CRS84 assumed) — using declared source_crs=%s instead.",
+                source.path,
+                geom_col,
+                source.source_crs,
+            )
+            detected_crs = source.source_crs
 
         src_describe = con.sql(
             f"DESCRIBE SELECT * FROM read_parquet('{_sql_str(source.path)}')"
