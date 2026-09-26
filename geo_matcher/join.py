@@ -3,12 +3,17 @@ from __future__ import annotations
 import functools
 import logging
 import pathlib
+import queue
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterable,
+    Iterator,
     Protocol,
     TypeAlias,
     TypeVar,
@@ -80,7 +85,7 @@ class FilteredMode:
 class NationalMode:
     """Full national join — RHS split into *n_chunks* chunks processed one at a time."""
 
-    n_chunks: int = 80
+    n_chunks: int = 100
 
 
 JoinMode: TypeAlias = FilteredMode | NationalMode
@@ -112,6 +117,7 @@ class JoinFn(Protocol):
         overlap_threshold: float = ...,
         usrn_line_parquet: pathlib.Path | None = ...,
         phase4_tolerance_m: float = ...,
+        rows_per_batch: int = ...,
     ) -> pa.Table: ...
 
 
@@ -223,16 +229,27 @@ def _bbox_col_indices(pf: pq.ParquetFile) -> dict[str, int]:
 
 
 def _split_into_chunks(n_row_groups: int, n_chunks: int) -> list[list[int]]:
-    """Partition row-group indices into at most *n_chunks* contiguous chunks.
+    """Partition row-group indices into ``min(n_chunks, n_row_groups)`` contiguous
+    chunks, sized as evenly as possible (differing by at most one row group).
 
     Each row group lands in exactly one chunk, which is what makes the per-chunk
-    match-rate counters summable into global figures.
+    match-rate counters summable into global figures. An even split (rather than a
+    fixed ``ceil(n_row_groups / n_chunks)`` stride) matters because a fixed stride
+    rounds up and then walks it, which can produce far fewer chunks than requested
+    whenever ``n_row_groups`` doesn't divide evenly — e.g. 427 row groups with
+    ``n_chunks=200`` would stride by ``ceil(427/200) = 3``, yielding only 143 chunks.
     """
-    rgs_per_chunk = max(1, (n_row_groups + n_chunks - 1) // n_chunks)
-    return [
-        list(range(s, min(s + rgs_per_chunk, n_row_groups)))
-        for s in range(0, n_row_groups, rgs_per_chunk)
-    ]
+    if n_row_groups == 0:
+        return []
+    n_chunks = max(1, min(n_chunks, n_row_groups))
+    base, extra = divmod(n_row_groups, n_chunks)
+    chunks: list[list[int]] = []
+    start = 0
+    for i in range(n_chunks):
+        size = base + (1 if i < extra else 0)
+        chunks.append(list(range(start, start + size)))
+        start += size
+    return chunks
 
 
 def _row_group_envelope(
@@ -246,6 +263,80 @@ def _row_group_envelope(
         max(rg.column(bbox_idx["xmax"]).statistics.max for rg in rgs),
         max(rg.column(bbox_idx["ymax"]).statistics.max for rg in rgs),
     )
+
+
+def _read_rhs_chunks(
+    rhs_pf: pq.ParquetFile,
+    chunk_row_groups: list[list[int]],
+    bbox_idx: dict[str, int],
+) -> Iterator[tuple[list[int], pa.Table, BBox]]:
+    """Read each RHS chunk in turn, pairing it with its row-group indices and envelope.
+
+    The I/O-bound half of a national join's per-chunk work — ``_prefetch`` wraps this
+    so the next chunk's read overlaps the current chunk's (CPU-bound) Sedona query.
+    """
+    for chunk_rgs in chunk_row_groups:
+        chunk = rhs_pf.read_row_groups(chunk_rgs)
+        envelope = _row_group_envelope(rhs_pf, chunk_rgs, bbox_idx)
+        yield chunk_rgs, chunk, envelope
+
+
+_T = TypeVar("_T")
+
+
+def _prefetch(source: Iterable[_T], buffer_size: int = 1) -> Iterator[_T]:
+    """Yield from *source*, produced one step ahead on a background thread.
+
+    Used to overlap a national join's next-chunk read (I/O-bound: parquet
+    decompression) with the current chunk's Sedona query (CPU-bound), without
+    parallelising the queries themselves — those still run strictly sequentially
+    against the single shared ``SedonaContext``, preserving the memory-bounding
+    guarantee chunking exists for. *buffer_size* caps how many extra items can ever
+    sit in memory ahead of the one the caller is processing — 1 by default, so peak
+    memory goes from "1 chunk" to "at most 2 chunks", never unbounded.
+
+    An exception raised while producing an item is re-raised here, in the
+    consuming thread, once it's this item's turn.
+    """
+    buffer: queue.Queue = queue.Queue(maxsize=buffer_size)
+    _NO_MORE_VALUES = object()
+    t0 = time.perf_counter()
+
+    def read_ahead() -> None:
+        try:
+            for i, value in enumerate(source):
+                log.debug(
+                    "_prefetch +%.3fs: read_ahead read item %d, enqueuing...",
+                    time.perf_counter() - t0,
+                    i,
+                )
+                buffer.put((None, value))
+                log.debug(
+                    "_prefetch +%.3fs: read_ahead enqueued item %d",
+                    time.perf_counter() - t0,
+                    i,
+                )
+        except Exception as exc:  # noqa: BLE001 - re-raised verbatim in the consumer
+            buffer.put((exc, None))
+            return
+        buffer.put((None, _NO_MORE_VALUES))
+
+    threading.Thread(target=read_ahead, daemon=True).start()
+    i = 0
+    while True:
+        log.debug(
+            "_prefetch +%.3fs: consumer waiting for item %d",
+            time.perf_counter() - t0,
+            i,
+        )
+        error, value = buffer.get()
+        log.debug("_prefetch +%.3fs: consumer got item %d", time.perf_counter() - t0, i)
+        i += 1
+        if error is not None:
+            raise error
+        if value is _NO_MORE_VALUES:
+            return
+        yield cast(_T, value)
 
 
 def _table_envelope(table: pa.Table) -> BBox:
@@ -317,18 +408,31 @@ def _intersect_len(a: pa.Array, b: pa.Array) -> int:
     return len(a.filter(pc.is_in(a, value_set=b)))
 
 
-def _register_rhs_view(sd: SedonaContext, table: pa.Table, rhs_view: str) -> None:
-    """Register an in-memory RHS table as *rhs_view* with a decoded geometry column.
+_GEOM_CRS = "EPSG:27700"
 
-    The Arrow table carries geometry as WKB, so it lands as ``rhs_raw`` first and is
-    then re-projected through ``ST_GeomFromWKB`` into the view the join templates read.
+
+def _as_geoarrow(table: pa.Table, geom_col: str = "geometry") -> pa.Table:
+    """Tag *geom_col*'s WKB bytes with the ``geoarrow.wkb`` extension type (zero-copy —
+    no bytes are touched) so Sedona reads it as native geometry directly off
+    ``create_data_frame``. Skips the ``ST_GeomFromWKB``/``ST_SetSRID`` SQL cast (and
+    the intermediate view it would otherwise need) that a plain WKB binary column
+    requires.
+
+    Imported locally, not at module scope: ``geoarrow`` loads a native (compiled)
+    library, and this is only ever called from code paths that already required
+    ``sedona.db`` (imported the same way in ``_connect``) — see that function's
+    docstring for why prepare-only import paths must stay native-geo-stack-free.
     """
-    non_geom = ", ".join(f'"{c}"' for c in table.schema.names if c != "geometry")
-    sd.create_data_frame(table).to_view("rhs_raw", overwrite=True)
-    sd.sql(
-        f"SELECT {non_geom},"
-        f" ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM rhs_raw"
-    ).to_view(rhs_view, overwrite=True)
+    import geoarrow.pyarrow as ga
+
+    idx = table.schema.get_field_index(geom_col)
+    tagged = ga.wkb().with_crs(_GEOM_CRS).wrap_array(table.column(geom_col))
+    return table.set_column(idx, geom_col, tagged)
+
+
+def _register_rhs_view(sd: SedonaContext, table: pa.Table, rhs_view: str) -> None:
+    """Register an in-memory RHS table as *rhs_view*, geometry decoded via GeoArrow."""
+    sd.create_data_frame(_as_geoarrow(table)).to_view(rhs_view, overwrite=True)
 
 
 def _register_neighbours_view(
@@ -365,16 +469,10 @@ def _register_neighbours_view(
     """).to_arrow_table()
     if not len(neighbours):
         return 0
-    sd.create_data_frame(neighbours).to_view("neighbours_raw", overwrite=True)
 
-    # Register a view for phase 4
-    # usrn, street type and the geometry of the matched feautre
     # TODO: Return the feature's column ID as well
     # So we can see what features bridges the usrns to the new target feature
-    sd.sql(
-        "SELECT usrn, street_type,"
-        " ST_SetSRID(ST_GeomFromWKB(geometry), 27700) AS geometry FROM neighbours_raw"
-    ).to_view("neighbours", overwrite=True)
+    sd.create_data_frame(_as_geoarrow(neighbours)).to_view("neighbours", overwrite=True)
     return len(neighbours)
 
 
@@ -534,8 +632,9 @@ def _run_in_batches(
     explain: bool,
     label: str,
     indent: str = "",
+    rows_per_batch: int = _ROWS_PER_BATCH,
 ) -> list[pa.Table]:
-    """Run one phase over *features* in ``_ROWS_PER_BATCH`` batches.
+    """Run one phase over *features* in ``rows_per_batch``-row batches.
 
     Shared by Phase 3 and Phase 4 in both the national and filtered executors — the
     loop body is identical in all three call sites, so it lives here once. Phases 1
@@ -549,13 +648,13 @@ def _run_in_batches(
     callers. Returns one table per non-empty batch.
     """
     parts: list[pa.Table] = []
-    n_batches = max(1, (len(features) + _ROWS_PER_BATCH - 1) // _ROWS_PER_BATCH)
+    n_batches = max(1, (len(features) + rows_per_batch - 1) // rows_per_batch)
     log.info(
         "%s%s: %d unmatched rows → %d batches", indent, label, len(features), n_batches
     )
 
     for batch_i in range(n_batches):
-        batch = features.slice(batch_i * _ROWS_PER_BATCH, _ROWS_PER_BATCH)
+        batch = features.slice(batch_i * rows_per_batch, rows_per_batch)
         if not len(batch):
             continue
 
@@ -596,6 +695,7 @@ def _phase4_match(
     expand_m: float,
     explain: bool,
     indent: str = "",
+    rows_per_batch: int = _ROWS_PER_BATCH,
 ) -> list[pa.Table]:
     """Propagate USRNs across physical connections to features Phases 1-3 left unmatched.
 
@@ -645,6 +745,7 @@ def _phase4_match(
         # Several connected neighbours may each offer a USRN — keep the closest.
         post_process=lambda t: _nearest_dedup(t, id_col, phase=4),
         explain=explain,
+        rows_per_batch=rows_per_batch,
         label="Phase 4 (connected)",
         indent=indent,
     )
@@ -733,7 +834,7 @@ def _national_spatial_join(
     usrn_expand_m: float,
     explain: bool,
     output_path: pathlib.Path,
-    n_chunks: int = 80,  # controlled by NationalMode.n_chunks
+    n_chunks: int = 100,  # controlled by NationalMode.n_chunks
     lhs_view_name: str = "usrns",
 ) -> None:
     """Direct spatial-join NationalMode executor — one LHS file, chunked RHS.
@@ -761,10 +862,8 @@ def _national_spatial_join(
 
     writer: pq.ParquetWriter | None = None
     try:
-        for i, chunk_rgs in enumerate(chunk_row_groups):
-            chunk = rhs_pf.read_row_groups(chunk_rgs)
-            envelope = _row_group_envelope(rhs_pf, chunk_rgs, bbox_idx)
-
+        chunks = _prefetch(_read_rhs_chunks(rhs_pf, chunk_row_groups, bbox_idx))
+        for i, (chunk_rgs, chunk, envelope) in enumerate(chunks):
             _register_rhs_view(sd, chunk, rhs_view)
 
             query = fill_spatial_filter(
@@ -851,9 +950,10 @@ def _national_line_join(
     explain: bool,
     output_path: pathlib.Path,
     usrn_line_parquet: pathlib.Path,
-    n_chunks: int = 80,
+    n_chunks: int = 100,
     overlap_threshold: float = 0.10,
     phase4_tolerance_m: float = 5.0,
+    rows_per_batch: int = _ROWS_PER_BATCH,
 ) -> None:
     """Four-phase NationalMode executor for ``line`` joins — two USRN files, chunked RHS.
 
@@ -896,7 +996,8 @@ def _national_line_join(
     sum_matched = sum_both = 0
     writer: pq.ParquetWriter | None = None
     try:
-        for i, chunk_rgs in enumerate(chunk_row_groups):
+        chunks = _prefetch(_read_rhs_chunks(rhs_pf, chunk_row_groups, bbox_idx))
+        for i, (chunk_rgs, chunk, envelope) in enumerate(chunks):
             log.info(
                 "── Chunk %d/%d (%d rhs row groups) ──",
                 i + 1,
@@ -908,13 +1009,6 @@ def _national_line_join(
             phase1_parts: list[pa.Table] = []
             phase2_parts: list[pa.Table] = []
             phase3_parts: list[pa.Table] = []
-
-            # Get the chunk
-            chunk = rhs_pf.read_row_groups(chunk_rgs)
-
-            # Calculate its bbox
-            # So we can spatially filter
-            envelope = _row_group_envelope(rhs_pf, chunk_rgs, bbox_idx)
 
             _register_rhs_view(sd, chunk, rhs_view)
 
@@ -979,6 +1073,7 @@ def _national_line_join(
                     explain=explain and i == 0,
                     label="Phase 3 (nearest)",
                     indent="  ",
+                    rows_per_batch=rows_per_batch,
                 )
 
             if phase3_parts:
@@ -1001,6 +1096,7 @@ def _national_line_join(
                 expand_m=distance_m,
                 explain=explain and i == 0,
                 indent="  ",
+                rows_per_batch=rows_per_batch,
             )
             if phase4_parts:
                 log.info(
@@ -1062,6 +1158,7 @@ def _filtered_line_join(
     overlap_threshold: float,
     usrn_line_parquet: pathlib.Path,
     phase4_tolerance_m: float = 5.0,
+    rows_per_batch: int = _ROWS_PER_BATCH,
 ) -> pa.Table:
     """Four-phase FilteredMode executor for ``line`` joins — two USRN files, city bbox.
 
@@ -1185,6 +1282,7 @@ def _filtered_line_join(
             post_process=lambda t: _nearest_dedup(t, id_col),
             explain=explain,
             label="Phase 3 (nearest)",
+            rows_per_batch=rows_per_batch,
         )
 
     if phase3_parts:
@@ -1201,6 +1299,7 @@ def _filtered_line_join(
         tolerance_m=phase4_tolerance_m,
         expand_m=distance_m,
         explain=explain,
+        rows_per_batch=rows_per_batch,
     )
     if phase4_parts:
         log.info(
@@ -1266,6 +1365,7 @@ class LineJoinPhases:
     usrn_line_parquet: pathlib.Path
     overlap_threshold: float = 0.10
     phase4_tolerance_m: float = 5.0
+    rows_per_batch: int = _ROWS_PER_BATCH
 
 
 def execute_join(
@@ -1345,6 +1445,7 @@ def execute_join(
                     lp.overlap_threshold,
                     lp.usrn_line_parquet,
                     phase4_tolerance_m=lp.phase4_tolerance_m,
+                    rows_per_batch=lp.rows_per_batch,
                 )
             case NationalMode(n_chunks=n_chunks):
                 return _materialise_national(
@@ -1365,6 +1466,7 @@ def execute_join(
                         n_chunks=n_chunks,
                         overlap_threshold=lp.overlap_threshold,
                         phase4_tolerance_m=lp.phase4_tolerance_m,
+                        rows_per_batch=lp.rows_per_batch,
                     ),
                     output_path,
                 )
@@ -1628,6 +1730,7 @@ def run_usrn_line_join(
     overlap_threshold: float = 0.10,
     usrn_line_parquet: pathlib.Path | None = None,
     phase4_tolerance_m: float = 5.0,
+    rows_per_batch: int = _ROWS_PER_BATCH,
     **_kwargs: Any,
 ) -> pa.Table:
     """Match each linestring in the RHS dataset against the USRN street network — always two USRN files needed.
@@ -1780,6 +1883,7 @@ def run_usrn_line_join(
             usrn_line_parquet=usrn_line_parquet,
             overlap_threshold=overlap_threshold,
             phase4_tolerance_m=phase4_tolerance_m,
+            rows_per_batch=rows_per_batch,
         ),
         explain=explain,
         output_path=output_path,

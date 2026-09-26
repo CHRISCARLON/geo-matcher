@@ -66,9 +66,10 @@ prepare-built:
 
 prepare-stops:
 	$(GEO_MATCHER) prepare-csv \
-		--name   stops \
-		--x-col  Easting \
-		--y-col  Northing \
+		--name            stops \
+		--x-col           Easting \
+		--y-col           Northing \
+		--row-group-size  1000 \
 		--force
 
 prepare-counts:
@@ -100,6 +101,7 @@ prepare-all: prepare-soil prepare-stops prepare-counts prepare-built
 
 match-soil-national:
 	$(GEO_MATCHER) match \
+		--lhs-name   usrn \
 		--rhs-name   soil \
 		--mode       polygon \
 		--output     parquet
@@ -130,6 +132,7 @@ match-built-uprn:
 
 match-stops-national:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
@@ -137,6 +140,7 @@ match-stops-national:
 
 match-stops-london:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name stops \
 		--mode     point \
 		--distance 10 \
@@ -145,6 +149,7 @@ match-stops-london:
 
 match-counts-national:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name count_points \
 		--mode     point \
 		--distance 10 \
@@ -152,6 +157,7 @@ match-counts-national:
 
 match-soil-leeds:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
@@ -159,6 +165,7 @@ match-soil-leeds:
 
 match-soil-leeds-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name soil \
 		--mode     polygon \
 		--city     LEEDS \
@@ -167,6 +174,7 @@ match-soil-leeds-explain:
 
 match-soil-national-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name usrn \
 		--rhs-name soil \
 		--mode     polygon \
 		--output   csv \
@@ -177,6 +185,7 @@ match-soil-national-explain:
 
 match-gas-pipe-sample:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -189,6 +198,7 @@ match-gas-pipe-sample:
 
 match-gas-pipe-sample-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -202,6 +212,7 @@ match-gas-pipe-sample-explain:
 
 match-gas-pipe-national:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -213,6 +224,7 @@ match-gas-pipe-national:
 
 match-gas-pipe-national-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         gas_pipe \
 		--mode             line \
 		--distance         10 \
@@ -225,6 +237,7 @@ match-gas-pipe-national-explain:
 
 match-ngn-mains-sample:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -237,6 +250,7 @@ match-ngn-mains-sample:
 
 match-ngn-mains-sample-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -250,6 +264,7 @@ match-ngn-mains-sample-explain:
 
 match-ngn-mains-national:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \
@@ -261,6 +276,7 @@ match-ngn-mains-national:
 
 match-ngn-mains-national-explain:
 	$(GEO_MATCHER) match \
+		--lhs-name         usrn \
 		--rhs-name         ngn_mains \
 		--mode             line \
 		--distance         10 \

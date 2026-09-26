@@ -2,6 +2,7 @@
 
 import logging
 import pathlib
+import time
 
 import duckdb
 import pyarrow as pa
@@ -13,10 +14,93 @@ from geo_matcher.join import (
     _log_line_match_summary,
     _nearest_dedup,
     _phase2_select_corridors,
+    _prefetch,
+    _split_into_chunks,
     bbox_pruner,
 )
 
 pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# _split_into_chunks
+# ---------------------------------------------------------------------------
+
+
+def test_split_into_chunks_exact_division():
+    """10 row groups / 5 chunks divides evenly — 2 row groups each."""
+    chunks = _split_into_chunks(10, 5)
+    assert [len(c) for c in chunks] == [2, 2, 2, 2, 2]
+    assert sum(chunks, []) == list(range(10))
+
+
+def test_split_into_chunks_uneven_division_hits_requested_count():
+    """427 row groups / 200 chunks — the reported case. A fixed ceil(427/200)=3
+    stride would only produce 143 chunks; the even split must hit 200 exactly,
+    sized 2-3 row groups each."""
+    chunks = _split_into_chunks(427, 200)
+    assert len(chunks) == 200
+    sizes = {len(c) for c in chunks}
+    assert sizes <= {2, 3}
+    assert sum(chunks, []) == list(range(427))
+
+
+def test_split_into_chunks_clamps_to_row_group_count():
+    """Requesting more chunks than row groups clamps to one row group per chunk."""
+    chunks = _split_into_chunks(5, 200)
+    assert len(chunks) == 5
+    assert [len(c) for c in chunks] == [1, 1, 1, 1, 1]
+
+
+def test_split_into_chunks_single_chunk():
+    chunks = _split_into_chunks(10, 1)
+    assert len(chunks) == 1
+    assert chunks[0] == list(range(10))
+
+
+def test_split_into_chunks_empty_input():
+    assert _split_into_chunks(0, 50) == []
+
+
+# ---------------------------------------------------------------------------
+# _prefetch
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_preserves_order():
+    assert list(_prefetch(range(20), buffer_size=1)) == list(range(20))
+
+
+def test_prefetch_overlaps_production_with_consumption():
+    """The next item is produced while the current one is being consumed."""
+
+    def slow_items():
+        for i in range(3):
+            time.sleep(0.05)
+            yield i
+
+    start = time.perf_counter()
+    results = []
+    for item in _prefetch(slow_items(), buffer_size=1):
+        time.sleep(0.05)
+        results.append(item)
+    elapsed = time.perf_counter() - start
+
+    assert results == [0, 1, 2]
+    assert elapsed < 0.28
+
+
+def test_prefetch_propagates_producer_exception():
+    def failing_items():
+        yield 1
+        raise ValueError("boom")
+
+    got = []
+    with pytest.raises(ValueError, match="boom"):
+        for item in _prefetch(failing_items(), buffer_size=1):
+            got.append(item)
+    assert got == [1]
+
 
 # ---------------------------------------------------------------------------
 # bbox_pruner

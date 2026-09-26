@@ -26,6 +26,7 @@ from .config import (
     UsrnSource,
 )
 from .join import (
+    _ROWS_PER_BATCH,
     FilteredMode,
     JoinFn,
     JoinMode,
@@ -91,7 +92,7 @@ class GeoMatcher:
         lhs: LhsKind | str = LhsKind.USRN,
         bbox: BBox | None = None,
         explain: bool = False,
-        n_chunks: int = 50,
+        n_chunks: int = 100,
         distance_m: float = 10.0,
         phase3_distance_m: float | None = None,
         rhs_id_col: str | None = None,
@@ -99,6 +100,7 @@ class GeoMatcher:
         overlap_threshold: float = 0.10,
         usrn_line_parquet: pathlib.Path | None = None,
         phase4_tolerance_m: float = 5.0,
+        rows_per_batch: int = _ROWS_PER_BATCH,
     ) -> pa.Table:
         """Dispatch the match to the registered Join Function.
 
@@ -138,6 +140,7 @@ class GeoMatcher:
             overlap_threshold=overlap_threshold,
             usrn_line_parquet=usrn_line_parquet,
             phase4_tolerance_m=phase4_tolerance_m,
+            rows_per_batch=rows_per_batch,
         )
         if output_path is not None and output_path.exists():
             log.info(
@@ -272,6 +275,12 @@ class GeoMatcher:
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
         )
+        p_prepare_usrns.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
+        )
 
         # ------------------------------------------------------------------ #
         # prepare-usrns-line                                                 #
@@ -318,6 +327,12 @@ class GeoMatcher:
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
         )
+        p_prepare_usrns_line.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
+        )
 
         # ------------------------------------------------------------------ #
         # prepare-uprns                                                      #
@@ -349,6 +364,12 @@ class GeoMatcher:
             default=None,
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+        p_prepare_uprns.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
         )
 
         # ------------------------------------------------------------------ #
@@ -395,6 +416,12 @@ class GeoMatcher:
             default=None,
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+        p_prepare_uprns_buffer.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
         )
 
         # ------------------------------------------------------------------ #
@@ -463,6 +490,12 @@ class GeoMatcher:
             default=None,
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+        p_prepare.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
         )
 
         # ------------------------------------------------------------------ #
@@ -559,6 +592,12 @@ class GeoMatcher:
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
         )
+        p_prepare_csv.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
+        )
 
         # ------------------------------------------------------------------ #
         # prepare-parquet                                                    #
@@ -629,6 +668,12 @@ class GeoMatcher:
             default=None,
             metavar="N",
             help="DuckDB thread count (default: all cores). Lower to reduce CPU pressure.",
+        )
+        p_prepare_parquet.add_argument(
+            "--memory-limit",
+            default=None,
+            metavar="SIZE",
+            help="DuckDB memory_limit for this run, e.g. '4GB' (default: DuckDB's own ~80%% of system RAM).",
         )
 
         # ------------------------------------------------------------------ #
@@ -724,14 +769,27 @@ class GeoMatcher:
         p_match.add_argument(
             "--batches",
             type=int,
-            default=50,
+            default=100,
             metavar="N",
             help=(
-                "Number of RHS chunks for national (no-bbox) joins (default: 50). "
+                "Number of RHS chunks for national (no-bbox) joins (default: 100). "
                 "The RHS parquet is split into this many in-memory chunks of row "
-                "groups; only one chunk's data is in memory at a time. Ignored when "
-                "--bbox or --city is supplied. (Line joins further split each chunk "
-                "into 5,000-row batches for Phases 3 and 4.)"
+                "groups (evenly sized, capped at the file's row-group count); only "
+                "one chunk's data is in memory at a time. Ignored when --bbox or "
+                "--city is supplied. (Line joins further split each chunk into "
+                "--rows-per-batch batches for Phases 3 and 4.)"
+            ),
+        )
+        p_match.add_argument(
+            "--rows-per-batch",
+            type=int,
+            default=_ROWS_PER_BATCH,
+            metavar="N",
+            help=(
+                f"Rows per sub-batch for --mode line Phases 3 and 4 "
+                f"(default: {_ROWS_PER_BATCH}). Smaller batches keep each "
+                "sub-query's USRN spatial filter tighter, improving row-group "
+                "pruning at the cost of more query plans."
             ),
         )
         p_match.add_argument(
@@ -816,6 +874,7 @@ class GeoMatcher:
                 ),
                 force=args.force,
                 threads=args.threads,
+                memory_limit=args.memory_limit,
             )
 
         elif args.command == "prepare-usrns-line":
@@ -840,6 +899,7 @@ class GeoMatcher:
                 ),
                 force=args.force,
                 threads=args.threads,
+                memory_limit=args.memory_limit,
             )
 
         elif args.command == "prepare-uprns":
@@ -854,6 +914,7 @@ class GeoMatcher:
                 ),
                 force=args.force,
                 threads=args.threads,
+                memory_limit=args.memory_limit,
             )
 
         elif args.command == "prepare-uprns-buffer":
@@ -878,6 +939,7 @@ class GeoMatcher:
                 ),
                 force=args.force,
                 threads=args.threads,
+                memory_limit=args.memory_limit,
             )
 
         elif args.command == "prepare-gpkg":
@@ -899,7 +961,12 @@ class GeoMatcher:
                 source=match_source,
                 parquet_path=cache_dir / f"{args.rhs_name}_27700.parquet",
             )
-            prepare(rhs_config, force=args.force, threads=args.threads)
+            prepare(
+                rhs_config,
+                force=args.force,
+                threads=args.threads,
+                memory_limit=args.memory_limit,
+            )
 
         elif args.command == "prepare-csv":
             csv_path: pathlib.Path = (
@@ -924,7 +991,12 @@ class GeoMatcher:
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
             )
-            prepare(rhs_config, force=args.force, threads=args.threads)
+            prepare(
+                rhs_config,
+                force=args.force,
+                threads=args.threads,
+                memory_limit=args.memory_limit,
+            )
 
         elif args.command == "prepare-parquet":
             src_parquet: pathlib.Path = (
@@ -946,7 +1018,12 @@ class GeoMatcher:
                 parquet_path=pathlib.Path(args.cache_dir)
                 / f"{args.name}_27700.parquet",
             )
-            prepare(rhs_config, force=args.force, threads=args.threads)
+            prepare(
+                rhs_config,
+                force=args.force,
+                threads=args.threads,
+                memory_limit=args.memory_limit,
+            )
 
         elif args.command == "match":
             cache_dir = pathlib.Path(args.cache_dir)
@@ -1000,6 +1077,7 @@ class GeoMatcher:
                 output_path=output_path,
                 overlap_threshold=args.overlap_threshold,
                 phase4_tolerance_m=args.phase4_tolerance,
+                rows_per_batch=args.rows_per_batch,
                 usrn_line_parquet=(
                     pathlib.Path(args.usrn_line_parquet)
                     if args.usrn_line_parquet is not None

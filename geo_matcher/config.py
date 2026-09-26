@@ -15,12 +15,9 @@ class GeometryType(StrEnum):
 
 
 class LhsKind(StrEnum):
-    """Which base dataset a join runs from — keys the second axis of the join registry.
-
-    USRN joins (street centrelines) and UPRN joins (address points) can both
-    register a strategy for the same RHS ``GeometryType`` (e.g. both have a
-    ``polygon`` join) without colliding, because the registry is keyed by
-    ``(LhsKind, GeometryType)`` rather than ``GeometryType`` alone.
+    """Base dataset a join runs from. Keyed with ``GeometryType`` in the join
+    registry so ``usrn`` and ``uprn`` can each register a ``polygon`` join
+    without colliding.
     """
 
     USRN = "usrn"
@@ -31,19 +28,11 @@ class LhsKind(StrEnum):
 class OgrSource:
     """Any GDAL-readable vector format (GeoPackage, Shapefile, etc.).
 
-    If a transform into/out of EPSG:27700 is needed, set ``nadgrids_path`` to the
-    ``.gsb`` binary grid extracted from the OS OSTN15 "NTv2 format files" ZIP
-    (https://www.ordnancesurvey.co.uk/products/os-net/for-developers — not the
-    ZIP itself, the ``.gsb`` file inside it, e.g. ``OSTN15_NTv2_OSGBtoETRS.gsb``)
-    for full accuracy; otherwise DuckDB falls back to its own default
-    (grid-less) coordinate operation search.
-
-    ``target_crs`` is the CRS this source is prepared into (EPSG:27700 by
-    default). The prepare step always detects the file's actual CRS itself
-    (from the OGR source's own metadata) and transforms from that detected
-    CRS to ``target_crs`` when they differ. ``source_crs`` is optional — what
-    you believe the file is in; if it disagrees with what's detected, prepare
-    logs a warning and uses the detected CRS anyway (the file wins).
+    Source CRS is always auto-detected from the file's own metadata; a
+    mismatched ``source_crs`` only logs a warning (the detected CRS wins).
+    Set ``nadgrids_path`` to the OSTN15 NTv2 ``.gsb`` grid for accurate
+    EPSG:27700 transforms — download from
+    https://www.ordnancesurvey.co.uk/products/os-net/for-developers.
     """
 
     path: pathlib.Path
@@ -55,24 +44,13 @@ class OgrSource:
 
 @dataclass(frozen=True)
 class CsvSource:
-    """CSV file with explicit x/y coordinate columns, or WKT text for line/polygon geometries.
+    """CSV with x/y coordinate columns (points), or a WKT column (lines/polygons).
 
-    If the coordinate/WKT values are in a different CRS than ``target_crs`` (the
-    target, EPSG:27700 by default), set ``source_crs`` to that CRS; the prepare
-    step will transform to ``target_crs``. If that transform is into/out of
-    EPSG:27700, also set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for
-    full accuracy — see ``OgrSource`` for where to get it.
-
-    Unlike ``OgrSource``/``ParquetSource``, a CSV carries no CRS metadata to
-    read. Prepare instead makes a best-effort guess from the coordinates
-    themselves: values within Great Britain's WGS84 lon/lat extent
-    are detected as ``EPSG:4326``, values within the British National Grid's
-    valid eastings/northings as ``EPSG:27700``. When detection succeeds it's
-    used for the transform, exactly like ``OgrSource``/``ParquetSource`` — and
-    if it disagrees with a declared ``source_crs``, prepare logs a warning and
-    uses the detected CRS anyway. When the extent doesn't clearly fall in
-    either range, detection is skipped and ``source_crs`` is used as declared,
-    with no warning.
+    Unlike ``OgrSource``/``ParquetSource``, a CSV carries no CRS metadata:
+    prepare guesses from the coordinate extent (GB lon/lat → EPSG:4326, BNG
+    eastings/northings → EPSG:27700) and warns if that disagrees with a
+    declared ``source_crs``. If the extent is ambiguous, ``source_crs`` is
+    used as declared, with no warning. See ``OgrSource`` for ``nadgrids_path``.
     """
 
     path: pathlib.Path
@@ -104,22 +82,10 @@ class CsvSource:
 class ParquetSource:
     """Existing GeoParquet to re-sort and re-compress.
 
-    For files produced by this pipeline the geometry column is always named
-    ``"geometry"`` and stored as WKB — the defaults handle that automatically.
-
-    For external Parquet files where the geometry column has a different name or
-    is stored as a native GEOMETRY type (e.g. ``GEOMETRY('OGC:CRS84')``), set
-    ``geometry_col`` to the source column name; the prepare step will transform
-    to ``target_crs`` (EPSG:27700) if needed. If that transform is into/out of
-    EPSG:27700, also set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for
-    full accuracy — see ``OgrSource`` for where to get it.
-
-    Prepare always auto-detects the CRS from the file's own GeoParquet ``geo``
-    metadata (mirroring ``OgrSource``'s auto-detection from the source file),
-    and raises if that metadata is absent — regardless of whether
-    ``source_crs`` is set. ``source_crs`` is optional — what you believe the
-    file is in; if it disagrees with what's detected, prepare logs a warning
-    and uses the detected CRS anyway (the file wins).
+    CRS is always auto-detected from the file's GeoParquet ``geo`` metadata
+    (raises if absent); a mismatched ``source_crs`` only logs a warning.
+    Set ``geometry_col`` for a non-standard column name or a native GEOMETRY
+    type (e.g. ``GEOMETRY('OGC:CRS84')``). See ``OgrSource`` for ``nadgrids_path``.
     """
 
     path: pathlib.Path
@@ -132,25 +98,16 @@ class ParquetSource:
 
 @dataclass(frozen=True)
 class UsrnSource:
-    """USRN preparation, in one of two modes selected by ``buffer_m``.
+    """USRN preparation — mode selected by ``buffer_m``.
 
-    ``buffer_m=None`` (default) — ``path`` points at a raw OGR-readable USRN
-    source (e.g. the OS Open USRN GeoPackage). Produces a plain Hilbert-sorted
-    centreline GeoParquet — equivalent to preparing ``path`` via ``OgrSource``.
+    - ``buffer_m=None`` (default): ``path`` is a raw OGR source; produces a
+      plain centreline GeoParquet, like ``OgrSource``.
+    - ``buffer_m=<float>``: ``path`` is an already-prepared centreline
+      GeoParquet; produces a buffered corridor for line-join Phase 2
+      (``geometry`` = buffered polygon, ``geometry_line`` = original
+      centreline). Must be >= ``--distance`` at match time.
 
-    ``buffer_m=<float>`` — ``path`` points at an already-prepared USRN
-    centreline GeoParquet (e.g. the output of the ``buffer_m=None`` mode).
-    Produces a buffered corridor GeoParquet for line-join Phase 2, where
-    ``geometry`` is ``ST_Buffer(centreline, buffer_m)`` (the join predicate)
-    and ``geometry_line`` is the original centreline WKB (used for distance
-    and overlap calculations). ``buffer_m`` must be >= ``--distance`` at
-    match time.
-
-    When ``buffer_m is None`` and the raw source needs a transform into
-    EPSG:27700, set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for full
-    accuracy — see ``OgrSource`` for where to get it. Forwarded to the
-    transient ``OgrSource`` this delegates to; unused in buffered mode (no
-    transform happens there).
+    ``nadgrids_path`` only applies in plain mode — see ``OgrSource``.
     """
 
     path: pathlib.Path
@@ -162,27 +119,17 @@ class UsrnSource:
 
 @dataclass(frozen=True)
 class UprnSource:
-    """UPRN preparation, in one of two modes selected by ``buffer_m``.
+    """UPRN preparation — mode selected by ``buffer_m``.
 
-    ``buffer_m=None`` (default) — ``path`` points at a raw OGR-readable UPRN
-    source (e.g. the OS Open UPRN GeoPackage). Produces a plain Hilbert-sorted
-    address-point GeoParquet with just ``uprn`` and ``geometry`` — the
-    source's uppercase ``UPRN`` id is renamed to match this pipeline's
-    lowercase convention, and ``X_COORDINATE``/``Y_COORDINATE``/``LATITUDE``/
-    ``LONGITUDE`` are dropped as redundant with ``geometry`` (same point, two
-    encodings) — at 40M+ rows that's four fewer doubles per row.
+    - ``buffer_m=None`` (default): ``path`` is a raw OGR source; produces a
+      plain address-point GeoParquet with just ``uprn`` + ``geometry`` —
+      the source's uppercase ``UPRN`` is renamed lowercase, and
+      ``X/Y_COORDINATE``/``LATITUDE``/``LONGITUDE`` dropped as redundant.
+    - ``buffer_m=<float>``: ``path`` is an already-prepared point GeoParquet;
+      produces buffered catchment polygons (``geometry`` = buffered polygon,
+      ``geometry_point`` = original point).
 
-    ``buffer_m=<float>`` — ``path`` points at an already-prepared UPRN
-    GeoParquet (e.g. the output of the ``buffer_m=None`` mode). Produces a
-    buffered catchment-polygon GeoParquet, where ``geometry`` is
-    ``ST_Buffer(point, buffer_m)`` (the join predicate) and ``geometry_point``
-    is the original point WKB, alongside ``uprn``.
-
-    When ``buffer_m is None`` and the raw source needs a transform into
-    EPSG:27700, set ``nadgrids_path`` to the OS OSTN15 ``.gsb`` grid for full
-    accuracy — see ``OgrSource`` for where to get it. Forwarded to the
-    transient ``OgrSource`` this delegates to; unused in buffered mode (no
-    transform happens there).
+    ``nadgrids_path`` only applies in plain mode — see ``OgrSource``.
     """
 
     path: pathlib.Path
@@ -207,38 +154,12 @@ DEFAULT_UPRN_GPKG: pathlib.Path = DEFAULT_INPUT_DIR / "osopenuprn.gpkg"
 class DatasetConfig:
     """Describes a spatial dataset for use as the right-hand side of a USRN join.
 
-    Parameters
-    ----------
-    name:
-        Short identifier used in output filenames, SQL view names, and log
-        messages. Must be a valid SQL identifier (letters, digits, underscores;
-        must not start with a digit). E.g. ``"soil"``, ``"highways"``,
-        ``"flood_risk"``.
-    source_path:
-        Path to the source file. Mutually optional with ``source`` — provide
-        one or the other. Kept for backward compatibility; prefer ``source``.
-    source:
-        Typed source descriptor (``OgrSource``, ``CsvSource``, ``ParquetSource``,
-        or ``UsrnSource``). When provided, ``source_path`` is derived from
-        ``source.path`` if not given explicitly. The ``prepare()`` function
-        dispatches on this type to choose the correct reader.
-    parquet_path:
-        Where the prepared GeoParquet file is written/cached. Defaults to
-        ``output_data/{name}_27700.parquet``.
-    columns:
-        Columns to SELECT from this dataset in the spatial join. An empty list
-        means all columns (excluding ``geometry`` and the internal ``bbox``
-        covering column) are selected automatically.
-    geometry_column:
-        Name of the geometry column in the source file. Kept for backward
-        compatibility — the prepare pipeline auto-detects this via DuckDB.
-    row_group_size:
-        Row group size when writing GeoParquet. Kept for backward compatibility
-        — prefer setting this on the ``source`` struct instead.
-    crs:
-        Expected CRS as an EPSG string. This is an assertion — reprojection is
-        NOT performed. Kept for backward compatibility — prefer setting this on
-        the ``source`` struct. Defaults to ``"EPSG:27700"`` (British National Grid).
+    Provide either ``source`` (typed descriptor — preferred, drives which
+    reader ``prepare()`` dispatches to) or ``source_path``. ``name`` must be
+    a valid SQL identifier. ``columns`` empty means every column except
+    ``geometry``/``bbox`` is auto-selected. ``geometry_column``,
+    ``row_group_size`` and ``crs`` are kept for backward compatibility —
+    prefer setting them on ``source`` instead.
     """
 
     name: str

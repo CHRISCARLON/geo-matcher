@@ -6,7 +6,8 @@ Two-phase pipeline:
 prepare  →  match
 ```
 
-The prepare step converts source files into spatially-sorted GeoParquet cached on disk. Run once; reuse for every subsequent match.
+- Prepare converts source files into spatially-sorted GeoParquet, cached in `output_data/`.
+- Run prepare once per source; reuse the output for every subsequent match.
 
 ---
 
@@ -30,7 +31,8 @@ Creates `input_data/`, `output_data/`, and `matched_data/`.
 geo-matcher prepare-usrns
 ```
 
-Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`. Add `--force` to re-prepare.
+- Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`.
+- Add `--force` to re-prepare.
 
 **UPRNs (address points, optional):**
 
@@ -38,12 +40,11 @@ Reads `input_data/osopenusrn.gpkg`, writes `output_data/usrns_27700.parquet`. Ad
 geo-matcher prepare-uprns
 ```
 
-Reads `input_data/osopenuprn.gpkg`, writes `output_data/uprns_27700.parquet`
-(`uprn` + `geometry` only — the source's redundant coordinate columns are
-dropped). ~23x the row count of USRN, so it takes noticeably longer. Follow
-with `geo-matcher prepare-uprns-buffer --buffer-m 10` for buffered catchment
-polygons (`uprns_buffer_10m_27700.parquet`, adds `geometry_point` for the
-original point).
+- Reads `input_data/osopenuprn.gpkg`, writes `output_data/uprns_27700.parquet`.
+- Keeps only `uprn` + `geometry` — the source's redundant coordinate columns are dropped.
+- ~23x the row count of USRN, so it takes noticeably longer.
+- Follow with `geo-matcher prepare-uprns-buffer --buffer-m 10` for buffered catchment polygons.
+- That writes `uprns_buffer_10m_27700.parquet`, adding `geometry_point` for the original point.
 
 **RHS from GeoPackage / shapefile:**
 
@@ -69,10 +70,9 @@ geo-matcher prepare-csv \
   --wkt-col       wkt
 ```
 
-`--wkt-col` holds plain WKT text (`LINESTRING(...)`, `MULTILINESTRING(...)`,
-`POLYGON(...)` or `MULTIPOLYGON(...)`) and is required whenever `--geometry-type` is
-`line` or `polygon`. If a WKT value contains commas (most do), make sure your CSV
-quotes that field — most spreadsheet/export tools do this automatically.
+- `--wkt-col` holds plain WKT text (`LINESTRING(...)`, `MULTILINESTRING(...)`, `POLYGON(...)`, `MULTIPOLYGON(...)`).
+- Required whenever `--geometry-type` is `line` or `polygon`.
+- Quote the WKT column in your CSV if it contains commas — most export tools do this automatically.
 
 **RHS from an existing Parquet (re-optimise / reproject):**
 
@@ -82,7 +82,13 @@ geo-matcher prepare-parquet \
   --source-crs EPSG:4326
 ```
 
-All prepare commands accept `--force` (re-prepare even if output exists) and `--threads N` (limit CPU usage).
+Every prepare command also accepts:
+
+| Flag | Description |
+|---|---|
+| `--force` | Re-prepare even if the output already exists |
+| `--threads N` | DuckDB thread count (default: all cores) |
+| `--memory-limit SIZE` | DuckDB `memory_limit` for this run, e.g. `4GB` (default: DuckDB's own ~80% of system RAM) |
 
 ---
 
@@ -108,16 +114,19 @@ geo-matcher match --lhs-name uprn --rhs-name soil --city LEEDS
 | Flag | Default | Description |
 |---|---|---|
 | `--rhs-name` | _(required)_ | Must match name used in prepare |
-| `--lhs-name` | `usrn` | Base dataset to join from: `usrn` (street centrelines) or `uprn` (address points). Not every `--mode` is registered for every `--lhs-name` — currently `uprn` only has `polygon`. |
-| `--mode` | `polygon` | `polygon` (area datasets), `point` (point datasets), or `line` (linestring datasets — two-phase) |
+| `--lhs-name` | `usrn` | Base dataset to join from: `usrn` (street centrelines) or `uprn` (address points) |
+| `--mode` | `polygon` | `polygon`, `point`, or `line` (linestrings, two-phase) |
 | `--distance` | `10` | Search radius in metres (`point` / `line` only) |
 | `--rhs-id-col` | none | Required for `--mode line` |
 | `--bbox` | none | `XMIN YMIN XMAX YMAX` in EPSG:27700 |
 | `--city` | none | Named bbox shortcut (e.g. `LEEDS`, `LONDON`) |
 | `--output` | `csv` | `csv`, `parquet`, or `sample` |
-| `--batches` | `50` | RHS row-group chunks for national joins (>= 2); ignored when `--bbox`/`--city` supplied |
-| `--threads` | 4 | DataFusion target partitions |
+| `--batches` | `100` | RHS row-group chunks for national joins; ignored with `--bbox`/`--city` |
+| `--rows-per-batch` | `5000` | Rows per sub-batch for `--mode line` Phases 3/4 |
+| `--threads` | `4` | DataFusion target partitions |
 | `--explain` | false | Run `EXPLAIN ANALYZE` before the join |
+
+Not every `--mode` is registered for every `--lhs-name` — currently `uprn` only has `polygon`.
 
 ---
 
@@ -171,9 +180,7 @@ matcher.output_writer(
 )
 ```
 
-`match_dispatch` returns a `pyarrow.Table` with attribute columns only (no geometry).
-
-`output_writer(table, output, matched_dir, stem)` is the single entry point for writing
-results: it picks the writer from an output-format string (`"csv"`, `"parquet"`, or
-`"sample"`) and writes to `matched_dir / f"{stem}.<ext>"` — the same dispatch the CLI
-`--output` flag uses.
+- `match_dispatch` returns a `pyarrow.Table` with attribute columns only (no geometry).
+- `output_writer(table, output, matched_dir, stem)` is the single entry point for writing results.
+- It picks the writer from an output-format string (`"csv"`, `"parquet"`, or `"sample"`).
+- Writes to `matched_dir / f"{stem}.<ext>"` — the same dispatch the CLI `--output` flag uses.

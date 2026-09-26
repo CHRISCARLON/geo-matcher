@@ -2,16 +2,20 @@
 synthetic GeoParquet files built by the prepare() pipeline.
 """
 
+import logging
 import pathlib
 
 import geopandas as gpd
+import pyarrow as pa
 import pytest
 import sedona.db
-from shapely.geometry import LineString, box
+import shapely.wkb
+from shapely.geometry import LineString, Point, box
 
 from geo_matcher.config import DatasetConfig, OgrSource, UsrnSource
 from geo_matcher.join import (
     _DEFAULT_MODE,
+    _run_in_batches,
     configure_sedona_session,
     run_usrn_polygon_join,
 )
@@ -90,3 +94,62 @@ def test_run_usrn_polygon_join_matches_real_overlap(
     assert result.column("usrn").to_pylist() == list(range(1, N_IN_POLY + 1))
     assert set(result.column("musid").to_pylist()) == {101}
     assert len(result) == N_IN_POLY
+
+
+# ---------------------------------------------------------------------------
+# rows_per_batch — _run_in_batches batching
+# ---------------------------------------------------------------------------
+
+
+def test_run_in_batches_honors_custom_rows_per_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A custom ``rows_per_batch`` must control how many batches ``_run_in_batches``
+    splits *features* into — 5 rows / rows_per_batch=2 → ceil(5/2) = 3 batches.
+
+    Exercises ``_run_in_batches`` directly (not through a full line join) with a
+    trivial one-row USRN view and a huge search radius, so every batch trivially
+    matches — this test is about batch mechanics, not spatial correctness.
+    """
+    sd = sedona.db.connect()
+    configure_sedona_session(sd, target_partitions=2)
+    sd.sql(
+        "SELECT 1 AS usrn, ST_SetSRID(ST_Point(0.0, 0.0), 27700) AS geometry"
+    ).to_view("usrns", overwrite=True)
+
+    n = 5
+    features = pa.table(
+        {
+            "asset_id": pa.array([f"F{i}" for i in range(n)]),
+            "geometry": pa.array(
+                [shapely.wkb.dumps(Point(float(i), 0.0)) for i in range(n)]
+            ),
+            "bbox": pa.array(
+                [
+                    {"xmin": float(i), "ymin": 0.0, "xmax": float(i), "ymax": 0.0}
+                    for i in range(n)
+                ]
+            ),
+        }
+    )
+    template = (
+        "SELECT s.asset_id, u.usrn FROM usrns AS u "
+        "JOIN test_rhs AS s ON ST_DWithin(u.geometry, s.geometry, 1000000) "
+        "WHERE TRUE {spatial_filter}"
+    )
+
+    with caplog.at_level(logging.INFO, logger="geo_matcher"):
+        parts = _run_in_batches(
+            sd,
+            features,
+            "test_rhs",
+            template,
+            expand_m=1_000_000.0,
+            post_process=lambda t: t,
+            explain=False,
+            label="Test phase",
+            rows_per_batch=2,
+        )
+
+    assert "Test phase: 5 unmatched rows → 3 batches" in caplog.text
+    assert sum(len(p) for p in parts) == n

@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-09-26
+
+### Fixed
+
+- `_split_into_chunks` now splits row groups evenly instead of a fixed stride, so `--batches N` reliably produces ~N chunks instead of undershooting when row groups don't divide evenly.
+
+### Added
+
+- `--rows-per-batch`/`rows_per_batch` — exposes the previously-hardcoded 5,000-row Phase 3/4 line-join batch size as a real parameter.
+- `--memory-limit` CLI flag on every `prepare-*` subcommand (previously only reachable via the Python API).
+- Bounded read-ahead prefetch (`_prefetch`) for national-join RHS chunk reads, overlapping the next chunk's I/O with the current chunk's Sedona query.
+- `geoarrow-pyarrow` dependency, used to cut `_register_rhs_view`/`_register_neighbours_view` from two Sedona round-trips to one per chunk/batch.
+- `docs/performance.md` — explains row groups vs. chunks vs. batches, and the prefetch mechanism.
+
+### Changed
+
+- Default `--batches`/`n_chunks` raised from 50 to 100 (and `NationalMode`'s own dataclass default aligned to match, was 80).
+- `geo_matcher/config.py` docstrings trimmed from full paragraphs to concise summaries.
+- `docs/usage.md`, `docs/how-it-works.md`, `docs/output.md` rewritten as one-point-per-line bullets instead of dense paragraphs.
+- Every `match-*` Makefile target now passes `--lhs-name` explicitly alongside `--rhs-name`.
+
 ## [0.1.5] - 2026-09-25
 
 ### Fixed

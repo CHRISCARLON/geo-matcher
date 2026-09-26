@@ -277,6 +277,7 @@ source = { editable = "." }
 dependencies = [
     { name = "apache-sedona", extra = ["db"] },
     { name = "duckdb" },
+    { name = "geoarrow-pyarrow" },
     { name = "pyproj" },
 ]
 
@@ -302,6 +303,7 @@ typechecking = [
 requires-dist = [
     { name = "apache-sedona", extras = ["db"], specifier = "==1.8.1" },
     { name = "duckdb", specifier = "==1.5.2" },
+    { name = "geoarrow-pyarrow", specifier = ">=0.2.0" },
     { name = "pyproj", specifier = ">=3.6" },
 ]
 
